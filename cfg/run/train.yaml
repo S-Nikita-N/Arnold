@@ -1,0 +1,21 @@
+# Training Run Config
+
+# ==================== Checkpointing ====================
+save_frequency: 1000
+save_curr_frequency: 50
+log_frequency: 1
+
+# ==================== Parallelism ====================
+num_threads: 1
+headless: true
+
+# ==================== Paths ====================
+output_dir: data/trained_models/${exp_name}
+
+# ==================== Expert ====================
+expert:
+  config_path: null  # Path to Kinesis config.yaml
+  checkpoint_epoch: -1  # -1 = latest
+
+# ==================== Evaluation ====================
+eval_frequency: 100  # Частота валидации (каждые N эпох), 0 = отключить

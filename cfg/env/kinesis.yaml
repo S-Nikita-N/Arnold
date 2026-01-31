@@ -1,0 +1,11 @@
+# Kinesis Environment Config
+
+# Task
+task: MyoLegs Imitation
+
+# Motion resampling
+resampling_interval: 100
+
+# Simulation (inherited from Kinesis expert)
+sim_timestep_inv: 150
+control_frequency_inv: 5

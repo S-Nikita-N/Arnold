@@ -1,0 +1,6 @@
+[submodule "src/arnold/experts/Kinesis"]
+	path = src/arnold/experts/Kinesis
+	url = https://github.com/amathislab/Kinesis.git
+[submodule "src/arnold/experts/myochallenge-lattice"]
+	path = src/arnold/experts/myochallenge-lattice
+	url = https://github.com/amathislab/myochallenge-lattice.git

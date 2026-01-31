@@ -1,0 +1,33 @@
+# Arnold Architecture & Learning Config
+
+# ==================== Architecture ====================
+embed_dim: 128
+ff_dim: 512
+num_heads: 4
+num_layers: 6
+dropout: 0.0
+history_len: 5
+
+# ==================== PPO ====================
+batch_size: 256
+learning_rate: 1.e-4
+weight_decay: 0.0
+gamma: 0.99
+tau: 0.95  # GAE lambda
+clip_epsilon: 0.2
+opt_num_epochs: 3
+grad_clip: 0.5
+
+# ==================== OBC Loss Weights ====================
+ppo_weight: 0
+imitation_weight: 1.0
+value_weight: 0.5
+entropy_weight: 0
+
+# ==================== Training ====================
+min_batch_size: 51200
+max_epochs: 100000
+use_scheduler: false
+
+# ==================== Debug ====================
+debug_checkpoints: false  # Сохранять чекпоинты перед каждым update для дебага
