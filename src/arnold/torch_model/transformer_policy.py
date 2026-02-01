@@ -34,11 +34,13 @@ class TransformerPolicy(nn.Module):
         num_heads: int = 4,
         num_layers: int = 6,
         dropout: float = 0.0,
+        detached_value_encoder: bool = False,
     ):
         super().__init__()
         
         self.vocab = vocab
         self.embed_dim = embed_dim
+        self.detached_value_encoder = detached_value_encoder
 
         self.obs_normalizer = SignatureNormalizerModule()
         
@@ -181,9 +183,10 @@ class TransformerPolicy(nn.Module):
         log_std = log_sigma_global + log_soft + log_norm_factor  # [batch, n_actions]
         log_std = torch.clamp(log_std, min=-4.6, max=2.3)
         
-        # 5. Value Decoder
-        value_query = self.value_query.expand(batch_size, -1, -1) # [batch, 1, embed_dim]
-        value_out = self.value_decoder(value_query, encoder_out)  # [batch, 1, embed_dim]
+        # 5. Value Decoder (опционально без градиентов в энкодер — detached_value_encoder)
+        value_query = self.value_query.expand(batch_size, -1, -1)  # [batch, 1, embed_dim]
+        value_encoder_out = encoder_out.detach() if self.detached_value_encoder else encoder_out
+        value_out = self.value_decoder(value_query, value_encoder_out)  # [batch, 1, embed_dim]
         value = self.value_head(value_out).squeeze(-1)  # [batch, 1]
         
         return actions, log_std, value

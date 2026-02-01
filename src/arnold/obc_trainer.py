@@ -98,6 +98,7 @@ class OBCTrainer:
         self.imitation_weight = cfg.learning.imitation_weight
         self.value_weight = cfg.learning.value_weight
         self.entropy_weight = cfg.learning.entropy_weight
+        self.detached_value_encoder = cfg.learning.detached_value_encoder
         self.min_batch_size = cfg.learning.min_batch_size
         self.max_epochs = cfg.learning.max_epochs
         self.use_scheduler = cfg.learning.use_scheduler
@@ -200,6 +201,7 @@ class OBCTrainer:
             num_heads=self.num_heads,
             num_layers=self.num_layers,
             dropout=self.dropout,
+            detached_value_encoder=self.detached_value_encoder,
         )
         self.policy.to(self.device)
         
@@ -733,6 +735,7 @@ class OBCTrainer:
                 "value_weight": self.value_weight,
                 "entropy_weight": self.entropy_weight,
                 "clip_epsilon": self.clip_epsilon,
+                "detached_value_encoder": self.detached_value_encoder,
             },
         }
         if self.scheduler is not None:

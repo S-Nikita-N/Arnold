@@ -37,12 +37,6 @@ from arnold.obc_trainer import OBCTrainer
 # Загрузка .env из корня репо (прокси и т.п.)
 _repo_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_repo_root / ".env")
-
-for key in ("HTTP_PROXY", "HTTPS_PROXY"):
-    val = os.getenv(key)
-    if val:
-        os.environ[key] = val
-
 os.environ["HTTP_PROXY"] = os.getenv("HTTP_PROXY")
 os.environ["HTTPS_PROXY"] = os.getenv("HTTPS_PROXY")
 
@@ -116,11 +110,12 @@ def main(cfg: DictConfig) -> None:
 
 # poetry run python -m arnold.train_arnold \
 #     use_wandb=true \
-#     exp_name=obc_run_A100_80GB_1 \
+#     exp_name=obc_run_A100_80GB_2 \
 #     device=cuda \
 #     learning.learning_rate=1e-3 \
-#     learning.min_batch_size=25120 \
-#     run.num_threads=25
+#     learning.min_batch_size=10000 \
+#     learning.detached_value_encoder=true \
+#     run.num_threads=10
 
 if __name__ == "__main__":
     main()

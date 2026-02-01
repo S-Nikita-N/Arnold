@@ -24,6 +24,9 @@ imitation_weight: 1.0
 value_weight: 0.5
 entropy_weight: 0
 
+# Отключать градиенты в энкодер при обучении value decoder
+detached_value_encoder: false
+
 # ==================== Training ====================
 min_batch_size: 51200
 max_epochs: 100000
