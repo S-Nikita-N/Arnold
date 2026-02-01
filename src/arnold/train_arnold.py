@@ -50,7 +50,7 @@ def setup_logging(output_dir: str) -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-@hydra.main(config_path="cfg", config_name="config", version_base=None)
+@hydra.main(config_path="../../cfg", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     """Main training function with Hydra config."""
     
@@ -85,7 +85,7 @@ def main(cfg: DictConfig) -> None:
     logger.info("Training completed!")
 
 
-# poetry run python -m myohuman.arnold.train_arnold \
+# poetry run python -m arnold.train_arnold \
 #     use_wandb=true \
 #     exp_name=obc_v2_run_2 \
 #     device=mps \
@@ -93,7 +93,7 @@ def main(cfg: DictConfig) -> None:
 #     learning.min_batch_size=5120 \
 #     run.num_threads=5
 
-# poetry run python -m myohuman.arnold.train_arnold \
+# poetry run python -m arnold.train_arnold \
 #     use_wandb=true \
 #     exp_name=obc_run_A100_80GB_1 \
 #     device=cuda \
