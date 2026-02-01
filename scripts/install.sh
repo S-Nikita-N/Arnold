@@ -1,7 +1,23 @@
 #!/bin/bash
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+# Проект требует Python 3.12. Если на системе по умолчанию 3.11 — задать явно перед poetry install:
+#   poetry env use python3.12
+# или
+#   poetry env use /usr/bin/python3.12
+if command -v poetry &>/dev/null; then
+    POETRY_PY=$(poetry env info -p 2>/dev/null)
+    if [ -n "$POETRY_PY" ] && [ -d "$POETRY_PY" ]; then
+        ENV_VER=$("$POETRY_PY/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
+        if [ -n "$ENV_VER" ] && [ "$ENV_VER" != "3.12" ] && [ "$ENV_VER" != "3.13" ] && [ "$ENV_VER" != "3.14" ]; then
+            echo "WARNING: Poetry venv uses Python $ENV_VER; project needs >=3.12. Run: poetry env use python3.12"
+            echo "         Then: poetry env remove python && poetry install"
+        fi
+    fi
+fi
 
 # --- Функция-обертка для кроссплатформенного sed -i ---
 sedi() {
@@ -23,8 +39,8 @@ pip install poetry
 echo "Installing project dependencies..."
 poetry install
 
-echo "Installing chumpy (PEP517 isolation off)..."
-PIP_NO_BUILD_ISOLATION=1 poetry run pip install "chumpy==0.70"
+echo "Installing chumpy (no build isolation: avoids 'No module named pip' in build env)..."
+PIP_NO_BUILD_ISOLATION=1 poetry run pip install --no-build-isolation "chumpy==0.70"
 
 echo "Patching chumpy for Python >=3.11 (getargspec -> getfullargspec)..."
 CH_FILE=$(
