@@ -2,6 +2,3 @@
 *__pycache__*
 data/*
 docs/arnold_tex/*
-# эксперты — трекаются как submodule, содержимое не добавлять
-src/arnold/experts/Kinesis
-src/arnold/experts/myochallenge-lattice
