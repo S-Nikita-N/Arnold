@@ -31,7 +31,7 @@ from arnold.experts.kinesis_wrapper import KinesisWrapper
 from arnold.memory import OBCMemory, OBCBatch
 from arnold.logger import OBCLogger
 from arnold.wandb_logger import WandbLogger
-from arnold.learning.learning_utils import to_test, to_cpu, optimizer_to
+from arnold.learning_utils import to_test, to_cpu, optimizer_to
 
 # Игнорируем SyntaxWarning про invalid escape sequence в docstrings Kinesis
 # (появляется при импорте модулей Kinesis в worker процессах)

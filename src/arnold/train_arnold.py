@@ -29,7 +29,7 @@ import warnings
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from myohuman.arnold.obc_trainer import OBCTrainer
+from arnold.obc_trainer import OBCTrainer
 
 # Игнорируем SyntaxWarning про invalid escape sequence в docstrings Kinesis
 warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
