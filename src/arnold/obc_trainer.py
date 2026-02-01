@@ -24,14 +24,14 @@ from omegaconf import DictConfig
 from typing import Dict, Tuple, Optional
 from tqdm import tqdm
 
-from myohuman.arnold.torch_model.transformer_policy import TransformerPolicy
-from myohuman.arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
-from myohuman.arnold.observation_parser import ObservationParser
-from myohuman.arnold.experts.kinesis_wrapper import KinesisWrapper
-from myohuman.arnold.memory import OBCMemory, OBCBatch
-from myohuman.arnold.logger import OBCLogger
-from myohuman.arnold.wandb_logger import WandbLogger
-from myohuman.learning.learning_utils import to_test, to_cpu, optimizer_to
+from arnold.torch_model.transformer_policy import TransformerPolicy
+from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
+from arnold.observation_parser import ObservationParser
+from arnold.experts.kinesis_wrapper import KinesisWrapper
+from arnold.memory import OBCMemory, OBCBatch
+from arnold.logger import OBCLogger
+from arnold.wandb_logger import WandbLogger
+from arnold.learning.learning_utils import to_test, to_cpu, optimizer_to
 
 # Игнорируем SyntaxWarning про invalid escape sequence в docstrings Kinesis
 # (появляется при импорте модулей Kinesis в worker процессах)

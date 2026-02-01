@@ -10,7 +10,7 @@ import torch
 import wandb
 from typing import Dict, Any, Optional
 from omegaconf import DictConfig, OmegaConf
-from myohuman.arnold.logger import OBCLogger
+from arnold.logger import OBCLogger
 
 
 logger = logging.getLogger(__name__)

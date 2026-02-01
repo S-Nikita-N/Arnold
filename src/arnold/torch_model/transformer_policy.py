@@ -11,9 +11,9 @@ import torch
 import torch.nn as nn
 from typing import List, Tuple
 
-from myohuman.arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
-from myohuman.arnold.torch_model.normalization import SignatureNormalizerModule
-from myohuman.arnold.torch_model.sensory_encoder import SensoryEncoder
+from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
+from arnold.torch_model.normalization import SignatureNormalizerModule
+from arnold.torch_model.sensory_encoder import SensoryEncoder
 
 
 class TransformerPolicy(nn.Module):

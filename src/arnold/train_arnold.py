@@ -93,5 +93,13 @@ def main(cfg: DictConfig) -> None:
 #     learning.min_batch_size=5120 \
 #     run.num_threads=5
 
+# poetry run python -m myohuman.arnold.train_arnold \
+#     use_wandb=true \
+#     exp_name=obc_run_A100_80GB_1 \
+#     device=cuda \
+#     learning.learning_rate=1e-3 \
+#     learning.min_batch_size=25120 \
+#     run.num_threads=25
+
 if __name__ == "__main__":
     main()
