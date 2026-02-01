@@ -26,10 +26,21 @@ import os
 import sys
 import logging
 import warnings
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from arnold.obc_trainer import OBCTrainer
+
+# Загрузка .env из корня репо (прокси и т.п.)
+_repo_root = Path(__file__).resolve().parent.parent.parent
+load_dotenv(_repo_root / ".env")
+for key in ("HTTP_PROXY", "HTTPS_PROXY"):
+    val = os.getenv(key)
+    if val:
+        os.environ[key] = val
 
 # Игнорируем SyntaxWarning про invalid escape sequence в docstrings Kinesis
 warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
