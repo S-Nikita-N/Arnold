@@ -151,7 +151,12 @@ else
         if ! [ -f "$KINESIS_DATA/trained_models/kinesis-moe-imitation/model.pth" ]; then
             echo "Downloading Kinesis model from Hugging Face..."
             poetry -C "$REPO_ROOT" env use python3.12 2>/dev/null || true
-            (cd "$KINESIS_ROOT" && (poetry -C "$REPO_ROOT" run python -c "import huggingface_hub" 2>/dev/null || poetry -C "$REPO_ROOT" run pip install -q huggingface_hub) && poetry -C "$REPO_ROOT" run python "$KINESIS_ROOT/src/utils/download_model.py" --repo_id amathislab/kinesis-moe-imitation) || echo "  Warning: model download failed (run from arnold root after: poetry install)."
+            VENV_PY="$(poetry -C "$REPO_ROOT" env info -p 2>/dev/null)/bin/python"
+            if [ -x "$VENV_PY" ]; then
+                (cd "$KINESIS_ROOT" && ("$VENV_PY" -c "import huggingface_hub" 2>/dev/null || "$VENV_PY" -m pip install -q huggingface_hub) && "$VENV_PY" src/utils/download_model.py --repo_id amathislab/kinesis-moe-imitation) || echo "  Warning: model download failed (run from arnold root after: poetry install)."
+            else
+                (cd "$KINESIS_ROOT" && (poetry -C "$REPO_ROOT" run python -c "import huggingface_hub" 2>/dev/null || poetry -C "$REPO_ROOT" run pip install -q huggingface_hub) && poetry -C "$REPO_ROOT" run python src/utils/download_model.py --repo_id amathislab/kinesis-moe-imitation) || echo "  Warning: model download failed (run from arnold root after: poetry install)."
+            fi
         else
             echo "Kinesis model already present."
         fi
