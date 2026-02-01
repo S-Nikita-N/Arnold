@@ -26,8 +26,8 @@ import os
 import sys
 import logging
 import warnings
-from pathlib import Path
 
+from pathlib import Path
 from dotenv import load_dotenv
 
 import hydra
@@ -37,10 +37,20 @@ from arnold.obc_trainer import OBCTrainer
 # Загрузка .env из корня репо (прокси и т.п.)
 _repo_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_repo_root / ".env")
+
 for key in ("HTTP_PROXY", "HTTPS_PROXY"):
     val = os.getenv(key)
     if val:
         os.environ[key] = val
+
+os.environ["HTTP_PROXY"] = os.getenv("HTTP_PROXY")
+os.environ["HTTPS_PROXY"] = os.getenv("HTTPS_PROXY")
+
+# Ограничить потоки в NumPy/BLAS/OpenMP — при большом run.num_threads иначе переподписка на CPU
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 # Игнорируем SyntaxWarning про invalid escape sequence в docstrings Kinesis
 warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
