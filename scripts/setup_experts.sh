@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Настраивает submodule-экспертов (Kinesis, myochallenge-lattice):
+# Настраивает submodule-экспертов (Kinesis, myochallenge-lattice, Myohuman):
 # инициализирует submodule и применяет локальные патчи.
 # Универсальный инсталлятор: macOS (BSD sed) и Linux (GNU sed).
 
@@ -51,6 +51,9 @@ run_sedi_multi() {
 echo "Platform: $(uname -s)"
 echo "Initializing submodules..."
 git submodule update --init --recursive
+# Подтянуть LFS-файлы во всех субмодулях (в т.ч. Myohuman)
+echo "Pulling LFS files in submodules..."
+git submodule foreach git lfs pull
 
 # ========== Kinesis ==========
 KINESIS_ROOT="$REPO_ROOT/src/arnold/experts/Kinesis"

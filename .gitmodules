@@ -4,3 +4,6 @@
 [submodule "src/arnold/experts/myochallenge-lattice"]
 	path = src/arnold/experts/myochallenge-lattice
 	url = https://github.com/amathislab/myochallenge-lattice.git
+[submodule "src/arnold/experts/Myohuman"]
+	path = src/arnold/experts/Myohuman
+	url = https://github.com/S-Nikita-N/Myohuman.git

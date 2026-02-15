@@ -28,8 +28,8 @@ cd arnold
 git lfs pull
 ```
 
-- `--recurse-submodules` — подтягивает Kinesis и myochallenge-lattice.
-- `git lfs pull` — подтягивает тяжёлые файлы из `downloads/Kinesis_assets/` (SMPL, motion dicts, initial poses).
+- `--recurse-submodules` — подтягивает Kinesis, myochallenge-lattice и Myohuman.
+- `git lfs pull` — подтягивает тяжёлые файлы из `downloads/Kinesis_assets/` (SMPL, motion dicts, initial poses). LFS-файлы внутри субмодулей (в т.ч. Myohuman) подтягиваются скриптом `setup_experts.sh`.
 
 Если репо уже склонирован без submodules:
 
@@ -55,6 +55,7 @@ poetry shell
 
 Скрипт:
 - инициализирует submodules (если ещё не сделано);
+- подтягивает LFS-файлы во всех субмодулях (в т.ч. Myohuman);
 - применяет патчи к коду и XML в Kinesis;
 - копирует ассеты из `downloads/Kinesis_assets/` в `src/arnold/experts/Kinesis/data/`;
 - скачивает модель эксперта с Hugging Face (`kinesis-moe-imitation`).
