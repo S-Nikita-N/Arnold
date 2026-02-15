@@ -55,7 +55,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 logger = logging.getLogger(__name__)
 
 
-def create_expert_wrapper(expert_entry: DictConfig, headless: bool = True, mode: str = "train"):
+def create_expert_wrapper(expert_entry: DictConfig, mode: str = "train", overrides=[]):
     """
     Создаёт обёртку для одного эксперта/среды.
 
@@ -73,8 +73,6 @@ def create_expert_wrapper(expert_entry: DictConfig, headless: bool = True, mode:
     expert_cfg_path = expert_entry.get("config_path", None)
     checkpoint_epoch = expert_entry.get("checkpoint_epoch", -1)
 
-    headless_overrides = [f"headless={'True' if headless else 'False'}"]
-
     if expert_type == "kinesis":
         from arnold.experts.kinesis_wrapper import KinesisWrapper
 
@@ -82,7 +80,7 @@ def create_expert_wrapper(expert_entry: DictConfig, headless: bool = True, mode:
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
             device="cpu",
-            overrides=headless_overrides,
+            overrides=overrides,
             mode=mode,
         )
 
@@ -93,7 +91,7 @@ def create_expert_wrapper(expert_entry: DictConfig, headless: bool = True, mode:
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
             device="cpu",
-            overrides=headless_overrides,
+            overrides=overrides,
             mode=mode,
         )
 
@@ -212,7 +210,7 @@ class ArnoldTrainer:
 
         # Load checkpoint if specified
         if self.resume_checkpoint:
-            self.load_checkpoint_from_path(self.resume_checkpoint)
+            self._load_from_path(self.resume_checkpoint, restore_optimizer=False)
         else:
             self.load_checkpoint(self.checkpoint_epoch)
 
@@ -248,11 +246,10 @@ class ArnoldTrainer:
             )
 
         expert_entry = experts_list[0]
-        headless = self.cfg.run.get("headless", True)
 
         logger.info(f"Setting up environment (type: {expert_entry.type}, mode: {self.training_mode})...")
 
-        self.expert = create_expert_wrapper(expert_entry, headless=headless, mode="train")
+        self.expert = create_expert_wrapper(expert_entry, mode="train")
 
         if self.use_expert:
             if hasattr(self.expert, 'has_expert') and not self.expert.has_expert:
@@ -267,7 +264,7 @@ class ArnoldTrainer:
         self.valid_expert = None
         if self.eval_frequency > 0:
             logger.info("Loading validation environment...")
-            self.valid_expert = create_expert_wrapper(expert_entry, headless=True, mode="valid")
+            self.valid_expert = create_expert_wrapper(expert_entry, mode="valid")
 
     def setup_parser(self) -> None:
         """Создаёт парсер."""
@@ -520,6 +517,7 @@ class ArnoldTrainer:
         returns = batch.returns.to(self.device)
         advantages = batch.advantages.to(self.device)
         fixed_log_probs = batch.log_probs.to(self.device)
+        old_values = batch.values.to(self.device)
 
         # Expert actions нужны только для имитации
         if self.use_expert:
@@ -544,6 +542,7 @@ class ArnoldTrainer:
                 mini_returns = returns[batch_indices]
                 mini_advantages = advantages[batch_indices]
                 mini_fixed_log_probs = fixed_log_probs[batch_indices]
+                mini_old_values = old_values[batch_indices]
 
                 # Forward pass
                 pred_actions, log_std, values = self.policy(
@@ -580,13 +579,23 @@ class ArnoldTrainer:
                     loss = loss + self.imitation_weight * imitation_loss
                     imitation_losses.append(imitation_loss.item())
 
-                # Value loss
+                # Value loss (PPO clipped value function)
+                # Ограничиваем обновление value head по аналогии с policy clipping:
+                # V_clipped = V_old + clamp(V_new - V_old, -ε, ε)
+                # loss = 0.5 * max(|V_new - R|², |V_clipped - R|²)
                 if self.value_weight > 0:
-                    value_loss = nn.functional.mse_loss(values, mini_returns)
+                    vf_loss_unclipped = (values - mini_returns) ** 2
+                    v_clipped = mini_old_values + torch.clamp(
+                        values - mini_old_values,
+                        -self.clip_epsilon,
+                        self.clip_epsilon,
+                    )
+                    vf_loss_clipped = (v_clipped - mini_returns) ** 2
+                    value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
                     loss = loss + self.value_weight * value_loss
                     value_losses.append(value_loss.item())
 
-                # Entropy loss
+                # Entropy loss (Gaussian: H = 0.5 * d * log(2πe) + Σ log_std)
                 if self.entropy_weight > 0:
                     entropy = 0.5 * (1 + 1.8378770664093453) + log_std.mean()
                     entropy_loss = -entropy
@@ -635,10 +644,6 @@ class ArnoldTrainer:
             t_sample_start = time.time()
             batch, obc_logger = self.sample(self.min_batch_size)
             t_sample = time.time() - t_sample_start
-
-            # Save debug checkpoint BEFORE update
-            if self.debug_checkpoints:
-                self.save_debug_checkpoint(batch, epoch)
 
             # Update parameters
             t_update_start = time.time()
@@ -733,50 +738,6 @@ class ArnoldTrainer:
         torch.save(checkpoint, path)
         logger.info(f"Checkpoint saved: {path}")
 
-    def save_debug_checkpoint(self, batch: OBCBatch, epoch: int) -> None:
-        """Сохраняет дебаг-чекпоинт ПЕРЕД update_params."""
-        debug_dir = os.path.join(self.output_dir, "debug_checkpoints")
-        os.makedirs(debug_dir, exist_ok=True)
-
-        checkpoint = {
-            "epoch": epoch,
-            "num_steps": self.num_steps,
-            "policy": self.policy.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "batch": {
-                "states": batch.states.cpu(),
-                "student_actions": batch.student_actions.cpu(),
-                "expert_actions": batch.expert_actions.cpu(),
-                "rewards": batch.rewards.cpu(),
-                "values": batch.values.cpu(),
-                "returns": batch.returns.cpu(),
-                "advantages": batch.advantages.cpu(),
-                "masks": batch.masks.cpu(),
-                "log_probs": batch.log_probs.cpu(),
-                "obs_signatures": batch.obs_signatures,
-                "action_signatures": batch.action_signatures,
-            },
-            "hyperparams": {
-                "learning_rate": self.learning_rate,
-                "batch_size": self.batch_size,
-                "opt_num_epochs": self.opt_num_epochs,
-                "grad_clip": self.grad_clip,
-                "ppo_weight": self.ppo_weight,
-                "imitation_weight": self.imitation_weight,
-                "value_weight": self.value_weight,
-                "entropy_weight": self.entropy_weight,
-                "clip_epsilon": self.clip_epsilon,
-                "detached_value_encoder": self.detached_value_encoder,
-                "training_mode": self.training_mode,
-            },
-        }
-        if self.scheduler is not None:
-            checkpoint["scheduler"] = self.scheduler.state_dict()
-
-        path = os.path.join(debug_dir, f"debug_epoch_{epoch:05d}.pth")
-        torch.save(checkpoint, path)
-        logger.debug(f"Debug checkpoint saved: {path}")
-
     def load_checkpoint(self, epoch: int) -> None:
         """
         Загружает чекпоинт из output_dir по номеру эпохи.
@@ -802,22 +763,6 @@ class ArnoldTrainer:
                 return
 
         self._load_from_path(path, restore_optimizer=True)
-
-    def load_checkpoint_from_path(self, path: str) -> None:
-        """
-        Загружает чекпоинт из произвольного пути.
-
-        Загружает только веса policy (без оптимизатора) — подходит для
-        переноса знаний между средами (например, Kinesis → MyoHuman).
-        Эпоха сбрасывается на 0.
-
-        Args:
-            path: Абсолютный путь к .pth файлу
-        """
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Resume checkpoint not found: {path}")
-
-        self._load_from_path(path, restore_optimizer=False)
 
     def _load_from_path(self, path: str, restore_optimizer: bool = True) -> None:
         """
@@ -933,10 +878,13 @@ class ArnoldTrainer:
             if step_imitation_losses:
                 episode_imitation_losses.append(np.mean(step_imitation_losses))
 
-            # Value loss
-            cumulative_rewards = np.cumsum(step_rewards[::-1])[::-1]
-            if len(step_values) == len(cumulative_rewards):
-                value_loss = np.mean((np.array(step_values) - cumulative_rewards) ** 2)
+            if step_values and step_rewards:
+                discounted_returns = np.zeros(len(step_rewards), dtype=np.float64)
+                running_return = 0.0
+                for ri in reversed(range(len(step_rewards))):
+                    running_return = step_rewards[ri] + self.gamma * running_return
+                    discounted_returns[ri] = running_return
+                value_loss = np.mean((np.array(step_values) - discounted_returns) ** 2)
                 episode_value_losses.append(value_loss)
 
         metrics = {

@@ -6,7 +6,7 @@ save_curr_frequency: 50
 log_frequency: 1
 
 # ==================== Parallelism ====================
-num_threads: 10
+num_threads: 1
 headless: true
 
 # ==================== Paths ====================

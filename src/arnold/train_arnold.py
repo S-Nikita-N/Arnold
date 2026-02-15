@@ -13,14 +13,15 @@
     poetry run python -m arnold.train_arnold exp_name=obc_kinesis
 
     # PPO на MyoHuman, с переносом знаний из OBC чекпоинта
-    poetry run python -m arnold.train_arnold \\
-        env=myohuman \\
-        'run.experts=[{type: myohuman, config_path: null, checkpoint_epoch: 0}]' \\
-        resume_checkpoint=/path/to/model_best_ep_length.pth \\
-        learning.ppo_weight=1.0 \\
-        learning.imitation_weight=0 \\
-        learning.entropy_weight=0.01 \\
-        exp_name=ppo_myohuman_transfer
+    poetry run python -m arnold.train_arnold \
+        env=myohuman \
+        'run.experts=[{type: myohuman, config_path: null, checkpoint_epoch: 0}]' \
+        resume_checkpoint=data/trained_models/obc_run_A100_80GB_3/model_best_ep_length.pth \
+        learning.ppo_weight=1.0 \
+        learning.imitation_weight=0 \
+        learning.entropy_weight=0.001 \
+        learning.value_weight=0.5 \
+        exp_name=ppo_myohuman_transfer_1
 """
 
 import os
