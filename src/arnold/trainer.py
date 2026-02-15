@@ -577,7 +577,7 @@ class ArnoldTrainer:
 
         n_batches = max(1, batch_size // self.batch_size)
         total_updates = self.opt_num_epochs * n_batches
-        pbar_update = tqdm(total=total_updates, desc="Update", unit="batch")
+        pbar = tqdm(total=total_updates, desc="Update", unit="batch")
 
         # PPO epochs
         for ppo_epoch in range(self.opt_num_epochs):
@@ -653,17 +653,6 @@ class ArnoldTrainer:
                     loss = loss + self.entropy_weight * entropy_loss
                     entropy_losses.append(entropy_loss.item())
 
-                # Проверка на NaN/Inf
-                if isinstance(loss, torch.Tensor) and (torch.isnan(loss) or torch.isinf(loss)):
-                    logger.warning("NaN/Inf detected in loss! Skipping mini-batch.")
-                    pbar_update.update(1)
-                    continue
-
-                if isinstance(loss, (int, float)) and loss == 0:
-                    logger.warning("All loss weights are zero! Nothing to optimize.")
-                    pbar_update.update(1)
-                    continue
-
                 # Backward
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -673,9 +662,9 @@ class ArnoldTrainer:
                     torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip)
 
                 self.optimizer.step()
-                pbar_update.update(1)
+                pbar.update(1)
 
-        pbar_update.close()
+        pbar.close()
         return {
             "ppo_loss": float(np.mean(ppo_losses)) if ppo_losses else 0.0,
             "imitation_loss": float(np.mean(imitation_losses)) if imitation_losses else 0.0,
