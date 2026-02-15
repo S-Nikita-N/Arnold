@@ -73,7 +73,7 @@ class KinesisWrapper:
         expert_cfg: DictConfig = None,
         checkpoint_epoch: int = -1,
         device: str = "cpu",
-        overrides: list = None,
+        overrides: list = [],
         mode: str = "train",
     ):
         """
@@ -203,6 +203,11 @@ class KinesisWrapper:
         info['r_vel'] = info['r_vel'][0]
         return next_obs, reward, terminated, truncated, info
     
+    @property
+    def has_expert(self) -> bool:
+        """Kinesis всегда загружается с экспертом."""
+        return True
+
     @property
     def env(self):
         """Доступ к среде эксперта."""

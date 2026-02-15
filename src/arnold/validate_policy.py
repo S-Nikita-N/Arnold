@@ -25,7 +25,7 @@ import hydra
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from arnold.experts.kinesis_wrapper import KinesisWrapper
+from arnold.trainer import create_expert_wrapper
 from arnold.observation_parser import ObservationParser
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.torch_model.transformer_policy import TransformerPolicy
@@ -100,15 +100,15 @@ def validate(cfg: DictConfig) -> dict:
     headless = run.headless
     sleep_per_step = run.sleep_per_step
     
-    logger.info(f"Loading Kinesis expert (valid mode, headless={headless})...")
+    logger.info(f"Loading expert environment (valid mode, headless={headless})...")
+
+    experts_list = cfg.run.experts
+    if len(experts_list) == 0:
+        raise ValueError("cfg.run.experts is empty")
+    expert_entry = experts_list[0]
+
     overrides = [f"run.headless={str(headless).lower()}"]
-    
-    expert = KinesisWrapper(
-        checkpoint_epoch=-1,
-        device=str(device) if device.type != "mps" else "cpu",
-        mode="valid",
-        overrides=overrides,
-    )
+    expert = create_expert_wrapper(expert_entry, mode="valid", overrides=overrides)
     logger.info(f"Expert loaded. Obs dim: {expert.obs_dim}, Action dim: {expert.action_dim}")
     
     # Создаём парсер
@@ -177,9 +177,10 @@ def validate(cfg: DictConfig) -> dict:
                 action_np = action.squeeze(0).cpu().numpy()
                 
                 t0 = time.perf_counter()
-                expert_action = expert.get_expert_action(obs)
-                imitation_loss = float(((action_np - expert_action) ** 2).mean())
-                step_imitation_losses.append(imitation_loss)
+                if expert.has_expert:
+                    expert_action = expert.get_expert_action(obs)
+                    imitation_loss = float(((action_np - expert_action) ** 2).mean())
+                    step_imitation_losses.append(imitation_loss)
                 profile_times["get_expert_action"] += time.perf_counter() - t0
                 
                 t0 = time.perf_counter()
@@ -222,14 +223,17 @@ def validate(cfg: DictConfig) -> dict:
             
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
-            episode_imitation_losses.append(np.mean(step_imitation_losses))
+            if step_imitation_losses:
+                episode_imitation_losses.append(np.mean(step_imitation_losses))
             
             # Обновляем прогресс-бар
-            pbar.set_postfix({
+            postfix = {
                 "reward": f"{episode_reward:.2f}",
                 "length": episode_length,
-                "im_loss": f"{np.mean(step_imitation_losses):.4f}",
-            })
+            }
+            if step_imitation_losses:
+                postfix["im_loss"] = f"{np.mean(step_imitation_losses):.4f}"
+            pbar.set_postfix(postfix)
     
     finally:
         expert.env.end_eval()
@@ -240,8 +244,9 @@ def validate(cfg: DictConfig) -> dict:
         "std_reward": float(np.std(episode_rewards)),
         "mean_length": float(np.mean(episode_lengths)),
         "std_length": float(np.std(episode_lengths)),
-        "imitation_loss": float(np.mean(episode_imitation_losses)),
     }
+    if episode_imitation_losses:
+        metrics["imitation_loss"] = float(np.mean(episode_imitation_losses))
     
     print("\n" + "=" * 60)
     print("VALIDATION RESULTS")
@@ -249,7 +254,8 @@ def validate(cfg: DictConfig) -> dict:
     print(f"  Motions evaluated: {len(episode_rewards)}")
     print(f"  Mean reward:       {metrics['mean_reward']:.4f} ± {metrics['std_reward']:.4f}")
     print(f"  Mean length:       {metrics['mean_length']:.2f} ± {metrics['std_length']:.2f}")
-    print(f"  Imitation loss:    {metrics['imitation_loss']:.6f}")
+    if "imitation_loss" in metrics:
+        print(f"  Imitation loss:    {metrics['imitation_loss']:.6f}")
     print("=" * 60)
     
     return metrics
