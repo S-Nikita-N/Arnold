@@ -221,14 +221,59 @@ class SensorimotorVocabulary(nn.Module):
         """
         Получает батч композитных эмбеддингов.
         
+        Кеширует только индексы и segment_ids (не эмбеддинги!) — 
+        embedding lookup выполняется каждый раз для корректного backprop.
+        
         Args:
             tokens_batch: Список кортежей токенов.
         
         Returns:
             Тензор размера [batch_size, embed_dim].
         """
-        embeddings = [self.get_embedding(tokens) for tokens in tokens_batch]
-        return torch.stack(embeddings, dim=0)
+        # embeddings = [self.get_embedding(tokens) for tokens in tokens_batch]
+        # return torch.stack(embeddings, dim=0)
+        cache_key = tuple(tokens_batch)
+        device = self.embeddings.weight.device
+        
+        # Кеш индексов: избегаем Python-циклы при повторных вызовах
+        if not hasattr(self, "_idx_cache"):
+            self._idx_cache = {}
+        
+        if cache_key in self._idx_cache:
+            idx_tensor, seg_tensor, n_segments = self._idx_cache[cache_key]
+            # Проверяем device
+            if idx_tensor.device != device:
+                idx_tensor = idx_tensor.to(device)
+                seg_tensor = seg_tensor.to(device)
+                self._idx_cache[cache_key] = (idx_tensor, seg_tensor, n_segments)
+        else:
+            # Первый вызов: собираем индексы + segment ids
+            all_indices = []
+            segment_ids = []
+            for seg_id, tokens in enumerate(tokens_batch):
+                for token in tokens:
+                    if token not in self.token_to_idx:
+                        raise KeyError(f"Token '{token}' not found in vocabulary.")
+                    all_indices.append(self.token_to_idx[token])
+                    segment_ids.append(seg_id)
+            
+            idx_tensor = torch.tensor(all_indices, device=device, dtype=torch.long)
+            seg_tensor = torch.tensor(segment_ids, device=device, dtype=torch.long)
+            n_segments = len(tokens_batch)
+            
+            # Ограничиваем размер кеша
+            if len(self._idx_cache) > 10:
+                self._idx_cache.clear()
+            self._idx_cache[cache_key] = (idx_tensor, seg_tensor, n_segments)
+        
+        # Embedding lookup (каждый раз — для корректного backprop)
+        all_embs = self.embeddings(idx_tensor)  # [total_tokens, embed_dim]
+        
+        # Segment sum: суммируем эмбеддинги по segment_ids
+        result = torch.zeros(n_segments, self.embed_dim, device=device, dtype=all_embs.dtype)
+        result.scatter_add_(0, seg_tensor.unsqueeze(1).expand(-1, self.embed_dim), all_embs)
+        
+        return result
 
     @property
     def vocab_size(self) -> int:

@@ -113,7 +113,6 @@ class KinesisWrapper:
                 
                 default_overrides = [
                     run_config,
-                    "headless=True",
                     "no_log=True",
                     "epoch=-1",  # Важно! Пропускаем загрузку expert_path в PolicyMOE.__init__
                     "run.test=True",  # Но ставим test=True для eval mode
@@ -121,6 +120,9 @@ class KinesisWrapper:
                 ]
                 if overrides:
                     default_overrides.extend(overrides)
+
+                if not any(override.startswith("run.headless=") for override in overrides):
+                    default_overrides.append("run.headless=True")
                 
                 cfg_dir = cfg_path if cfg_path else str(KINESIS_CFG)
                 self.cfg = load_kinesis_config(config_dir=cfg_dir, overrides=default_overrides)

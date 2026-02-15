@@ -46,6 +46,43 @@ class OBCMemory:
     def __len__(self):
         return len(self.states)
 
+    def to_transfer_dict(self) -> dict:
+        """
+        Упаковывает memory в dict со stacked тензорами для передачи через multiprocessing.Queue.
+        Резко уменьшает число shared-memory сегментов (тысячи мелких тензоров → несколько больших).
+        """
+        if len(self.states) == 0:
+            return {"n": 0}
+        return {
+            "n": len(self.states),
+            "states": torch.stack(self.states, dim=0),
+            "student_actions": torch.stack(self.student_actions, dim=0),
+            "expert_actions": torch.stack(self.expert_actions, dim=0),
+            "values": torch.stack(self.values, dim=0),
+            "log_probs": torch.stack(self.log_probs, dim=0),
+            "rewards": list(self.rewards),
+            "masks": list(self.masks),
+            "obs_signatures": list(self.obs_signatures),
+            "action_signatures": list(self.action_signatures),
+        }
+
+    @staticmethod
+    def from_transfer_dict(d: dict) -> "OBCMemory":
+        """Собирает OBCMemory из transfer dict (после получения из Queue)."""
+        if d["n"] == 0:
+            return OBCMemory()
+        m = OBCMemory()
+        m.states = list(d["states"].unbind(0))
+        m.student_actions = list(d["student_actions"].unbind(0))
+        m.expert_actions = list(d["expert_actions"].unbind(0))
+        m.values = list(d["values"].unbind(0))
+        m.log_probs = list(d["log_probs"].unbind(0))
+        m.rewards = d["rewards"]
+        m.masks = d["masks"]
+        m.obs_signatures = d["obs_signatures"]
+        m.action_signatures = d["action_signatures"]
+        return m
+
     def to_batch(
         self,
         gamma: float,

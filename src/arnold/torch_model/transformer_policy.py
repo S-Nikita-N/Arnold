@@ -9,7 +9,7 @@ Encoder-Decoder Transformer для управления мышцами.
 
 import torch
 import torch.nn as nn
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.torch_model.normalization import SignatureNormalizerModule
@@ -132,16 +132,19 @@ class TransformerPolicy(nn.Module):
         # Role embeddings из vocabulary
         role_emb = self.vocab.get_embedding_batch(obs_signatures)  # [n_obs, embed_dim]
         role_emb = role_emb.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, n_obs, embed_dim]
-        
+
         # Суммируем
-        return sensory_emb + role_emb
+        out = sensory_emb + role_emb
+        return out
     
     def forward(
         self,
         obs_timeseries: torch.Tensor,
         obs_signatures: List[Tuple[str, ...]],
         action_signatures: List[Tuple[str, ...]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_std: bool = True,
+        return_value: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Forward pass.
         
@@ -149,46 +152,48 @@ class TransformerPolicy(nn.Module):
             obs_timeseries: [batch, n_obs, history_len] - наблюдения
             obs_signatures: список токенов для каждого obs element
             action_signatures: список токенов для каждой мышцы
+            return_std: если False — не считать std head (быстрее при eval)
+            return_value: если False — не считать value decoder (быстрее при eval)
         
         Returns:
             actions: [batch, num_actions] - mean actions
-            log_std: [batch, num_actions] - log std для exploration
-            value: [batch, 1] - state value
+            log_std: [batch, num_actions] или None
+            value: [batch, 1] или None
         """
         batch_size = obs_timeseries.shape[0]
-
-        # 1. Нормализация наблюдений (обновление статистик происходит внутри forward)
-        obs_timeseries = self.obs_normalizer(obs_signatures, obs_timeseries)
-        
+        # 1. Нормализация наблюдений
+        obs_timeseries = self.obs_normalizer(obs_signatures, obs_timeseries)    
         # 2. Encode observations
         sensory_emb = self.encode_observations(obs_timeseries, obs_signatures)
-        
+
         # 3. Transformer Encoder
         encoder_out = self.encoder(sensory_emb)  # [batch, n_obs, embed_dim]
-        
-        # 4. Action Decoder
-        # Query = muscle embeddings
-        action_query = self.vocab.get_embedding_batch(action_signatures)  # [n_muscles, embed_dim]
-        action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, n_muscles, embed_dim]
-        action_out = self.action_decoder(action_query, encoder_out)  # [batch, n_actions, embed_dim]
-        actions = self.action_mean_head(action_out).squeeze(-1)  # [batch, n_actions]
-        # Std (task-specific exploratory noise): sigma = sigma_global * softmax(E @ x) * N_A
-        num_actions = action_out.shape[1]
-        std_logits = self.action_std_head(action_out).squeeze(-1)          # [batch, n_actions]
-        log_soft = torch.log_softmax(std_logits, dim=-1)                   # [batch, n_actions]
-        log_sigma_global = self.log_sigma_global.view(1, 1)                # [1,1]
-        log_norm_factor = torch.log(torch.tensor(
-            num_actions, dtype=log_soft.dtype, device=log_soft.device, requires_grad=False
-        ))
-        log_std = log_sigma_global + log_soft + log_norm_factor  # [batch, n_actions]
-        log_std = torch.clamp(log_std, min=-4.6, max=2.3)
-        
-        # 5. Value Decoder (опционально без градиентов в энкодер — detached_value_encoder)
-        value_query = self.value_query.expand(batch_size, -1, -1)  # [batch, 1, embed_dim]
-        value_encoder_out = encoder_out.detach() if self.detached_value_encoder else encoder_out
-        value_out = self.value_decoder(value_query, value_encoder_out)  # [batch, 1, embed_dim]
-        value = self.value_head(value_out).squeeze(-1)  # [batch, 1]
-        
+
+        # 4. Action Decoder + mean head
+        action_query = self.vocab.get_embedding_batch(action_signatures)
+        action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)
+        action_out = self.action_decoder(action_query, encoder_out)
+        actions = self.action_mean_head(action_out).squeeze(-1)
+
+        log_std = None
+        if return_std:
+            num_actions = action_out.shape[1]
+            std_logits = self.action_std_head(action_out).squeeze(-1)
+            log_soft = torch.log_softmax(std_logits, dim=-1)
+            log_sigma_global = self.log_sigma_global.view(1, 1)
+            log_norm_factor = torch.log(torch.tensor(
+                num_actions, dtype=log_soft.dtype, device=log_soft.device, requires_grad=False
+            ))
+            log_std = log_sigma_global + log_soft + log_norm_factor
+            log_std = torch.clamp(log_std, min=-4.6, max=2.3)
+
+        value = None
+        if return_value:
+            value_query = self.value_query.expand(batch_size, -1, -1)
+            value_encoder_out = encoder_out.detach() if self.detached_value_encoder else encoder_out
+            value_out = self.value_decoder(value_query, value_encoder_out)
+            value = self.value_head(value_out).squeeze(-1)
+
         return actions, log_std, value
     
     def get_action(
@@ -197,7 +202,9 @@ class TransformerPolicy(nn.Module):
         obs_signatures: List[Tuple[str, ...]],
         action_signatures: List[Tuple[str, ...]],
         deterministic: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_std: bool = True,
+        return_value: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Получает действие для среды.
         
@@ -206,23 +213,28 @@ class TransformerPolicy(nn.Module):
             obs_signatures: список токенов для obs
             action_signatures: список токенов для actions
             deterministic: если True - без шума
+            return_std: если False — не считать std head (быстрее при eval)
+            return_value: если False — не считать value decoder (быстрее при eval)
         
         Returns:
             action: [batch, num_muscles]
-            log_prob: [batch, 1] - log probability действия
-            value: [batch, 1]
+            log_prob: [batch, 1] или None при return_std=False
+            value: [batch, 1] или None при return_value=False
         """
         mean, log_std, value = self.forward(
             obs_timeseries,
             obs_signatures,
-            action_signatures
+            action_signatures,
+            return_std=return_std,
+            return_value=return_value,
         )
         
         if deterministic:
-            # Для deterministic действия log_prob не имеет смысла
-            action = mean   
-            log_prob = torch.zeros(mean.shape[0], 1, device=mean.device)
+            action = mean
+            log_prob = None if return_std else torch.zeros(mean.shape[0], 1, device=mean.device)
         else:
+            if log_std is None:
+                raise ValueError("return_std=False допустим только при deterministic=True")
             action = self.sample_action(mean, log_std)
             log_prob = self._compute_log_prob(action, mean, log_std)
         

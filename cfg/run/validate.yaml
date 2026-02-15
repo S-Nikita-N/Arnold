@@ -1,0 +1,11 @@
+# ==================== Checkpoint ====================
+checkpoint: ""  # путь к .pth (обязателен для validate_policy)
+
+# ==================== Visualization ====================
+headless: true
+num_motions: -1  # -1 = все движения
+sleep_per_step: 0.0  # задержка между шагами (сек)
+
+# ==================== Performance ====================
+# При true: не считать std head и value decoder в get_action (быстрее при eval)
+fast_eval: true

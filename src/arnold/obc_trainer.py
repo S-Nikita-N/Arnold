@@ -333,7 +333,8 @@ class OBCTrainer:
                 pbar.close()
             
             if queue is not None:
-                queue.put([pid, memory, obc_logger])
+                # Передаём stacked tensors (to_transfer_dict), чтобы не исчерпать shared memory
+                queue.put([pid, memory.to_transfer_dict(), obc_logger])
                 mp_done.wait()
             else:
                 return memory, obc_logger
@@ -351,6 +352,13 @@ class OBCTrainer:
             obc_logger: Логгер с метриками
         """
         t_start = time.time()
+        
+        # # Используем file_system вместо shared memory для передачи тензоров через Queue —
+        # # уменьшает риск "Cannot allocate memory" при большом num_threads × batch.
+        # try:
+        #     multiprocessing.set_sharing_strategy("file_system")
+        # except RuntimeError:
+        #     pass  # уже установлено
         
         # Сбрасываем Event перед новой эпохой (важно для повторных вызовов)
         self.mp_done.clear()
@@ -383,8 +391,8 @@ class OBCTrainer:
                 
                 # Collect from workers
                 for i in range(self.num_threads - 1):
-                    pid, worker_memory, worker_logger = queue.get()
-                    memories[pid] = worker_memory
+                    pid, worker_transfer, worker_logger = queue.get()
+                    memories[pid] = OBCMemory.from_transfer_dict(worker_transfer)
                     loggers[pid] = worker_logger
                 
                 # Merge memories
