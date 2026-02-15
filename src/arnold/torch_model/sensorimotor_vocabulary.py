@@ -158,6 +158,18 @@ class SensorimotorVocabulary(nn.Module):
         """Xavier инициализация для лучшей сходимости."""
         nn.init.xavier_uniform_(self.embeddings.weight)
 
+    def _apply(self, fn):
+        """Переносит тензоры в _idx_cache при вызове .to()/.cpu()/.cuda()"""
+        super()._apply(fn)
+        if hasattr(self, "_idx_cache") and isinstance(self._idx_cache, dict):
+            for key, val in list(self._idx_cache.items()):
+                if isinstance(val, (tuple, list)):
+                    self._idx_cache[key] = tuple(
+                        fn(v) if isinstance(v, torch.Tensor) else v
+                        for v in val
+                    )
+        return self
+
     def _build_flat_vocab(self) -> Tuple[List[str], Dict[str, int]]:
         """
         Собирает плоский список всех токенов и маппинг имя -> индекс.
