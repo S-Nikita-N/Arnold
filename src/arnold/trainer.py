@@ -420,6 +420,54 @@ class ArnoldTrainer:
             else:
                 return memory, obc_logger
 
+    def _debug_find_non_cpu_tensors(self) -> None:
+        """Находит все тензоры НЕ на CPU в self и его модулях. Для дебага spawn."""
+        found = []
+
+        # 1. Атрибуты self (trainer)
+        for name in vars(self):
+            obj = getattr(self, name)
+            if isinstance(obj, torch.Tensor) and obj.device.type != 'cpu':
+                found.append(f"self.{name}: {obj.shape} on {obj.device}")
+
+        # 2. Policy parameters & buffers
+        for name, p in self.policy.named_parameters():
+            if p.device.type != 'cpu':
+                found.append(f"policy param '{name}': {p.shape} on {p.device}")
+        for name, b in self.policy.named_buffers():
+            if b.device.type != 'cpu':
+                found.append(f"policy buffer '{name}': {b.shape} on {b.device}")
+
+        # 3. Кастомные dict-атрибуты в модулях (normalizer stats и т.п.)
+        for mod_name, module in self.policy.named_modules():
+            for attr_name in vars(module):
+                obj = getattr(module, attr_name)
+                if isinstance(obj, torch.Tensor) and obj.device.type != 'cpu':
+                    found.append(f"module '{mod_name}'.{attr_name}: {obj.shape} on {obj.device}")
+                elif isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if isinstance(v, torch.Tensor) and v.device.type != 'cpu':
+                            found.append(f"module '{mod_name}'.{attr_name}['{k}']: {v.shape} on {v.device}")
+                        elif isinstance(v, (tuple, list)):
+                            for idx, elem in enumerate(v):
+                                if isinstance(elem, torch.Tensor) and elem.device.type != 'cpu':
+                                    found.append(f"module '{mod_name}'.{attr_name}['{k}'][{idx}]: {elem.shape} on {elem.device}")
+
+        # 4. Optimizer state
+        for pid, state in self.optimizer.state.items():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor) and v.device.type != 'cpu':
+                    found.append(f"optimizer state[{pid}]['{k}']: {v.shape} on {v.device}")
+
+        if found:
+            logger.warning(f"NON-CPU TENSORS BEFORE SPAWN ({len(found)}):")
+            for f in found[:20]:
+                logger.warning(f"  {f}")
+            if len(found) > 20:
+                logger.warning(f"  ... и ещё {len(found) - 20}")
+        else:
+            logger.info("All tensors on CPU — spawn should be safe.")
+
     def sample(self, min_batch_size: int) -> Tuple[OBCBatch, OBCLogger]:
         """
         Собирает траектории.
@@ -436,6 +484,7 @@ class ArnoldTrainer:
         # Run on CPU for multiprocessing
         optimizer_to(self.optimizer, torch.device('cpu'))
         with to_cpu(self.policy):
+            self._debug_find_non_cpu_tensors()
             with torch.no_grad():
                 thread_batch_size = int(math.floor(min_batch_size / self.num_threads))
                 queue = multiprocessing.Queue()
@@ -526,12 +575,14 @@ class ArnoldTrainer:
         batch_size = states.shape[0]
         ppo_losses, imitation_losses, value_losses, entropy_losses = [], [], [], []
 
+        n_batches = max(1, batch_size // self.batch_size)
+        total_updates = self.opt_num_epochs * n_batches
+        pbar_update = tqdm(total=total_updates, desc="Update", unit="batch")
+
         # PPO epochs
         for ppo_epoch in range(self.opt_num_epochs):
             indices = np.arange(batch_size)
             np.random.shuffle(indices)
-
-            n_batches = max(1, batch_size // self.batch_size)
 
             for i in range(n_batches):
                 start_idx = i * self.batch_size
@@ -605,10 +656,12 @@ class ArnoldTrainer:
                 # Проверка на NaN/Inf
                 if isinstance(loss, torch.Tensor) and (torch.isnan(loss) or torch.isinf(loss)):
                     logger.warning("NaN/Inf detected in loss! Skipping mini-batch.")
+                    pbar_update.update(1)
                     continue
 
                 if isinstance(loss, (int, float)) and loss == 0:
                     logger.warning("All loss weights are zero! Nothing to optimize.")
+                    pbar_update.update(1)
                     continue
 
                 # Backward
@@ -620,7 +673,9 @@ class ArnoldTrainer:
                     torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip)
 
                 self.optimizer.step()
+                pbar_update.update(1)
 
+        pbar_update.close()
         return {
             "ppo_loss": float(np.mean(ppo_losses)) if ppo_losses else 0.0,
             "imitation_loss": float(np.mean(imitation_losses)) if imitation_losses else 0.0,
@@ -906,8 +961,3 @@ class ArnoldTrainer:
         )
 
         return metrics
-
-
-# ==================== Backward compatibility ====================
-# Старый импорт: from arnold.obc_trainer import OBCTrainer
-OBCTrainer = ArnoldTrainer

@@ -15,12 +15,16 @@
     # PPO на MyoHuman, с переносом знаний из OBC чекпоинта
     poetry run python -m arnold.train_arnold \
         env=myohuman \
+        device=mps \
         'run.experts=[{type: myohuman, config_path: null, checkpoint_epoch: 0}]' \
+        run.num_threads=5 \
         resume_checkpoint=data/trained_models/obc_run_A100_80GB_3/model_best_ep_length.pth \
         learning.ppo_weight=1.0 \
         learning.imitation_weight=0 \
         learning.entropy_weight=0.001 \
         learning.value_weight=0.5 \
+        learning.batch_size=64 \
+        learning.min_batch_size=5120 \
         exp_name=ppo_myohuman_transfer_1
 """
 
@@ -30,7 +34,7 @@ import logging
 import warnings
 
 from pathlib import Path
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -38,14 +42,14 @@ from arnold.trainer import ArnoldTrainer
 
 # Загрузка .env из корня репо
 _repo_root = Path(__file__).resolve().parent.parent.parent
-load_dotenv(_repo_root / ".env")
 
-_http_proxy = os.getenv("HTTP_PROXY")
-_https_proxy = os.getenv("HTTPS_PROXY")
-if _http_proxy:
-    os.environ["HTTP_PROXY"] = _http_proxy
-if _https_proxy:
-    os.environ["HTTPS_PROXY"] = _https_proxy
+# load_dotenv(_repo_root / ".env")
+# _http_proxy = os.getenv("HTTP_PROXY")
+# _https_proxy = os.getenv("HTTPS_PROXY")
+# if _http_proxy:
+#     os.environ["HTTP_PROXY"] = _http_proxy
+# if _https_proxy:
+#     os.environ["HTTPS_PROXY"] = _https_proxy
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
