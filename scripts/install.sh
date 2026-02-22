@@ -1,6 +1,13 @@
 #!/bin/bash
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Путь к скрипту: в zsh BASH_SOURCE не задан, используем ${(%):-%x}
+if [ -n "${BASH_SOURCE[0]}" ]; then
+  _SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [ -n "$ZSH_VERSION" ]; then
+  _SCRIPT_PATH="${(%):-%x}"
+else
+  _SCRIPT_PATH="$0"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_PATH")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
