@@ -135,11 +135,12 @@ class SignatureNormalizerModule(nn.Module):
             stds = torch.sqrt(M2s / counts + 1e-8)
             return (values - means.view(1, n, 1)) / stds.view(1, n, 1)
 
+        elif len(known_t) == 0:
+            return values.clone()
+
         else:
             out = values.clone()
             k_idx = known_t.tolist()
-            if len(k_idx) == 0:
-                return out
             means = torch.stack([self.stats[keys[i]][1] for i in k_idx]).to(device)
             M2s = torch.stack([self.stats[keys[i]][2] for i in k_idx]).to(device)
             counts = torch.tensor(

@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.torch_model.normalization import SignatureNormalizerModule
 from arnold.torch_model.sensory_encoder import SensoryEncoder
+from arnold.profiler import SamplingProfiler
 
 
 class TransformerPolicy(nn.Module):
@@ -99,8 +100,17 @@ class TransformerPolicy(nn.Module):
         # Value query embedding (learnable)
         self.value_query = nn.Parameter(torch.randn(1, 1, embed_dim))
         
+        # Профайлер (None = отключён). Устанавливается снаружи через enable_profiling()
+        self.profiler: Optional[SamplingProfiler] = None
+
         self._init_weights()
-    
+
+    def enable_profiling(self, profiler: SamplingProfiler) -> None:
+        self.profiler = profiler
+
+    def disable_profiling(self) -> None:
+        self.profiler = None
+
     def _init_weights(self):
         """Xavier инициализация для всех Linear слоев."""
         for module in self.modules():
@@ -160,20 +170,42 @@ class TransformerPolicy(nn.Module):
             log_std: [batch, num_actions] или None
             value: [batch, 1] или None
         """
+        p = self.profiler
         batch_size = obs_timeseries.shape[0]
+
         # 1. Нормализация наблюдений
-        obs_timeseries = self.obs_normalizer(obs_signatures, obs_timeseries)    
-        # 2. Encode observations
-        sensory_emb = self.encode_observations(obs_timeseries, obs_signatures)
+        if p: p.tick("  normalizer")
+        obs_timeseries = self.obs_normalizer(obs_signatures, obs_timeseries)
+        if p: p.tock("  normalizer")
 
-        # 3. Transformer Encoder
-        encoder_out = self.encoder(sensory_emb)  # [batch, n_obs, embed_dim]
+        # 2. Sensory encoder (linear projection временного ряда)
+        if p: p.tick("  sensory_encoder")
+        sensory_emb = self.sensory_encoder(obs_timeseries)
+        if p: p.tock("  sensory_encoder")
 
-        # 4. Action Decoder + mean head
+        # 3. Vocab embedding для obs (role embeddings)
+        if p: p.tick("  vocab_embed_obs")
+        role_emb = self.vocab.get_embedding_batch(obs_signatures)
+        role_emb = role_emb.unsqueeze(0).expand(batch_size, -1, -1)
+        sensory_emb = sensory_emb + role_emb
+        if p: p.tock("  vocab_embed_obs")
+
+        # 4. Transformer Encoder
+        if p: p.tick("  transformer_encoder")
+        encoder_out = self.encoder(sensory_emb)
+        if p: p.tock("  transformer_encoder")
+
+        # 5. Vocab embedding для actions (action queries)
+        if p: p.tick("  vocab_embed_act")
         action_query = self.vocab.get_embedding_batch(action_signatures)
         action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)
+        if p: p.tock("  vocab_embed_act")
+
+        # 6. Action Decoder + mean head
+        if p: p.tick("  action_decoder")
         action_out = self.action_decoder(action_query, encoder_out)
         actions = self.action_mean_head(action_out).squeeze(-1)
+        if p: p.tock("  action_decoder")
 
         log_std = None
         if return_std:
@@ -187,12 +219,15 @@ class TransformerPolicy(nn.Module):
             log_std = log_sigma_global + log_soft + log_norm_factor
             log_std = torch.clamp(log_std, min=-4.6, max=2.3)
 
+        # 7. Value Decoder
         value = None
         if return_value:
+            if p: p.tick("  value_decoder")
             value_query = self.value_query.expand(batch_size, -1, -1)
             value_encoder_out = encoder_out.detach() if self.detached_value_encoder else encoder_out
             value_out = self.value_decoder(value_query, value_encoder_out)
             value = self.value_head(value_out).squeeze(-1)
+            if p: p.tock("  value_decoder")
 
         return actions, log_std, value
     

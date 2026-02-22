@@ -45,6 +45,7 @@ from arnold.memory import OBCMemory, OBCBatch
 from arnold.logger import OBCLogger
 from arnold.wandb_logger import WandbLogger
 from arnold.learning_utils import to_test, to_cpu, optimizer_to
+from arnold.profiler import SamplingProfiler
 
 # Игнорируем SyntaxWarning про invalid escape sequence в docstrings Kinesis
 warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
@@ -202,6 +203,9 @@ class ArnoldTrainer:
         # Multiprocessing Event
         self.mp_done = multiprocessing.Event()
 
+        # Профайлер семплирования (только main process)
+        self.sampling_profiler = SamplingProfiler()
+
         # Setup
         self.setup_expert()
         self.setup_parser()
@@ -345,7 +349,12 @@ class ArnoldTrainer:
         memory = OBCMemory()
         obc_logger = OBCLogger()
 
+        # Профайлер только в main process (pid==0)
+        profiler: Optional[SamplingProfiler] = None
         if pid == 0:
+            profiler = self.sampling_profiler
+            profiler.reset()
+            self.policy.enable_profiling(profiler)
             pbar = tqdm(total=min_batch_size, desc="Sampling", unit="step")
 
         # Для PPO-only: заготовка нулевого expert_action
@@ -358,29 +367,38 @@ class ArnoldTrainer:
                 worker_parser.reset(obs)
 
                 for t in range(10000):
-                    # Get observation for Arnold
+                    # --- parser.get_observation ---
+                    if profiler: profiler.tick("parser.get_obs")
                     obs_ts, obs_sigs = worker_parser.get_observation(torch.device("cpu"))
                     act_sigs = worker_parser.get_action_signatures()
+                    if profiler: profiler.tock("parser.get_obs")
 
-                    # Arnold forward — get action with log_prob
+                    # --- policy.get_action (внутри — sub-компоненты через хуки в forward) ---
+                    if profiler: profiler.tick("policy.forward")
                     with torch.no_grad():
                         student_action, log_prob, value = self.policy.get_action(
                             obs_ts, obs_sigs, act_sigs, deterministic=False
                         )
+                    if profiler: profiler.tock("policy.forward")
 
-                    # Expert action (только если используем имитацию)
+                    # --- expert.get_expert_action ---
                     if self.use_expert:
+                        if profiler: profiler.tick("expert.get_action")
                         expert_action = self.expert.get_expert_action(obs)
                         expert_action_t = torch.from_numpy(expert_action).float()
+                        if profiler: profiler.tock("expert.get_action")
                     else:
                         expert_action_t = zero_expert
 
-                    # Step environment with student action
+                    # --- env.step ---
                     student_action_np = student_action.squeeze(0).cpu().numpy()
+                    if profiler: profiler.tick("env.step")
                     next_obs, reward, terminated, truncated, info = self.expert.step(student_action_np)
+                    if profiler: profiler.tock("env.step")
                     done = terminated or truncated
 
-                    # Store in memory
+                    # --- memory.append ---
+                    if profiler: profiler.tick("memory.append")
                     memory.states.append(obs_ts.squeeze(0).cpu())
                     memory.obs_signatures.append(obs_sigs)
                     memory.action_signatures.append(act_sigs)
@@ -390,6 +408,7 @@ class ArnoldTrainer:
                     memory.values.append(value.squeeze(0).cpu())
                     memory.masks.append(0.0 if done else 1.0)
                     memory.log_probs.append(log_prob.squeeze(0).cpu())
+                    if profiler: profiler.tock("memory.append")
 
                     obc_logger.step(
                         reward=reward,
@@ -402,8 +421,10 @@ class ArnoldTrainer:
                     if done:
                         break
 
-                    # Update parser and state
+                    # --- parser.update ---
+                    if profiler: profiler.tick("parser.update")
                     worker_parser.update(next_obs)
+                    if profiler: profiler.tock("parser.update")
                     obs = next_obs
 
                 obc_logger.end_episode()
@@ -416,6 +437,7 @@ class ArnoldTrainer:
         finally:
             if pid == 0:
                 pbar.close()
+                self.policy.disable_profiling()
 
             if queue is not None:
                 queue.put([pid, memory.to_transfer_dict(), obc_logger])
@@ -712,6 +734,10 @@ class ArnoldTrainer:
         """Логирует метрики эпохи."""
         log_str = obc_logger.get_log_str(epoch=epoch, exp_name=self.exp_name)
         logger.info(log_str)
+        logger.info(
+            f"Sampling profile (epoch {epoch}, main process):\n"
+            + self.sampling_profiler.report()
+        )
 
         if self.use_wandb:
             self.wandb_logger.log_train(

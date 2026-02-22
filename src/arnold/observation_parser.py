@@ -86,8 +86,7 @@ class ObservationParser:
         
         # History buffer
         self._history: Optional[np.ndarray] = None  # [n_obs_elements, history_len]
-        self._obs_signatures: List[Tuple[str, ...]] = []
-        self._flat_to_struct_map: List[Tuple[int, int]] = []  # (spec_idx, local_idx)
+        self.obs_signatures: List[Tuple[str, ...]] = []
         
         # Строим flat signatures и mapping
         self._build_flat_signatures()
@@ -347,14 +346,12 @@ class ObservationParser:
         return sigs
     
     def _build_flat_signatures(self) -> None:
-        """Строит flat список signatures и mapping."""
-        self._obs_signatures = []
-        self._flat_to_struct_map = []
+        """Строит flat список signatures."""
+        self.obs_signatures = []
         
-        for spec_idx, spec in enumerate(self.obs_specs):
-            for local_idx, sig in enumerate(spec.signatures):
-                self._obs_signatures.append(sig)
-                self._flat_to_struct_map.append((spec_idx, local_idx))
+        for spec in self.obs_specs:
+            for sig in spec.signatures:
+                self.obs_signatures.append(sig)
     
     def reset(self, initial_obs: np.ndarray) -> None:
         """
@@ -395,56 +392,9 @@ class ObservationParser:
         # [n_obs_elements, history_len] -> [1, n_obs_elements, history_len]
         obs_ts = torch.from_numpy(self._history).float().unsqueeze(0).to(device)
         
-        return obs_ts, self._obs_signatures
+        return obs_ts, self.obs_signatures
     
     def get_action_signatures(self) -> List[Tuple[str, ...]]:
         """Возвращает signatures для action outputs."""
         return self.action_signatures
     
-    @property
-    def obs_signatures(self) -> List[Tuple[str, ...]]:
-        """Signatures для всех observation elements."""
-        return self._obs_signatures
-
-
-class ObservationParserSimple:
-    """
-    Упрощённый парсер, который не требует знания структуры observations.
-    
-    Использует generic signatures вида ("obs", idx) для каждого элемента.
-    Подходит для быстрого прототипирования.
-    """
-    
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        history_len: int = 5,
-    ):
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
-        self.history_len = history_len
-        
-        # Generic signatures
-        self._obs_signatures = [("position", "c", "value", str(i)) for i in range(obs_dim)]
-        self._action_signatures = [("muscle", "c", "activation", str(i)) for i in range(action_dim)]
-        
-        self._history: Optional[np.ndarray] = None
-    
-    def reset(self, initial_obs: np.ndarray) -> None:
-        self._history = np.tile(initial_obs[:, np.newaxis], (1, self.history_len))
-    
-    def update(self, obs: np.ndarray) -> None:
-        if self._history is None:
-            raise RuntimeError("Parser not initialized. Call reset() first.")
-        self._history = np.roll(self._history, -1, axis=1)
-        self._history[:, -1] = obs
-    
-    def get_observation(self, device: torch.device = torch.device("cpu")) -> Tuple[torch.Tensor, List[Tuple[str, ...]]]:
-        if self._history is None:
-            raise RuntimeError("Parser not initialized. Call reset() first.")
-        obs_ts = torch.from_numpy(self._history).float().unsqueeze(0).to(device)
-        return obs_ts, self._obs_signatures
-    
-    def get_action_signatures(self) -> List[Tuple[str, ...]]:
-        return self._action_signatures
