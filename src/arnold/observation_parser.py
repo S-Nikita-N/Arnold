@@ -79,9 +79,7 @@ class ObservationParser:
         self.obs_specs: List[ObservationSpec] = []
         self._build_observation_specs()
         
-        # Общее число элементов в flat observation и структурированных элементов
-        self.flat_obs_size = sum(spec.size for spec in self.obs_specs)
-        self.n_obs_elements = sum(len(spec.signatures) for spec in self.obs_specs)
+        self.n_obs_elements = sum(spec.size for spec in self.obs_specs)
         
         # Сигнатуры для actions (muscle activations)
         self.action_signatures = self._build_action_signatures()
@@ -367,46 +365,21 @@ class ObservationParser:
         Args:
             initial_obs: Flat observation [flat_obs_size]
         """
-        structured = self._flat_to_structured(initial_obs)
-        # Заполняем историю одним obs
-        self._history = np.tile(structured[:, np.newaxis], (1, self.history_len))
+        obs_f32 = initial_obs.astype(np.float32)
+        self._history = np.tile(obs_f32[:, np.newaxis], (1, self.history_len))
     
     def update(self, obs: np.ndarray) -> None:
         """
         Обновляет историю новым наблюдением.
         
         Args:
-            obs: Flat observation [flat_obs_size]
+            obs: Flat observation
         """
         if self._history is None:
             raise RuntimeError("Parser not initialized. Call reset() first.")
         
-        structured = self._flat_to_structured(obs)
-        # Сдвигаем историю и добавляем новое obs
-        self._history = np.roll(self._history, -1, axis=1)
-        self._history[:, -1] = structured
-    
-    def _flat_to_structured(self, flat_obs: np.ndarray) -> np.ndarray:
-        """
-        Конвертирует flat observation в structured (one timestep).
-        
-        Args:
-            flat_obs: [flat_obs_size]
-        
-        Returns:
-            [n_obs_elements] - каждый элемент это одно значение
-        """
-        structured = np.zeros(self.n_obs_elements, dtype=np.float32)
-        
-        flat_idx = 0
-        struct_idx = 0
-        for spec in self.obs_specs:
-            for i in range(spec.size):
-                structured[struct_idx] = flat_obs[flat_idx]
-                flat_idx += 1
-                struct_idx += 1
-        
-        return structured
+        self._history[:, :-1] = self._history[:, 1:]
+        self._history[:, -1] = obs
     
     def get_observation(self, device: torch.device = torch.device("cpu")) -> Tuple[torch.Tensor, List[Tuple[str, ...]]]:
         """
