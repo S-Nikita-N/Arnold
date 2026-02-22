@@ -12,10 +12,19 @@ headless: true
 # ==================== Paths ====================
 output_dir: data/trained_models/${exp_name}
 
-# ==================== Expert ====================
-expert:
-  config_path: null  # Path to Kinesis config.yaml
-  checkpoint_epoch: -1  # -1 = latest
+# ==================== Experts ====================
+# Список сред/экспертов для обучения.
+# type: kinesis | myohuman
+#   kinesis   — MyoLegs эксперт (Kinesis submodule)
+#   myohuman  — Полнотелый эксперт (MyoHuman submodule)
+# checkpoint_epoch: -1 = latest, 0 = без экспертной policy, >0 = конкретная эпоха
+#
+# Если len(experts) > 1 — требуется кросс-задачная нормализация (не реализована).
+# PPO-only: установить checkpoint_epoch=0 и learning.imitation_weight=0.
+experts:
+  - type: kinesis
+    config_path: null
+    checkpoint_epoch: -1
 
 # ==================== Evaluation ====================
 eval_frequency: 100  # Частота валидации (каждые N эпох), 0 = отключить

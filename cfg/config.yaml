@@ -7,19 +7,20 @@ defaults:
 # ==================== Experiment ====================
 project: arnold
 exp_name: arnold_obc
-notes: "Arnold OBC Training"
+notes: "Arnold Training"
 
 # ==================== Hardware ====================
 device: cuda
 seed: 42
 
 # ==================== Logging ====================
-use_wandb: false
+use_wandb: true
 wandb_project: arnold
 no_log: false
 
 # ==================== Resume ====================
 epoch: 0  # 0 = start from scratch, >0 = resume, -1 = latest
+resume_checkpoint: null  # Путь к .pth для resume из произвольного чекпоинта (перекрывает epoch)
 
 # ==================== Hydra ====================
 hydra:

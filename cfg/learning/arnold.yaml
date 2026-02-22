@@ -31,6 +31,3 @@ detached_value_encoder: false
 min_batch_size: 51200
 max_epochs: 100000
 use_scheduler: false
-
-# ==================== Debug ====================
-debug_checkpoints: false  # Сохранять чекпоинты перед каждым update для дебага

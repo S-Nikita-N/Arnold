@@ -1,10 +1,22 @@
+# Validation Run Config
+
 # ==================== Checkpoint ====================
 checkpoint: ""  # путь к .pth (обязателен для validate_policy)
 
 # ==================== Visualization ====================
-headless: true
+headless: false
 num_motions: -1  # -1 = все движения
 sleep_per_step: 0.0  # задержка между шагами (сек)
+
+# ==================== Parallelism ====================
+num_threads: 1
+
+# ==================== Experts ====================
+# Аналогично train.yaml, но для валидации используется mode="valid"
+experts:
+  - type: kinesis
+    config_path: null
+    checkpoint_epoch: -1
 
 # ==================== Performance ====================
 # При true: не считать std head и value decoder в get_action (быстрее при eval)
