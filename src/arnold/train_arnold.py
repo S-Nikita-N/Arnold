@@ -34,28 +34,12 @@ import logging
 import warnings
 
 from pathlib import Path
-# from dotenv import load_dotenv
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from arnold.trainer import ArnoldTrainer
 
-# Загрузка .env из корня репо
 _repo_root = Path(__file__).resolve().parent.parent.parent
-
-# load_dotenv(_repo_root / ".env")
-# _http_proxy = os.getenv("HTTP_PROXY")
-# _https_proxy = os.getenv("HTTPS_PROXY")
-# if _http_proxy:
-#     os.environ["HTTP_PROXY"] = _http_proxy
-# if _https_proxy:
-#     os.environ["HTTPS_PROXY"] = _https_proxy
-
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
 warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
 
 
