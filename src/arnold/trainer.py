@@ -210,7 +210,7 @@ class ArnoldTrainer:
 
         # Load checkpoint if specified
         if self.resume_checkpoint:
-            self._load_from_path(self.resume_checkpoint, resume_training=False)
+            self._load_from_path(self.resume_checkpoint, resume_training=not cfg.learning.transfer_mode)
         else:
             self.load_checkpoint(self.checkpoint_epoch)
 
