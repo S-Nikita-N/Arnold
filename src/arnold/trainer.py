@@ -210,7 +210,7 @@ class ArnoldTrainer:
 
         # Load checkpoint if specified
         if self.resume_checkpoint:
-            self._load_from_path(self.resume_checkpoint, restore_optimizer=False)
+            self._load_from_path(self.resume_checkpoint, resume_training=False)
         else:
             self.load_checkpoint(self.checkpoint_epoch)
 
@@ -757,9 +757,9 @@ class ArnoldTrainer:
                 logger.warning(f"Checkpoint not found: {path}")
                 return
 
-        self._load_from_path(path, restore_optimizer=True)
+        self._load_from_path(path, resume_training=True)
 
-    def _load_from_path(self, path: str, restore_optimizer: bool = True) -> None:
+    def _load_from_path(self, path: str, resume_training: bool = True) -> None:
         """
         Внутренний метод загрузки чекпоинта.
 
@@ -778,7 +778,7 @@ class ArnoldTrainer:
             logger.info("Trying partial load (strict=False) for cross-environment transfer...")
             self.policy.load_state_dict(checkpoint["policy"], strict=False)
 
-        if restore_optimizer:
+        if resume_training:
             self.epoch = checkpoint["epoch"] + 1
             self.num_steps = checkpoint["num_steps"]
             if "optimizer" in checkpoint:
@@ -789,6 +789,18 @@ class ArnoldTrainer:
             # Transfer learning: сбрасываем эпоху, оптимизатор оставляем свежим
             self.epoch = 0
             self.num_steps = 0
+
+            logger.info("Transfer mode: resetting observation normalizer statistics")
+            self.policy.obs_normalizer.stats.clear()
+
+            logger.info("Transfer mode: reinitializing value decoder and value head")
+            for module in [self.policy.value_decoder, self.policy.value_head]:
+                for param in module.parameters():
+                    if param.dim() >= 2:
+                        nn.init.xavier_uniform_(param)
+                    elif param.dim() == 1:
+                        nn.init.zeros_(param)
+            nn.init.normal_(self.policy.value_query.data)
 
         prev_mode = checkpoint.get("training_mode", "unknown")
         src_epoch = checkpoint.get("epoch", "?")
