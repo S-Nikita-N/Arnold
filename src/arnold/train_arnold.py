@@ -30,22 +30,22 @@
 
 import os
 import sys
+import hydra
 import logging
 import warnings
 
 from pathlib import Path
-
-import hydra
 from omegaconf import DictConfig, OmegaConf
-from arnold.trainer import ArnoldTrainer
-
-_repo_root = Path(__file__).resolve().parent.parent.parent
-warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+from arnold.trainer import ArnoldTrainer
+
+_repo_root = Path(__file__).resolve().parent.parent.parent
+warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
 
 
 def setup_logging(output_dir: str) -> logging.Logger:
