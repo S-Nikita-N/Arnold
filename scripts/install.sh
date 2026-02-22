@@ -50,15 +50,11 @@ echo "Installing chumpy (no build isolation: avoids 'No module named pip' in bui
 PIP_NO_BUILD_ISOLATION=1 poetry run pip install --no-build-isolation "chumpy==0.70"
 
 echo "Patching chumpy for Python >=3.11 (getargspec -> getfullargspec)..."
-CH_FILE=$(
-poetry run python <<'PY'
-import site
-import pathlib
-
-site_packages = next(p for p in site.getsitepackages() if "site-packages" in p)
-print(pathlib.Path(site_packages) / "chumpy" / "ch.py")
-PY
-)
+CH_FILE=$(cd "$REPO_ROOT" && poetry run python -c "
+import site, pathlib
+p = next(p for p in site.getsitepackages() if 'site-packages' in p)
+print(pathlib.Path(p) / 'chumpy' / 'ch.py')
+")
 if [ -n "$CH_FILE" ] && [ -f "$CH_FILE" ]; then
     # ИСПОЛЬЗУЕМ sedi ВМЕСТО sed -i
     sedi 's/inspect.getargspec/inspect.getfullargspec/g' "$CH_FILE"
@@ -68,16 +64,11 @@ else
 fi
 
 echo "Patching chumpy __init__.py for NumPy>=2.0 imports..."
-CH_INIT=$(
-poetry run python <<'PY'
-import site
-import pathlib
-
-site_packages = next(p for p in site.getsitepackages() if "site-packages" in p)
-f = pathlib.Path(site_packages) / "chumpy" / "__init__.py"
-print(f)
-PY
-)
+CH_INIT=$(cd "$REPO_ROOT" && poetry run python -c "
+import site, pathlib
+p = next(p for p in site.getsitepackages() if 'site-packages' in p)
+print(pathlib.Path(p) / 'chumpy' / '__init__.py')
+")
 if [ -n "$CH_INIT" ] && [ -f "$CH_INIT" ]; then
     # ИСПОЛЬЗУЕМ sedi ВМЕСТО sed -i
     sedi 's/from numpy import bool, int, float, complex, object, unicode, str, nan, inf/from numpy import nan, inf/g' "$CH_INIT"
