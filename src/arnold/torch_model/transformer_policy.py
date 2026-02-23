@@ -100,7 +100,7 @@ class TransformerPolicy(nn.Module):
         self.action_std_head = nn.Linear(embed_dim, 1)
         self.value_head = nn.Linear(embed_dim, 1)
 
-        self.log_sigma_global = nn.Parameter(torch.zeros(1))
+        self.log_sigma_global = nn.Parameter(torch.full((1,), -1.2))
         self.value_query = nn.Parameter(torch.randn(1, 1, embed_dim))
 
         self.profiler: Optional[SamplingProfiler] = None
@@ -178,7 +178,7 @@ class TransformerPolicy(nn.Module):
         # 6. Action Decoder: n_action queries × 70 keys
         if p: p.tick("  action_decoder")
         action_out = self.action_decoder(action_query, encoder_out)
-        actions = self.action_mean_head(action_out).squeeze(-1)
+        actions = torch.tanh(self.action_mean_head(action_out).squeeze(-1))
         if p: p.tock("  action_decoder")
 
         log_std = None
