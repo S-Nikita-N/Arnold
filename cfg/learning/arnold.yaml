@@ -4,18 +4,20 @@
 embed_dim: 128
 ff_dim: 512
 num_heads: 4
-num_layers: 6
+num_enc_layers: 6
+num_act_dec_layers: 6
+num_val_dec_layers: 1
 dropout: 0.0
 history_len: 5
 
 # ==================== PPO ====================
-batch_size: 256
+batch_size: 128
 learning_rate: 1.e-4
 weight_decay: 0.0
 gamma: 0.99
 tau: 0.95  # GAE lambda
 clip_epsilon: 0.2
-opt_num_epochs: 3
+opt_num_epochs: 10
 grad_clip: 0.5
 
 # ==================== OBC Loss Weights ====================
@@ -31,6 +33,5 @@ detached_value_encoder: false
 min_batch_size: 51200
 max_epochs: 100000
 use_scheduler: false
-transfer_mode: true  # true — перенос знаний из другого чекпоинта
-# torch.compile для ускорения forward (CPU/GPU). Первый прогон — компиляция.
+transfer_mode: true
 use_compile: false

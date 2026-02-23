@@ -139,7 +139,9 @@ class ArnoldTrainer:
         self.embed_dim = cfg.learning.embed_dim
         self.ff_dim = cfg.learning.ff_dim
         self.num_heads = cfg.learning.num_heads
-        self.num_layers = cfg.learning.num_layers
+        self.num_enc_layers = cfg.learning.num_enc_layers
+        self.num_act_dec_layers = cfg.learning.num_act_dec_layers
+        self.num_val_dec_layers = cfg.learning.num_val_dec_layers
         self.dropout = cfg.learning.dropout
 
         # PPO/Training (из cfg.learning)
@@ -289,14 +291,21 @@ class ArnoldTrainer:
         # Vocabulary
         self.vocab = SensorimotorVocabulary(embed_dim=self.embed_dim)
 
+        # Body groups для body-level tokenization
+        groups = self.parser.get_body_groups()
+        logger.info(f"Body tokenizer: {len(groups)} groups (from {self.parser.n_obs_elements} flat obs)")
+
         # Policy
         self.policy = TransformerPolicy(
             vocab=self.vocab,
+            groups=groups,
             history_len=self.history_len,
             embed_dim=self.embed_dim,
             ff_dim=self.ff_dim,
             num_heads=self.num_heads,
-            num_layers=self.num_layers,
+            num_enc_layers=self.num_enc_layers,
+            num_act_dec_layers=self.num_act_dec_layers,
+            num_val_dec_layers=self.num_val_dec_layers,
             dropout=self.dropout,
             detached_value_encoder=self.detached_value_encoder,
         )

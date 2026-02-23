@@ -66,7 +66,7 @@ class SamplingProfiler:
             "parser.get_obs",
             "policy.forward",
             "  normalizer",
-            "  sensory_encoder",
+            "  body_tokenizer",
             "  vocab_embed_obs",
             "  transformer_encoder",
             "  vocab_embed_act",

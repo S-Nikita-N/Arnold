@@ -34,43 +34,57 @@ from arnold.torch_model.transformer_policy import TransformerPolicy
 logger = logging.getLogger(__name__)
 
 
-def load_policy(checkpoint_path: str, device: torch.device, learning_cfg) -> tuple:
+def load_policy(
+    checkpoint_path: str,
+    device: torch.device,
+    learning_cfg,
+    parser: ObservationParser,
+) -> tuple:
     """
     Загружает политику из чекпоинта.
-    
+
     Returns:
         (policy, hyperparams) — политика и гиперпараметры из чекпоинта
     """
     logger.info(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
-    # Гиперпараметры архитектуры — только из подконфига learning
+
     embed_dim = learning_cfg.embed_dim
     ff_dim = learning_cfg.ff_dim
     num_heads = learning_cfg.num_heads
-    num_layers = learning_cfg.num_layers
+    num_enc_layers = learning_cfg.num_enc_layers
+    num_act_dec_layers = learning_cfg.num_act_dec_layers
+    num_val_dec_layers = learning_cfg.num_val_dec_layers
     dropout = learning_cfg.dropout
     history_len = learning_cfg.history_len
-    
+
+    groups = parser.get_body_groups()
     vocab = SensorimotorVocabulary(embed_dim=embed_dim)
     policy = TransformerPolicy(
         vocab=vocab,
+        groups=groups,
         history_len=history_len,
         embed_dim=embed_dim,
         ff_dim=ff_dim,
         num_heads=num_heads,
-        num_layers=num_layers,
+        num_enc_layers=num_enc_layers,
+        num_act_dec_layers=num_act_dec_layers,
+        num_val_dec_layers=num_val_dec_layers,
         dropout=dropout,
     )
-    
+
     policy.load_state_dict(checkpoint["policy"])
     policy.to(device)
     policy.eval()
-    
+
     logger.info(f"Policy loaded. Parameters: {sum(p.numel() for p in policy.parameters()):,}")
-    logger.info(f"  embed_dim={embed_dim}, ff_dim={ff_dim}, num_heads={num_heads}, "
-                f"num_layers={num_layers}, history_len={history_len}")
-    
+    logger.info(
+        f"  embed_dim={embed_dim}, ff_dim={ff_dim}, num_heads={num_heads}, "
+        f"enc_layers={num_enc_layers}, act_dec_layers={num_act_dec_layers}, "
+        f"val_dec_layers={num_val_dec_layers}, history_len={history_len}, "
+        f"body_groups={len(groups)}"
+    )
+
     return policy, {"history_len": history_len}
 
 
@@ -91,15 +105,12 @@ def validate(cfg: DictConfig) -> dict:
         )
     
     device = torch.device(cfg.device)
-    
-    # Загружаем политику (архитектура из cfg.learning)
-    policy, hp = load_policy(checkpoint, device, cfg.learning)
-    history_len = hp["history_len"]
-    
+    history_len = cfg.learning.history_len
+
     # Параметры run для валидации
     headless = run.headless
     sleep_per_step = run.sleep_per_step
-    
+
     logger.info(f"Loading expert environment (valid mode, headless={headless})...")
 
     experts_list = cfg.run.experts
@@ -110,10 +121,13 @@ def validate(cfg: DictConfig) -> dict:
     overrides = [f"run.headless={str(headless).lower()}"]
     expert = create_expert_wrapper(expert_entry, mode="valid", overrides=overrides)
     logger.info(f"Expert loaded. Obs dim: {expert.obs_dim}, Action dim: {expert.action_dim}")
-    
-    # Создаём парсер
+
+    # Создаём парсер (нужен для body groups при создании policy)
     parser = ObservationParser.from_env(expert.env, history_len=history_len)
     logger.info(f"Parser: {parser.n_obs_elements} observation elements")
+
+    # Загружаем политику (архитектура из cfg.learning, groups из parser)
+    policy, hp = load_policy(checkpoint, device, cfg.learning, parser)
     
     # Собираем метрики
     episode_rewards = []

@@ -22,6 +22,16 @@ class ObservationSpec:
     signatures: List[Tuple[str, ...]] = field(default_factory=list)
 
 
+@dataclass
+class BodyGroup:
+    """Группа наблюдений, объединённых по телу/мышце для body-level tokenization."""
+    name: str
+    side: str
+    group_type: str  # "root", "body", "muscle", "task", "task_muscle", "feet"
+    flat_indices: List[int]
+    signature: Tuple[str, ...]
+
+
 class ObservationParser:
     """
     Парсит flat observation из среды Kinesis/MyoLegsIm в structured формат для Arnold.
@@ -397,4 +407,82 @@ class ObservationParser:
     def get_action_signatures(self) -> List[Tuple[str, ...]]:
         """Возвращает signatures для action outputs."""
         return self.action_signatures
+
+    def get_body_groups(self) -> List[BodyGroup]:
+        """
+        Строит body-level группы из flat obs specs.
+
+        Вместо ~953 скалярных токенов создаёт ~70 body-level токенов,
+        объединяя все наблюдения одного тела/мышцы в один группу.
+        """
+        BODY_SPECS = {"local_body_pos", "local_body_rot", "local_body_vel", "local_body_ang_vel"}
+        ROOT_SPECS = {"root_height", "root_tilt"}
+        MUSCLE_SPECS = {"muscle_len", "muscle_vel", "muscle_force"}
+        TASK_BODY_SPECS = {"diff_local_body_pos", "diff_local_vel", "local_ref_body_pos"}
+        TASK_MUSCLE_SPECS = {"diff_muscle_len", "diff_muscle_vel"}
+
+        root_indices: List[int] = []
+        body_indices: dict = {}
+        muscle_indices: dict = {}
+        task_body_indices: dict = {}
+        task_muscle_indices: dict = {}
+        feet_indices: List[int] = []
+
+        offset = 0
+        for spec in self.obs_specs:
+            if spec.name in ROOT_SPECS:
+                for i in range(spec.size):
+                    root_indices.append(offset + i)
+
+            elif spec.name in BODY_SPECS:
+                for i, sig in enumerate(spec.signatures):
+                    name, side = sig[0], sig[1]
+                    if name == "root":
+                        root_indices.append(offset + i)
+                    else:
+                        key = (name, side)
+                        body_indices.setdefault(key, []).append(offset + i)
+
+            elif spec.name in MUSCLE_SPECS:
+                for i, sig in enumerate(spec.signatures):
+                    key = (sig[0], sig[1])
+                    muscle_indices.setdefault(key, []).append(offset + i)
+
+            elif spec.name == "feet_contacts":
+                for i in range(spec.size):
+                    feet_indices.append(offset + i)
+
+            elif spec.name in TASK_BODY_SPECS:
+                for i, sig in enumerate(spec.signatures):
+                    key = (sig[0], sig[1])
+                    task_body_indices.setdefault(key, []).append(offset + i)
+
+            elif spec.name in TASK_MUSCLE_SPECS:
+                for i, sig in enumerate(spec.signatures):
+                    key = (sig[0], sig[1])
+                    task_muscle_indices.setdefault(key, []).append(offset + i)
+
+            offset += spec.size
+
+        groups: List[BodyGroup] = []
+
+        if root_indices:
+            groups.append(BodyGroup("root", "c", "root", root_indices, ("root", "c")))
+
+        for (name, side), indices in body_indices.items():
+            groups.append(BodyGroup(name, side, "body", indices, (name, side)))
+
+        for (name, side), indices in muscle_indices.items():
+            groups.append(BodyGroup(name, side, "muscle", indices, (name, side, "muscle")))
+
+        if feet_indices:
+            groups.append(BodyGroup("contacts", "c", "feet", feet_indices, ("contacts", "c")))
+
+        for (name, side), indices in task_body_indices.items():
+            groups.append(BodyGroup(name, side, "task", indices, (name, side, "error")))
+
+        for (name, side), indices in task_muscle_indices.items():
+            groups.append(BodyGroup(name, side, "task_muscle", indices, (name, side, "muscle", "error")))
+
+        return groups
     
