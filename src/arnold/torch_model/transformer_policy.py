@@ -100,17 +100,21 @@ class TransformerPolicy(nn.Module):
         self.action_std_head = nn.Linear(embed_dim, 1)
         self.value_head = nn.Linear(embed_dim, 1)
 
-        self.log_sigma_global = nn.Parameter(torch.full((1,), -1.2))
+        self.log_sigma_global = nn.Parameter(torch.zeros(1))
         self.value_query = nn.Parameter(torch.randn(1, 1, embed_dim))
 
         self.profiler: Optional[SamplingProfiler] = None
 
         self._init_weights()
 
-        # Policy mean head: gain=0.01 keeps pre-tanh outputs near 0
-        # where tanh ≈ identity and gradient ≈ 1 (no saturation at init)
+        # Инициализируем action_mean около нуля, чтобы не было изначального взрыва
         nn.init.orthogonal_(self.action_mean_head.weight, gain=0.01)
         nn.init.zeros_(self.action_mean_head.bias)
+        
+        # Инициализируем std независимым от состояния, около -0.5 (std ~ 0.6)
+        # Это даст нормальное начальное исследование (exploration) без softmax
+        nn.init.zeros_(self.action_std_head.weight)
+        nn.init.constant_(self.action_std_head.bias, -0.5)
 
     def enable_profiling(self, profiler: SamplingProfiler) -> None:
         self.profiler = profiler
@@ -183,9 +187,7 @@ class TransformerPolicy(nn.Module):
         # 6. Action Decoder: n_action queries × 70 keys
         if p: p.tick("  action_decoder")
         action_out = self.action_decoder(action_query, encoder_out)
-        raw_actions = self.action_mean_head(action_out).squeeze(-1)
-        actions = torch.tanh(raw_actions)
-        self._last_pre_tanh = raw_actions.detach()
+        actions = self.action_mean_head(action_out).squeeze(-1)
         if p: p.tock("  action_decoder")
 
         log_std = None
