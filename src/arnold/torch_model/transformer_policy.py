@@ -107,6 +107,11 @@ class TransformerPolicy(nn.Module):
 
         self._init_weights()
 
+        # Policy mean head: gain=0.01 keeps pre-tanh outputs near 0
+        # where tanh ≈ identity and gradient ≈ 1 (no saturation at init)
+        nn.init.orthogonal_(self.action_mean_head.weight, gain=0.01)
+        nn.init.zeros_(self.action_mean_head.bias)
+
     def enable_profiling(self, profiler: SamplingProfiler) -> None:
         self.profiler = profiler
 
@@ -178,7 +183,9 @@ class TransformerPolicy(nn.Module):
         # 6. Action Decoder: n_action queries × 70 keys
         if p: p.tick("  action_decoder")
         action_out = self.action_decoder(action_query, encoder_out)
-        actions = torch.tanh(self.action_mean_head(action_out).squeeze(-1))
+        raw_actions = self.action_mean_head(action_out).squeeze(-1)
+        actions = torch.tanh(raw_actions)
+        self._last_pre_tanh = raw_actions.detach()
         if p: p.tock("  action_decoder")
 
         log_std = None

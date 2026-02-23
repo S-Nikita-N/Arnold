@@ -692,6 +692,14 @@ class ArnoldTrainer:
             logstd_max = diag_log_std.max().item() if diag_log_std is not None else 0.0
             val_post_mean = diag_values.mean().item() if diag_values is not None else 0.0
             val_post_std = diag_values.std().item() if diag_values is not None else 0.0
+            pre_tanh = getattr(self.policy, '_last_pre_tanh', None)
+            if pre_tanh is not None:
+                pre_tanh_mean = pre_tanh.mean().item()
+                pre_tanh_std = pre_tanh.std().item()
+                pre_tanh_min = pre_tanh.min().item()
+                pre_tanh_max = pre_tanh.max().item()
+            else:
+                pre_tanh_mean = pre_tanh_std = pre_tanh_min = pre_tanh_max = 0.0
 
         # Sampling-phase diagnostics (pre-update data)
         with torch.no_grad():
@@ -733,6 +741,10 @@ class ArnoldTrainer:
             "logstd_max": logstd_max,
             "val_post_mean": val_post_mean,
             "val_post_std": val_post_std,
+            "pre_tanh_mean": pre_tanh_mean,
+            "pre_tanh_std": pre_tanh_std,
+            "pre_tanh_min": pre_tanh_min,
+            "pre_tanh_max": pre_tanh_max,
             "kl_early_stop_epoch": kl_early_stop_epoch,
             "ppo_epochs_actual": (kl_early_stop_epoch + 1) if kl_early_stop_epoch >= 0 else self.opt_num_epochs,
         }
@@ -863,7 +875,8 @@ class ArnoldTrainer:
                 f"|act|={d.get('act_abs_mean', 0):.4f}  "
                 f"act_range=[{d.get('act_min', 0):.3f}, {d.get('act_max', 0):.3f}]  "
                 f"logstd={d.get('logstd_mean', 0):.3f} [{d.get('logstd_min', 0):.3f}, {d.get('logstd_max', 0):.3f}]  "
-                f"val_post={d.get('val_post_mean', 0):.3f}±{d.get('val_post_std', 0):.3f}"
+                f"val_post={d.get('val_post_mean', 0):.3f}±{d.get('val_post_std', 0):.3f}  "
+                f"pre_tanh={d.get('pre_tanh_mean', 0):.3f}±{d.get('pre_tanh_std', 0):.3f} [{d.get('pre_tanh_min', 0):.3f}, {d.get('pre_tanh_max', 0):.3f}]"
             )
 
         if self.use_wandb:
