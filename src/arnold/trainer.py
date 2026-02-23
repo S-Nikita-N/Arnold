@@ -571,12 +571,16 @@ class ArnoldTrainer:
         all_clip_fracs = []
         all_approx_kls = []
         all_grad_norms = []
+        kl_early_stop_epoch = -1
+
+        target_kl = 0.05
 
         n_batches = max(1, batch_size // self.batch_size)
         total_updates = self.opt_num_epochs * n_batches
         pbar = tqdm(total=total_updates, desc="Update", unit="batch")
 
         for ppo_epoch in range(self.opt_num_epochs):
+            epoch_kls = []
             indices = np.arange(batch_size)
             np.random.shuffle(indices)
 
@@ -624,6 +628,7 @@ class ArnoldTrainer:
                         all_ratios.append(ratio.mean().item())
                         all_clip_fracs.append(clip_frac)
                         all_approx_kls.append(approx_kl)
+                        epoch_kls.append(approx_kl)
 
                 if self.use_expert and self.imitation_weight > 0:
                     mini_expert = expert_actions[batch_indices]
@@ -661,6 +666,13 @@ class ArnoldTrainer:
 
                 self.optimizer.step()
                 pbar.update(1)
+
+            # KL early stopping: проверяем после каждой PPO epoch
+            if epoch_kls and np.mean(epoch_kls) > target_kl:
+                kl_early_stop_epoch = ppo_epoch
+                remaining = (self.opt_num_epochs - ppo_epoch - 1) * n_batches
+                pbar.update(remaining)
+                break
 
         pbar.close()
 
@@ -721,6 +733,8 @@ class ArnoldTrainer:
             "logstd_max": logstd_max,
             "val_post_mean": val_post_mean,
             "val_post_std": val_post_std,
+            "kl_early_stop_epoch": kl_early_stop_epoch,
+            "ppo_epochs_actual": (kl_early_stop_epoch + 1) if kl_early_stop_epoch >= 0 else self.opt_num_epochs,
         }
 
     def optimize_policy(self) -> None:
@@ -826,6 +840,9 @@ class ArnoldTrainer:
         # PPO diagnostics — каждую эпоху
         d = getattr(self, '_last_update_diagnostics', {})
         if d:
+            ppo_ep = d.get('ppo_epochs_actual', '?')
+            kl_stop = d.get('kl_early_stop_epoch', -1)
+            kl_note = f" (KL stop @ ep {kl_stop})" if kl_stop >= 0 else ""
             logger.info(
                 f"PPO diag: "
                 f"approx_kl={d.get('approx_kl', 0):.4f}  "
@@ -834,6 +851,7 @@ class ArnoldTrainer:
                 f"grad_norm={d.get('grad_norm', 0):.3f}  "
                 f"σ_global={d.get('sigma_global', 0):.4f}  "
                 f"expl_var={d.get('explained_var', 0):.3f}  "
+                f"ppo_epochs={ppo_ep}/{self.opt_num_epochs}{kl_note}  "
                 f"adv={d.get('adv_mean', 0):.4f}±{d.get('adv_std', 0):.4f}  "
                 f"ret={d.get('ret_mean', 0):.3f}±{d.get('ret_std', 0):.3f}  "
                 f"val={d.get('val_mean', 0):.3f}±{d.get('val_std', 0):.3f}"
