@@ -747,7 +747,12 @@ class ArnoldTrainer:
 
             obc_logger.sample_time = t_sample
             obc_logger.update_time = t_update
-            obc_logger.set_update_losses(**losses)
+            obc_logger.set_update_losses(
+                ppo_loss=losses["ppo_loss"],
+                imitation_loss=losses["imitation_loss"],
+                value_loss=losses["value_loss"],
+                entropy_loss=losses["entropy_loss"],
+            )
             self._last_update_diagnostics = losses
 
             self.num_steps += obc_logger.num_steps
