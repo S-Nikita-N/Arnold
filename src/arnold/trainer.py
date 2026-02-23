@@ -159,6 +159,7 @@ class ArnoldTrainer:
         self.min_batch_size = cfg.learning.min_batch_size
         self.max_epochs = cfg.learning.max_epochs
         self.use_scheduler = cfg.learning.use_scheduler
+        self.use_compile = cfg.learning.use_compile
 
         # Run (из cfg.run)
         self.num_threads = cfg.run.num_threads
@@ -300,6 +301,10 @@ class ArnoldTrainer:
             detached_value_encoder=self.detached_value_encoder,
         )
         self.policy.to(self.device)
+
+        if self.use_compile:
+            self.policy = torch.compile(self.policy, mode="reduce-overhead")
+            logger.info("torch.compile applied (mode=reduce-overhead)")
 
         logger.info(f"Arnold policy created. Parameters: {sum(p.numel() for p in self.policy.parameters()):,}")
 

@@ -32,3 +32,5 @@ min_batch_size: 51200
 max_epochs: 100000
 use_scheduler: false
 transfer_mode: true  # true — перенос знаний из другого чекпоинта
+# torch.compile для ускорения forward (CPU/GPU). Первый прогон — компиляция.
+use_compile: false
