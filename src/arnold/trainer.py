@@ -573,7 +573,7 @@ class ArnoldTrainer:
         all_grad_norms = []
         kl_early_stop_epoch = -1
 
-        target_kl = 0.05
+        # target_kl = 0.05
 
         n_batches = max(1, batch_size // self.batch_size)
         total_updates = self.opt_num_epochs * n_batches
@@ -667,12 +667,12 @@ class ArnoldTrainer:
                 self.optimizer.step()
                 pbar.update(1)
 
-            # KL early stopping: проверяем после каждой PPO epoch
-            if epoch_kls and np.mean(epoch_kls) > target_kl:
-                kl_early_stop_epoch = ppo_epoch
-                remaining = (self.opt_num_epochs - ppo_epoch - 1) * n_batches
-                pbar.update(remaining)
-                break
+            # # KL early stopping: проверяем после каждой PPO epoch
+            # if epoch_kls and np.mean(epoch_kls) > target_kl:
+            #     kl_early_stop_epoch = ppo_epoch
+            #     remaining = (self.opt_num_epochs - ppo_epoch - 1) * n_batches
+            #     pbar.update(remaining)
+            #     break
 
         pbar.close()
 
