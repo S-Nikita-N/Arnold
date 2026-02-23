@@ -363,12 +363,13 @@ class ArnoldTrainer:
         memory = OBCMemory()
         obc_logger = OBCLogger()
 
-        # Профайлер только в main process (pid==0)
+        # Профайлер только в main process (pid==0) и только эпоха 0
         profiler: Optional[SamplingProfiler] = None
         if pid == 0:
-            profiler = self.sampling_profiler
-            profiler.reset()
-            self.policy.enable_profiling(profiler)
+            if self.epoch == 0:
+                profiler = self.sampling_profiler
+                profiler.reset()
+                self.policy.enable_profiling(profiler)
             pbar = tqdm(total=min_batch_size, desc="Sampling", unit="step")
 
         # Для PPO-only: заготовка нулевого expert_action
@@ -451,7 +452,8 @@ class ArnoldTrainer:
         finally:
             if pid == 0:
                 pbar.close()
-                self.policy.disable_profiling()
+                if profiler is not None:
+                    self.policy.disable_profiling()
 
             if queue is not None:
                 queue.put([pid, memory.to_transfer_dict(), obc_logger])
@@ -558,18 +560,22 @@ class ArnoldTrainer:
         fixed_log_probs = batch.log_probs.to(self.device)
         old_values = batch.values.to(self.device)
 
-        # Expert actions нужны только для имитации
         if self.use_expert:
             expert_actions = batch.expert_actions.to(self.device)
 
         batch_size = states.shape[0]
         ppo_losses, imitation_losses, value_losses, entropy_losses = [], [], [], []
 
+        # PPO diagnostics accumulators
+        all_ratios = []
+        all_clip_fracs = []
+        all_approx_kls = []
+        all_grad_norms = []
+
         n_batches = max(1, batch_size // self.batch_size)
         total_updates = self.opt_num_epochs * n_batches
         pbar = tqdm(total=total_updates, desc="Update", unit="batch")
 
-        # PPO epochs
         for ppo_epoch in range(self.opt_num_epochs):
             indices = np.arange(batch_size)
             np.random.shuffle(indices)
@@ -585,7 +591,6 @@ class ArnoldTrainer:
                 mini_fixed_log_probs = fixed_log_probs[batch_indices]
                 mini_old_values = old_values[batch_indices]
 
-                # Forward pass
                 pred_actions, log_std, values = self.policy(
                     mini_states,
                     batch.obs_signatures,
@@ -600,9 +605,9 @@ class ArnoldTrainer:
 
                 loss = 0
 
-                # PPO Clipped Surrogate Loss
                 if self.ppo_weight > 0:
-                    ratio = torch.exp(new_log_probs - mini_fixed_log_probs)
+                    log_ratio = new_log_probs - mini_fixed_log_probs
+                    ratio = torch.exp(log_ratio)
                     surr1 = ratio * mini_advantages
                     surr2 = torch.clamp(
                         ratio,
@@ -613,17 +618,19 @@ class ArnoldTrainer:
                     loss = loss + self.ppo_weight * ppo_loss
                     ppo_losses.append(ppo_loss.item())
 
-                # Imitation loss (MSE к эксперту)
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                        clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
+                        all_ratios.append(ratio.mean().item())
+                        all_clip_fracs.append(clip_frac)
+                        all_approx_kls.append(approx_kl)
+
                 if self.use_expert and self.imitation_weight > 0:
                     mini_expert = expert_actions[batch_indices]
                     imitation_loss = nn.functional.mse_loss(pred_actions, mini_expert)
                     loss = loss + self.imitation_weight * imitation_loss
                     imitation_losses.append(imitation_loss.item())
 
-                # Value loss (PPO clipped value function)
-                # Ограничиваем обновление value head по аналогии с policy clipping:
-                # V_clipped = V_old + clamp(V_new - V_old, -ε, ε)
-                # loss = 0.5 * max(|V_new - R|², |V_clipped - R|²)
                 if self.value_weight > 0:
                     vf_loss_unclipped = (values - mini_returns) ** 2
                     v_clipped = mini_old_values + torch.clamp(
@@ -636,30 +643,84 @@ class ArnoldTrainer:
                     loss = loss + self.value_weight * value_loss
                     value_losses.append(value_loss.item())
 
-                # Entropy loss (Gaussian: H = 0.5 * d * log(2πe) + Σ log_std)
                 if self.entropy_weight > 0:
                     entropy = 0.5 * (1 + 1.8378770664093453) + log_std.mean()
                     entropy_loss = -entropy
                     loss = loss + self.entropy_weight * entropy_loss
                     entropy_losses.append(entropy_loss.item())
 
-                # Backward
                 self.optimizer.zero_grad()
                 loss.backward()
 
-                # Gradient clipping
                 if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip)
+                    all_grad_norms.append(grad_norm.item())
+                else:
+                    total_norm = sum(p.grad.norm().item() ** 2 for p in self.policy.parameters() if p.grad is not None) ** 0.5
+                    all_grad_norms.append(total_norm)
 
                 self.optimizer.step()
                 pbar.update(1)
 
         pbar.close()
+
+        # Post-update: прогоним один батч через обновлённую policy для диагностики выходов
+        with torch.no_grad():
+            diag_idx = np.arange(min(512, batch_size))
+            diag_actions, diag_log_std, diag_values = self.policy(
+                states[diag_idx], batch.obs_signatures, batch.action_signatures
+            )
+            act_mean = diag_actions.mean().item()
+            act_std = diag_actions.std().item()
+            act_abs_mean = diag_actions.abs().mean().item()
+            act_min = diag_actions.min().item()
+            act_max = diag_actions.max().item()
+            logstd_mean = diag_log_std.mean().item() if diag_log_std is not None else 0.0
+            logstd_min = diag_log_std.min().item() if diag_log_std is not None else 0.0
+            logstd_max = diag_log_std.max().item() if diag_log_std is not None else 0.0
+            val_post_mean = diag_values.mean().item() if diag_values is not None else 0.0
+            val_post_std = diag_values.std().item() if diag_values is not None else 0.0
+
+        # Sampling-phase diagnostics (pre-update data)
+        with torch.no_grad():
+            adv_mean = advantages.mean().item()
+            adv_std = advantages.std().item()
+            ret_mean = returns.mean().item()
+            ret_std = returns.std().item()
+            val_mean = old_values.mean().item()
+            val_std = old_values.std().item()
+            ret_var = returns.var().item()
+            explained_var = 1 - (returns - old_values).var().item() / (ret_var + 1e-8)
+
+        sigma_global = self.policy.log_sigma_global.item()
+
         return {
             "ppo_loss": float(np.mean(ppo_losses)) if ppo_losses else 0.0,
             "imitation_loss": float(np.mean(imitation_losses)) if imitation_losses else 0.0,
             "value_loss": float(np.mean(value_losses)) if value_losses else 0.0,
             "entropy_loss": float(np.mean(entropy_losses)) if entropy_losses else 0.0,
+            "approx_kl": float(np.mean(all_approx_kls)) if all_approx_kls else 0.0,
+            "clip_frac": float(np.mean(all_clip_fracs)) if all_clip_fracs else 0.0,
+            "ratio_mean": float(np.mean(all_ratios)) if all_ratios else 1.0,
+            "grad_norm": float(np.mean(all_grad_norms)) if all_grad_norms else 0.0,
+            "explained_var": explained_var,
+            "adv_mean": adv_mean,
+            "adv_std": adv_std,
+            "ret_mean": ret_mean,
+            "ret_std": ret_std,
+            "val_mean": val_mean,
+            "val_std": val_std,
+            "sigma_global": sigma_global,
+            "act_mean": act_mean,
+            "act_std": act_std,
+            "act_abs_mean": act_abs_mean,
+            "act_min": act_min,
+            "act_max": act_max,
+            "logstd_mean": logstd_mean,
+            "logstd_min": logstd_min,
+            "logstd_max": logstd_max,
+            "val_post_mean": val_post_mean,
+            "val_post_std": val_post_std,
         }
 
     def optimize_policy(self) -> None:
@@ -687,6 +748,7 @@ class ArnoldTrainer:
             obc_logger.sample_time = t_sample
             obc_logger.update_time = t_update
             obc_logger.set_update_losses(**losses)
+            self._last_update_diagnostics = losses
 
             self.num_steps += obc_logger.num_steps
 
@@ -748,10 +810,38 @@ class ArnoldTrainer:
         """Логирует метрики эпохи."""
         log_str = obc_logger.get_log_str(epoch=epoch, exp_name=self.exp_name)
         logger.info(log_str)
-        logger.info(
-            f"Sampling profile (epoch {epoch}, main process):\n"
-            + self.sampling_profiler.report()
-        )
+
+        # Sampling profiler — только эпоха 0
+        if epoch == 0:
+            logger.info(
+                f"Sampling profile (epoch {epoch}, main process):\n"
+                + self.sampling_profiler.report()
+            )
+
+        # PPO diagnostics — каждую эпоху
+        d = getattr(self, '_last_update_diagnostics', {})
+        if d:
+            logger.info(
+                f"PPO diag: "
+                f"approx_kl={d.get('approx_kl', 0):.4f}  "
+                f"clip_frac={d.get('clip_frac', 0):.3f}  "
+                f"ratio={d.get('ratio_mean', 1):.4f}  "
+                f"grad_norm={d.get('grad_norm', 0):.3f}  "
+                f"σ_global={d.get('sigma_global', 0):.4f}  "
+                f"expl_var={d.get('explained_var', 0):.3f}  "
+                f"adv={d.get('adv_mean', 0):.4f}±{d.get('adv_std', 0):.4f}  "
+                f"ret={d.get('ret_mean', 0):.3f}±{d.get('ret_std', 0):.3f}  "
+                f"val={d.get('val_mean', 0):.3f}±{d.get('val_std', 0):.3f}"
+            )
+            logger.info(
+                f"Policy out: "
+                f"act_mean={d.get('act_mean', 0):.4f}  "
+                f"act_std={d.get('act_std', 0):.4f}  "
+                f"|act|={d.get('act_abs_mean', 0):.4f}  "
+                f"act_range=[{d.get('act_min', 0):.3f}, {d.get('act_max', 0):.3f}]  "
+                f"logstd={d.get('logstd_mean', 0):.3f} [{d.get('logstd_min', 0):.3f}, {d.get('logstd_max', 0):.3f}]  "
+                f"val_post={d.get('val_post_mean', 0):.3f}±{d.get('val_post_std', 0):.3f}"
+            )
 
         if self.use_wandb:
             self.wandb_logger.log_train(
