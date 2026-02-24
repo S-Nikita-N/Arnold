@@ -1,11 +1,14 @@
 """
-Body Tokenizer — группировка наблюдений по телам для body-level tokenization.
+Body Tokenizer — универсальная проекция наблюдений в эмбеддинги.
 
-Заменяет SensoryEncoder. Вместо ~953 скалярных токенов (по одному на каждый
-элемент наблюдения) создаёт ~70 body-level токенов, объединяя все наблюдения
-одного тела в один вектор и проецируя через Linear.
+Принимает список BodyGroup (сгенерированных с любой гранулярностью)
+и проецирует каждую группу через Linear(n_features * history_len, embed_dim).
+Группы одного type разделяют один проектор.
 
-Ускорение attention: 953² → 70² = ~185x.
+Гранулярность управляется в ObservationParser.get_body_groups(granularity):
+  "scalar"   → ~1583 токенов, Linear(5, 128) — как SensoryEncoder
+  "per_spec" → ~500 токенов, по (тело, тип_obs)
+  "per_body" → ~112 токенов, всё тело в одном токене
 """
 
 import torch
@@ -16,12 +19,11 @@ from arnold.observation_parser import BodyGroup
 
 class BodyTokenizer(nn.Module):
     """
-    Преобразует flat observations [B, n_obs, history_len] в body-level токены
-    [B, n_groups, embed_dim].
+    Преобразует flat observations [B, n_obs, history_len] в токены [B, n_groups, embed_dim].
 
-    Для каждого типа группы (root, body, muscle, task, task_muscle, feet)
-    создаётся отдельный Linear проектор, т.к. разные типы имеют разную
-    входную размерность.
+    Для каждого type создаётся отдельный Linear проектор (группы
+    одного типа имеют одинаковую входную размерность).
+    Количество и состав групп определяется granularity в ObservationParser.
     """
 
     def __init__(
@@ -34,13 +36,13 @@ class BodyTokenizer(nn.Module):
         self.history_len = history_len
         self.embed_dim = embed_dim
 
-        sorted_groups = sorted(groups, key=lambda g: (g.group_type, g.name, g.side))
+        sorted_groups = sorted(groups, key=lambda g: (g.type, g.name, g.side))
         self.group_signatures: List[Tuple[str, ...]] = [g.signature for g in sorted_groups]
         self.n_groups = len(sorted_groups)
 
         type_to_indices: Dict[str, List[List[int]]] = {}
         for g in sorted_groups:
-            type_to_indices.setdefault(g.group_type, []).append(g.flat_indices)
+            type_to_indices.setdefault(g.type, []).append(g.indices)
 
         self.type_order = sorted(type_to_indices.keys())
 

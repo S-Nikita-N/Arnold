@@ -58,7 +58,8 @@ def load_policy(
     dropout = learning_cfg.dropout
     history_len = learning_cfg.history_len
 
-    groups = parser.get_body_groups()
+    granularity = learning_cfg.tokenizer_granularity
+    groups = parser.get_body_groups(granularity)
     vocab = SensorimotorVocabulary(embed_dim=embed_dim)
     policy = TransformerPolicy(
         vocab=vocab,
@@ -174,7 +175,7 @@ def validate(cfg: DictConfig) -> dict:
             for t in range(10000):
                 t0 = time.perf_counter()
                 obs_ts, obs_sigs = parser.get_observation(device)
-                act_sigs = parser.get_action_signatures()
+                act_sigs = parser.action_signatures
                 profile_times["get_observation"] += time.perf_counter() - t0
                 
                 t0 = time.perf_counter()

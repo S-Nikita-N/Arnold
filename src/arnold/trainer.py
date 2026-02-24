@@ -143,6 +143,7 @@ class ArnoldTrainer:
         self.num_act_dec_layers = cfg.learning.num_act_dec_layers
         self.num_val_dec_layers = cfg.learning.num_val_dec_layers
         self.dropout = cfg.learning.dropout
+        self.tokenizer_granularity = cfg.learning.tokenizer_granularity
 
         # PPO/Training (из cfg.learning)
         self.batch_size = cfg.learning.batch_size
@@ -291,9 +292,12 @@ class ArnoldTrainer:
         # Vocabulary
         self.vocab = SensorimotorVocabulary(embed_dim=self.embed_dim)
 
-        # Body groups для body-level tokenization
-        groups = self.parser.get_body_groups()
-        logger.info(f"Body tokenizer: {len(groups)} groups (from {self.parser.n_obs_elements} flat obs)")
+        # Body groups для tokenization
+        groups = self.parser.get_body_groups(self.tokenizer_granularity)
+        logger.info(
+            f"Tokenizer [{self.tokenizer_granularity}]: "
+            f"{len(groups)} tokens (from {self.parser.n_obs_elements} flat obs)"
+        )
 
         # Policy
         self.policy = TransformerPolicy(
@@ -385,7 +389,7 @@ class ArnoldTrainer:
                     # --- parser.get_observation ---
                     if profiler: profiler.tick("parser.get_obs")
                     obs_ts, obs_sigs = worker_parser.get_observation(torch.device("cpu"))
-                    act_sigs = worker_parser.get_action_signatures()
+                    act_sigs = worker_parser.action_signatures
                     if profiler: profiler.tock("parser.get_obs")
 
                     # --- policy.get_action (внутри — sub-компоненты через хуки в forward) ---
@@ -1005,7 +1009,7 @@ class ArnoldTrainer:
 
             for t in range(10000):
                 obs_ts, obs_sigs = valid_parser.get_observation(self.device)
-                act_sigs = valid_parser.get_action_signatures()
+                act_sigs = valid_parser.action_signatures
 
                 with torch.no_grad():
                     action, _, value = self.policy.get_action(

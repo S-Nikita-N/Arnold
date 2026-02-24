@@ -27,31 +27,15 @@ class BodyGroup:
     """Группа наблюдений, объединённых по телу/мышце для body-level tokenization."""
     name: str
     side: str
-    group_type: str  # "root", "body", "muscle", "task", "task_muscle", "feet"
-    flat_indices: List[int]
+    type: str
+    indices: List[int]
     signature: Tuple[str, ...]
 
 
 class ObservationParser:
     """
     Парсит flat observation из среды Kinesis/MyoLegsIm в structured формат для Arnold.
-    
     Отслеживает историю наблюдений и генерирует signatures для vocabulary lookup.
-    
-    Usage:
-        parser = ObservationParser.from_env(env, history_len=5)
-        
-        obs, _ = env.reset()
-        parser.reset(obs)
-        
-        for step in range(max_steps):
-            obs_ts, obs_sigs = parser.get_observation()  # для Arnold
-            action_sigs = parser.get_action_signatures()  # для Arnold
-            
-            # ... Arnold forward ...
-            
-            next_obs, reward, done, _, info = env.step(action)
-            parser.update(next_obs)
     """
     
     def __init__(
@@ -85,21 +69,11 @@ class ObservationParser:
         self.num_muscles = num_muscles
         self.history_len = history_len
         
-        # Строим структуру observations
-        self.obs_specs: List[ObservationSpec] = []
-        self._build_observation_specs()
-        
+        self.obs_specs = self._build_observation_specs()
         self.n_obs_elements = sum(spec.size for spec in self.obs_specs)
-        
-        # Сигнатуры для actions (muscle activations)
         self.action_signatures = self._build_action_signatures()
-        
-        # History buffer
-        self._history: Optional[np.ndarray] = None  # [n_obs_elements, history_len]
-        self.obs_signatures: List[Tuple[str, ...]] = []
-        
-        # Строим flat signatures и mapping
-        self._build_flat_signatures()
+        self.obs_signatures = self._build_obs_signatures()
+        self.history: Optional[np.ndarray] = None
     
     @classmethod
     def from_env(cls, env, history_len: int = 5) -> "ObservationParser":
@@ -148,21 +122,22 @@ class ObservationParser:
         else:
             return name, "c"
     
-    def _build_observation_specs(self) -> None:
+    def _build_observation_specs(self) -> List[ObservationSpec]:
         """
         Строит спецификации observation компонентов на основе конфига.
         """
+        specs = []
         # ==== Proprioceptive inputs ====
         
         if "root_height" in self.proprioceptive_inputs:
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="root_height",
                 size=1,
                 signatures=[("root", "c", "height")]
             ))
         
         if "root_tilt" in self.proprioceptive_inputs:
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="root_tilt",
                 size=4,
                 signatures=[
@@ -181,7 +156,7 @@ class ObservationParser:
                 for coord in ["x", "y", "z"]:
                     sigs.append((base, side, "position", coord))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="local_body_pos",
                 size=3 * (self.num_bodies - 1),
                 signatures=sigs
@@ -200,7 +175,7 @@ class ObservationParser:
                         coord = ["x", "y", "z"][i - 3]
                         sigs.append((base, side, "rotation", "normal", coord))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="local_body_rot",
                 size=6 * self.num_bodies,
                 signatures=sigs
@@ -214,7 +189,7 @@ class ObservationParser:
                 for coord in ["x", "y", "z"]:
                     sigs.append((base, side, "linear", "velocity", coord))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="local_body_vel",
                 size=3 * self.num_bodies,
                 signatures=sigs
@@ -228,7 +203,7 @@ class ObservationParser:
                 for coord in ["x", "y", "z"]:
                     sigs.append((base, side, "angular", "velocity", coord))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="local_body_ang_vel",
                 size=3 * self.num_bodies,
                 signatures=sigs
@@ -240,7 +215,7 @@ class ObservationParser:
                 base, side = self._parse_side(muscle)
                 sigs.append((base, side, "muscle", "length"))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="muscle_len",
                 size=self.num_muscles,
                 signatures=sigs
@@ -252,7 +227,7 @@ class ObservationParser:
                 base, side = self._parse_side(muscle)
                 sigs.append((base, side, "muscle", "velocity"))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="muscle_vel",
                 size=self.num_muscles,
                 signatures=sigs
@@ -264,14 +239,14 @@ class ObservationParser:
                 base, side = self._parse_side(muscle)
                 sigs.append((base, side, "muscle", "force"))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="muscle_force",
                 size=self.num_muscles,
                 signatures=sigs
             ))
         
         if "feet_contacts" in self.proprioceptive_inputs:
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="feet_contacts",
                 size=4,
                 signatures=[
@@ -291,7 +266,7 @@ class ObservationParser:
                 for coord in ["x", "y", "z"]:
                     sigs.append((base, side, "error", "position", coord))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="diff_local_body_pos",
                 size=3 * len(self.track_bodies),
                 signatures=sigs
@@ -304,7 +279,7 @@ class ObservationParser:
                 for coord in ["x", "y", "z"]:
                     sigs.append((base, side, "error", "velocity", coord))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="diff_local_vel",
                 size=3 * len(self.track_bodies),
                 signatures=sigs
@@ -317,7 +292,7 @@ class ObservationParser:
                 for coord in ["x", "y", "z"]:
                     sigs.append((base, side, "target", "position", coord))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="local_ref_body_pos",
                 size=3 * len(self.track_bodies),
                 signatures=sigs
@@ -329,7 +304,7 @@ class ObservationParser:
                 base, side = self._parse_side(muscle)
                 sigs.append((base, side, "error", "length"))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="diff_muscle_len",
                 size=self.num_muscles,
                 signatures=sigs
@@ -341,27 +316,29 @@ class ObservationParser:
                 base, side = self._parse_side(muscle)
                 sigs.append((base, side, "error", "velocity"))
             
-            self.obs_specs.append(ObservationSpec(
+            specs.append(ObservationSpec(
                 name="diff_muscle_vel",
                 size=self.num_muscles,
                 signatures=sigs
             ))
-    
+
+        return specs
+
     def _build_action_signatures(self) -> List[Tuple[str, ...]]:
         """Строит signatures для action outputs (muscle activations)."""
-        sigs = []
+        signatures = []
         for muscle in self.muscle_names:
             base, side = self._parse_side(muscle)
-            sigs.append((base, side, "muscle", "activation"))
-        return sigs
+            signatures.append((base, side, "muscle", "activation"))
+        return signatures
     
-    def _build_flat_signatures(self) -> None:
+    def _build_obs_signatures(self) -> List[Tuple[str, ...]]:
         """Строит flat список signatures."""
-        self.obs_signatures = []
-        
+        signatures = []
         for spec in self.obs_specs:
             for sig in spec.signatures:
-                self.obs_signatures.append(sig)
+                signatures.append(sig)
+        return signatures
     
     def reset(self, initial_obs: np.ndarray) -> None:
         """
@@ -373,7 +350,7 @@ class ObservationParser:
             initial_obs: Flat observation [flat_obs_size]
         """
         obs_f32 = initial_obs.astype(np.float32)
-        self._history = np.tile(obs_f32[:, np.newaxis], (1, self.history_len))
+        self.history = np.tile(obs_f32[:, np.newaxis], (1, self.history_len))
     
     def update(self, obs: np.ndarray) -> None:
         """
@@ -382,13 +359,16 @@ class ObservationParser:
         Args:
             obs: Flat observation
         """
-        if self._history is None:
+        if self.history is None:
             raise RuntimeError("Parser not initialized. Call reset() first.")
         
-        self._history[:, :-1] = self._history[:, 1:]
-        self._history[:, -1] = obs
+        self.history[:, :-1] = self.history[:, 1:]
+        self.history[:, -1] = obs
     
-    def get_observation(self, device: torch.device = torch.device("cpu")) -> Tuple[torch.Tensor, List[Tuple[str, ...]]]:
+    def get_observation(
+        self,
+        device: torch.device = torch.device("cpu"),
+    ) -> Tuple[torch.Tensor, List[Tuple[str, ...]]]:
         """
         Возвращает observation для Arnold.
         
@@ -396,30 +376,122 @@ class ObservationParser:
             obs_timeseries: [1, n_obs_elements, history_len] - tensor
             obs_signatures: List[Tuple[str, ...]] - signatures для vocabulary
         """
-        if self._history is None:
+        if self.history is None:
             raise RuntimeError("Parser not initialized. Call reset() first.")
         
         # [n_obs_elements, history_len] -> [1, n_obs_elements, history_len]
-        obs_ts = torch.from_numpy(self._history).float().unsqueeze(0).to(device)
+        obs_ts = torch.from_numpy(self.history).float().unsqueeze(0).to(device)
         
         return obs_ts, self.obs_signatures
-    
-    def get_action_signatures(self) -> List[Tuple[str, ...]]:
-        """Возвращает signatures для action outputs."""
-        return self.action_signatures
 
-    def get_body_groups(self) -> List[BodyGroup]:
+    def get_body_groups(
+        self,
+        granularity: str = "per_body"
+    ) -> List[BodyGroup]:
         """
-        Строит body-level группы из flat obs specs.
+        Строит группы наблюдений с настраиваемой гранулярностью.
 
-        Вместо ~953 скалярных токенов создаёт ~70 body-level токенов,
-        объединяя все наблюдения одного тела/мышцы в один группу.
+        Granularity (от самого мелкого к самому крупному):
+          "scalar"   — каждый скаляр = свой токен (~1583). Эквивалент SensoryEncoder.
+          "per_spec" — группировка по (тело, тип_obs). position xyz = 1 токен.
+          "per_body" — всё про одно тело/мышцу в один токен (~112).
         """
-        BODY_SPECS = {"local_body_pos", "local_body_rot", "local_body_vel", "local_body_ang_vel"}
-        ROOT_SPECS = {"root_height", "root_tilt"}
-        MUSCLE_SPECS = {"muscle_len", "muscle_vel", "muscle_force"}
-        TASK_BODY_SPECS = {"diff_local_body_pos", "diff_local_vel", "local_ref_body_pos"}
-        TASK_MUSCLE_SPECS = {"diff_muscle_len", "diff_muscle_vel"}
+        if granularity == "scalar":
+            return self._build_groups_scalar()
+        elif granularity == "per_spec":
+            return self._build_groups_per_spec()
+        elif granularity == "per_body":
+            return self._build_groups_per_body()
+        else:
+            raise ValueError(
+                f"Unknown granularity '{granularity}'. "
+                f"Choose from: 'scalar', 'per_spec', 'per_body'"
+            )
+
+    def _build_groups_scalar(self) -> List[BodyGroup]:
+        """
+        Каждый observation scalar — отдельный токен.
+        Linear(history_len, embed_dim).
+        """
+        groups: List[BodyGroup] = []
+        offset = 0
+        for spec in self.obs_specs:
+            for i in range(spec.size):
+                if spec.signatures and i < len(spec.signatures):
+                    sig = spec.signatures[i]
+                else:
+                    sig = (spec.name, str(i))
+                groups.append(BodyGroup(
+                    name=sig[0],
+                    side=sig[1] if len(sig) > 1 else "c",
+                    type="scalar",
+                    indices=[offset + i],
+                    signature=sig,
+                ))
+            offset += spec.size
+        return groups
+
+    def _build_groups_per_spec(self) -> List[BodyGroup]:
+        """
+        Группировка по (entity, obs_spec).
+        Напр. femur_l position (3 скаляра) = 1 токен.
+        Для feet_contacts - отдельный токен.
+        """
+        groups: List[BodyGroup] = []
+        offset = 0
+        for spec in self.obs_specs:
+            if spec.signatures:
+                entity_indices: dict = {}
+                for i, sig in enumerate(spec.signatures):
+                    key = (sig[0], sig[1] if len(sig) > 1 else "c")
+                    entity_indices.setdefault(key, []).append(offset + i)
+                for (name, side), indices in entity_indices.items():
+                    groups.append(BodyGroup(
+                        name=name, side=side,
+                        type=spec.name,
+                        indices=indices,
+                        signature=(name, side, spec.name),
+                    ))
+            else:
+                groups.append(BodyGroup(
+                    name=spec.name, side="c",
+                    type=spec.name,
+                    indices=list(range(offset, offset + spec.size)),
+                    signature=(spec.name, "c"),
+                ))
+            offset += spec.size
+        return groups
+
+    def _build_groups_per_body(self) -> List[BodyGroup]:
+        """
+        Все наблюдения одного тела/мышцы(кроме feet_contacts)
+        объединены в один токен.
+        """
+
+        ROOT_SPECS = {
+            "root_height",
+            "root_tilt"
+        }
+        BODY_SPECS = {
+            "local_body_pos",
+            "local_body_rot",
+            "local_body_vel",
+            "local_body_ang_vel",
+        }
+        TASK_BODY_SPECS = {
+            "diff_local_body_pos",
+            "diff_local_vel",
+            "local_ref_body_pos",
+        }
+        MUSCLE_SPECS = {
+            "muscle_len",
+            "muscle_vel",
+            "muscle_force",
+        }
+        TASK_MUSCLE_SPECS = {
+            "diff_muscle_len",
+            "diff_muscle_vel",
+        }
 
         root_indices: List[int] = []
         body_indices: dict = {}
@@ -433,56 +505,77 @@ class ObservationParser:
             if spec.name in ROOT_SPECS:
                 for i in range(spec.size):
                     root_indices.append(offset + i)
-
             elif spec.name in BODY_SPECS:
                 for i, sig in enumerate(spec.signatures):
                     name, side = sig[0], sig[1]
                     if name == "root":
                         root_indices.append(offset + i)
                     else:
-                        key = (name, side)
-                        body_indices.setdefault(key, []).append(offset + i)
-
+                        body_indices.setdefault((name, side), []).append(offset + i)
             elif spec.name in MUSCLE_SPECS:
                 for i, sig in enumerate(spec.signatures):
-                    key = (sig[0], sig[1])
-                    muscle_indices.setdefault(key, []).append(offset + i)
-
+                    muscle_indices.setdefault((sig[0], sig[1]), []).append(offset + i)
             elif spec.name == "feet_contacts":
                 for i in range(spec.size):
                     feet_indices.append(offset + i)
-
             elif spec.name in TASK_BODY_SPECS:
                 for i, sig in enumerate(spec.signatures):
-                    key = (sig[0], sig[1])
-                    task_body_indices.setdefault(key, []).append(offset + i)
-
+                    task_body_indices.setdefault((sig[0], sig[1]), []).append(offset + i)
             elif spec.name in TASK_MUSCLE_SPECS:
                 for i, sig in enumerate(spec.signatures):
-                    key = (sig[0], sig[1])
-                    task_muscle_indices.setdefault(key, []).append(offset + i)
-
+                    task_muscle_indices.setdefault((sig[0], sig[1]), []).append(offset + i)
             offset += spec.size
 
         groups: List[BodyGroup] = []
-
         if root_indices:
-            groups.append(BodyGroup("root", "c", "root", root_indices, ("root", "c")))
-
+            groups.append(
+                BodyGroup(
+                    name="root",
+                    side="c",
+                    type="root",
+                    indices=root_indices,
+                    signature=("root", "c"),
+                )
+            )
         for (name, side), indices in body_indices.items():
-            groups.append(BodyGroup(name, side, "body", indices, (name, side)))
-
+            groups.append(BodyGroup(
+                name=name,
+                side=side,
+                type="body",
+                indices=indices,
+                signature=(name, side),
+            ))
         for (name, side), indices in muscle_indices.items():
-            groups.append(BodyGroup(name, side, "muscle", indices, (name, side, "muscle")))
-
+            groups.append(BodyGroup(
+                name=name,
+                side=side,
+                type="muscle",
+                indices=indices,
+                signature=(name, side, "muscle"),
+            ))
         if feet_indices:
-            groups.append(BodyGroup("contacts", "c", "feet", feet_indices, ("contacts", "c")))
-
+            groups.append(BodyGroup(
+                name="contacts",
+                side="c",
+                type="feet",
+                indices=feet_indices,
+                signature=("contacts", "c"),
+            ))
         for (name, side), indices in task_body_indices.items():
-            groups.append(BodyGroup(name, side, "task", indices, (name, side, "error")))
-
+            groups.append(BodyGroup(
+                name=name,
+                side=side,
+                type="task",
+                indices=indices,
+                signature=(name, side, "error"),
+            ))
         for (name, side), indices in task_muscle_indices.items():
-            groups.append(BodyGroup(name, side, "task_muscle", indices, (name, side, "muscle", "error")))
-
+            groups.append(BodyGroup(
+                name=name,
+                side=side,
+                type="task_muscle",
+                indices=indices,
+                signature=(name, side, "muscle", "error"),
+            ))
         return groups
     

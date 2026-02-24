@@ -9,6 +9,7 @@ num_act_dec_layers: 6
 num_val_dec_layers: 1
 dropout: 0.0
 history_len: 5
+tokenizer_granularity: scalar  # scalar | per_spec | per_body
 
 # ==================== PPO ====================
 batch_size: 128

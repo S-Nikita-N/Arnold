@@ -108,13 +108,13 @@ class TransformerPolicy(nn.Module):
         self._init_weights()
 
         # Инициализируем action_mean около нуля, чтобы не было изначального взрыва
-        nn.init.orthogonal_(self.action_mean_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.action_mean_head.weight, gain=0.1)
         nn.init.zeros_(self.action_mean_head.bias)
         
-        # Инициализируем std независимым от состояния, около -0.5 (std ~ 0.6)
-        # Это даст нормальное начальное исследование (exploration) без softmax
-        nn.init.zeros_(self.action_std_head.weight)
-        nn.init.constant_(self.action_std_head.bias, -0.5)
+        # # Инициализируем std независимым от состояния, около -0.5 (std ~ 0.6)
+        # # Это даст нормальное начальное исследование (exploration) без softmax
+        # nn.init.zeros_(self.action_std_head.weight)
+        # nn.init.constant_(self.action_std_head.bias, -0.5)
 
     def enable_profiling(self, profiler: SamplingProfiler) -> None:
         self.profiler = profiler
@@ -161,7 +161,7 @@ class TransformerPolicy(nn.Module):
         obs_timeseries = self.obs_normalizer(obs_signatures, obs_timeseries)
         if p: p.tock("  normalizer")
 
-        # 2. Body tokenizer: [B, 953, 5] → [B, 70, embed_dim]
+        # 2. Body tokenizer: [B, n_obs_flat, history_len] → [B, n_tokens, embed_dim]
         if p: p.tick("  body_tokenizer")
         sensory_emb = self.body_tokenizer(obs_timeseries)
         if p: p.tock("  body_tokenizer")
@@ -173,7 +173,7 @@ class TransformerPolicy(nn.Module):
         sensory_emb = sensory_emb + role_emb
         if p: p.tock("  vocab_embed_obs")
 
-        # 4. Transformer Encoder: [B, 70, embed_dim]
+        # 4. Transformer Encoder
         if p: p.tick("  transformer_encoder")
         encoder_out = self.encoder(sensory_emb)
         if p: p.tock("  transformer_encoder")
@@ -184,7 +184,7 @@ class TransformerPolicy(nn.Module):
         action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)
         if p: p.tock("  vocab_embed_act")
 
-        # 6. Action Decoder: n_action queries × 70 keys
+        # 6. Action Decoder
         if p: p.tick("  action_decoder")
         action_out = self.action_decoder(action_query, encoder_out)
         actions = self.action_mean_head(action_out).squeeze(-1)
@@ -202,7 +202,7 @@ class TransformerPolicy(nn.Module):
             log_std = log_sigma_global + log_soft + log_norm_factor
             log_std = torch.clamp(log_std, min=-4.6, max=2.3)
 
-        # 7. Value Decoder: 1 query × 70 keys
+        # 7. Value Decoder
         value = None
         if return_value:
             if p: p.tick("  value_decoder")
