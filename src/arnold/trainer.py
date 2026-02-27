@@ -934,9 +934,28 @@ class ArnoldTrainer:
         try:
             self.policy.load_state_dict(checkpoint["policy"])
         except RuntimeError as e:
-            logger.warning(f"Strict load failed: {e}")
-            logger.info("Trying partial load (strict=False) for cross-environment transfer...")
-            self.policy.load_state_dict(checkpoint["policy"], strict=False)
+            logger.warning(f"Strict load failed. Exception: {e}")
+            logger.info("Filtering checkpoint for size mismatches (cross-environment transfer)...")
+            
+            model_state = self.policy.state_dict()
+            ckpt_state = checkpoint["policy"]
+            filtered_state = {}
+            
+            for k, v in ckpt_state.items():
+                if (
+                    k in model_state and
+                    hasattr(model_state[k], 'shape') and 
+                    hasattr(v, 'shape') and 
+                    model_state[k].shape != v.shape
+                ):
+                    logger.info(
+                        f"  Skipping '{k}' due to size mismatch: "
+                        f"checkpoint={v.shape} vs current={model_state[k].shape}"
+                    )
+                    continue
+                filtered_state[k] = v
+                
+            self.policy.load_state_dict(filtered_state, strict=False)
 
         if resume_training:
             self.epoch = checkpoint["epoch"] + 1

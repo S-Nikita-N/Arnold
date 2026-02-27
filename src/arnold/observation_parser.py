@@ -362,7 +362,7 @@ class ObservationParser:
         if self.history is None:
             raise RuntimeError("Parser not initialized. Call reset() first.")
         
-        self.history[:, :-1] = self.history[:, 1:]
+        self.history = np.roll(self.history, -1, axis=1)
         self.history[:, -1] = obs
     
     def get_observation(

@@ -49,6 +49,8 @@ BODY_TOKENS: List[str] = [
     "secondmc", "talus", "thirdmc", "thorax",
     "tibia", "toes", "torso", "trapezium",
     "trapezoid", "triquetrum", "ulna",
+
+    "lumbar", "thoracic",
 ]
 
 JOINT_TOKENS: List[str] = [
@@ -57,6 +59,8 @@ JOINT_TOKENS: List[str] = [
     "L1_L2_AR", "L1_L2_FE", "L1_L2_LB", "L2_L3_AR", "L2_L3_FE", "L2_L3_LB",
     "L3_L4_AR", "L3_L4_FE", "L3_L4_LB", "L4_L5_AR", "L4_L5_FE", "L4_L5_LB",
     "neck_flexion", "neck_rotation",
+
+    "lumbar_extension", "lumbar_bending", "lumbar_rotation",
     
     # Arm (shoulder/elbow)
     "acromioclavicular1", "acromioclavicular2", "acromioclavicular3",
@@ -120,6 +124,26 @@ MUSCLE_TOKENS: List[str] = [
     "semimem", "semiten", "soleus", "tfl",
     "tibant", "tibpost", "vasint", "vaslat",
     "vasmed",
+
+    "ercspn", "intobl", "extobl",
+]
+
+PROPRIOCEPTIVE_TOKENS: List[str] = [
+    "root_height",
+    "root_tilt",
+    "local_body_pos",
+    "local_body_rot",
+    "local_body_vel",
+    "local_body_ang_vel",
+    "diff_local_body_pos",
+    "diff_local_vel",
+    "local_ref_body_pos",
+    "muscle_len",
+    "muscle_vel",
+    "muscle_force",
+    "diff_muscle_len",
+    "diff_muscle_vel",
+    "feet_contacts",
 ]
 
 
@@ -184,7 +208,7 @@ class SensorimotorVocabulary(nn.Module):
         for tokens in [
             SIDE_TOKENS, COORD_TOKENS, SEMANTIC_TOKENS,
             ORIENTATION_TOKENS, SPECIAL_TOKENS, BODY_TOKENS,
-            JOINT_TOKENS, MUSCLE_TOKENS
+            JOINT_TOKENS, MUSCLE_TOKENS, PROPRIOCEPTIVE_TOKENS
         ]:
             for token in tokens:
                 if token in seen:
