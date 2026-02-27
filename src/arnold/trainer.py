@@ -56,14 +56,13 @@ os.environ["OMP_NUM_THREADS"] = "1"
 logger = logging.getLogger(__name__)
 
 
-def create_expert_wrapper(expert_entry: DictConfig, mode: str = "train", overrides=[]):
+def create_expert_wrapper(expert_entry: DictConfig, mode: str = "train"):
     """
     Создаёт обёртку для одного эксперта/среды.
 
     Args:
-        expert_entry: Один элемент из списка cfg.run.experts
-                      (поля: type, config_path, checkpoint_epoch)
-        headless: Рендерить ли среду
+        expert_entry: Один элемент из списка cfg.run.experts.
+                      Поля: type, config_path, checkpoint_epoch, overrides (опционально).
         mode: "train" или "valid"
 
     Returns:
@@ -73,6 +72,8 @@ def create_expert_wrapper(expert_entry: DictConfig, mode: str = "train", overrid
     expert_type = expert_entry.type
     expert_cfg_path = expert_entry.get("config_path", None)
     checkpoint_epoch = expert_entry.get("checkpoint_epoch", -1)
+    # Hydra хранит списки как ListConfig — приводим к plain list для совместимости
+    overrides = list(expert_entry.get("overrides", []) or [])
 
     if expert_type == "kinesis":
         from arnold.experts.kinesis_wrapper import KinesisWrapper

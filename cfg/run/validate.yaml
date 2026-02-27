@@ -17,6 +17,11 @@ experts:
   - type: kinesis
     config_path: null
     checkpoint_epoch: -1
+    # Hydra overrides, которые пробрасываются напрямую в конфиг эксперта.
+    # Пример:
+    #   overrides:
+    #     - "run.xml_path=/path/to/myohuman_simpletorso.xml"
+    overrides: []
 
 # ==================== Performance ====================
 # При true: не считать std head и value decoder в get_action (быстрее при eval)

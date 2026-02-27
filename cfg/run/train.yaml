@@ -25,6 +25,7 @@ experts:
   - type: kinesis
     config_path: null
     checkpoint_epoch: -1
+    overrides: []
 
 # ==================== Evaluation ====================
 eval_frequency: 100  # Частота валидации (каждые N эпох), 0 = отключить
