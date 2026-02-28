@@ -1,0 +1,4 @@
+type: kinesis
+config_path: null
+checkpoint_epoch: -1
+overrides: []
