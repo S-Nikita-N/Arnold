@@ -22,7 +22,7 @@ output_dir: data/trained_models/${exp_name}
 #
 # Если len(experts) > 1 — требуется кросс-задачная нормализация (не реализована).
 # PPO-only: установить checkpoint_epoch=0 и learning.imitation_weight=0.
-experts: []
+experts: {}
 
 # ==================== Evaluation ====================
 eval_frequency: 100  # Частота валидации (каждые N эпох), 0 = отключить

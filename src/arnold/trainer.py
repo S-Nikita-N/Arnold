@@ -56,7 +56,11 @@ os.environ["OMP_NUM_THREADS"] = "1"
 logger = logging.getLogger(__name__)
 
 
-def create_expert_wrapper(expert_entry: DictConfig, mode: str = "train"):
+def create_expert_wrapper(
+    expert_entry: DictConfig,
+    mode: str = "train",
+    overrides: list = None,
+):
     """
     Создаёт обёртку для одного эксперта/среды.
 
@@ -72,8 +76,11 @@ def create_expert_wrapper(expert_entry: DictConfig, mode: str = "train"):
     expert_type = expert_entry.type
     expert_cfg_path = expert_entry.get("config_path", None)
     checkpoint_epoch = expert_entry.get("checkpoint_epoch", -1)
-    # Hydra хранит списки как ListConfig — приводим к plain list для совместимости
-    overrides = list(expert_entry.get("overrides", []) or [])
+
+    entry_overrides = list(expert_entry.get("overrides", []) or [])
+    mode_overrides_key = "train_overrides" if mode == "train" else "valid_overrides"
+    mode_overrides = list(expert_entry.get(mode_overrides_key, []) or [])
+    all_overrides = entry_overrides + mode_overrides + (overrides or [])
 
     if expert_type == "kinesis":
         from arnold.experts.kinesis_wrapper import KinesisWrapper
@@ -82,7 +89,7 @@ def create_expert_wrapper(expert_entry: DictConfig, mode: str = "train"):
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
             device="cpu",
-            overrides=overrides,
+            overrides=all_overrides,
             mode=mode,
         )
 
@@ -245,7 +252,7 @@ class ArnoldTrainer:
         Если передано больше одного — бросается NotImplementedError
         (требуется кросс-задачная нормализация наград/лоссов).
         """
-        experts_list = self.cfg.run.experts
+        experts_list = list(self.cfg.run.experts.values())
         if len(experts_list) == 0:
             raise ValueError("cfg.run.experts is empty — нужна хотя бы одна среда.")
         if len(experts_list) > 1:

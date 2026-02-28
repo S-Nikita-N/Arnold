@@ -114,7 +114,7 @@ def validate(cfg: DictConfig) -> dict:
 
     logger.info(f"Loading expert environment (valid mode, headless={headless})...")
 
-    experts_list = cfg.run.experts
+    experts_list = list(cfg.run.experts.values())
     if len(experts_list) == 0:
         raise ValueError("cfg.run.experts is empty")
     expert_entry = experts_list[0]
