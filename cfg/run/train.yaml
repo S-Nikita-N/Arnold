@@ -3,6 +3,7 @@
 # ==================== Checkpointing ====================
 save_frequency: 1000
 save_curr_frequency: 50
+resampling_interval: 100
 log_frequency: 1
 
 # ==================== Parallelism ====================

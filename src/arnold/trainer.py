@@ -172,9 +172,7 @@ class ArnoldTrainer:
         self.log_frequency = cfg.run.log_frequency
         self.output_dir = cfg.run.output_dir
         self.eval_frequency = cfg.run.eval_frequency
-
-        # Environment (из cfg.env)
-        self.resampling_interval = cfg.env.resampling_interval
+        self.resampling_interval = cfg.run.resampling_interval
 
         # Logging
         self.use_wandb = cfg.use_wandb

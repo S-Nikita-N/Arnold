@@ -1,4 +1,0 @@
-task: Myohuman
-resampling_interval: 100
-sim_timestep_inv: 150
-control_frequency_inv: 5
