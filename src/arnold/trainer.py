@@ -65,22 +65,15 @@ def create_expert_wrapper(
     Создаёт обёртку для одного эксперта/среды.
 
     Args:
-        expert_entry: Один элемент из списка cfg.run.experts.
-                      Поля: type, config_path, checkpoint_epoch, overrides (опционально).
+        expert_entry: Элемент из cfg.run.experts (dict).
+                      Общие поля: type, config_path, checkpoint_epoch.
+                      Myohuman: simple (bool) — упрощённая модель (simpletorso).
         mode: "train" или "valid"
-
-    Returns:
-        Wrapper с интерфейсом: .env, .reset(), .step(), .get_expert_action(),
-        .forward_motions(), .has_expert, .num_motions, .sample_motions()
+        overrides: Дополнительные Hydra overrides
     """
     expert_type = expert_entry.type
     expert_cfg_path = expert_entry.get("config_path", None)
     checkpoint_epoch = expert_entry.get("checkpoint_epoch", -1)
-
-    entry_overrides = list(expert_entry.get("overrides", []) or [])
-    mode_overrides_key = "train_overrides" if mode == "train" else "valid_overrides"
-    mode_overrides = list(expert_entry.get(mode_overrides_key, []) or [])
-    all_overrides = entry_overrides + mode_overrides + (overrides or [])
 
     if expert_type == "kinesis":
         from arnold.experts.kinesis_wrapper import KinesisWrapper
@@ -89,19 +82,22 @@ def create_expert_wrapper(
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
             device="cpu",
-            overrides=all_overrides,
+            overrides=overrides or [],
             mode=mode,
         )
 
     elif expert_type == "myohuman":
         from arnold.experts.myohuman_wrapper import MyoHumanWrapper
 
+        simple = expert_entry.get("simple", False)
+
         return MyoHumanWrapper(
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
             device="cpu",
-            overrides=overrides,
+            overrides=overrides or [],
             mode=mode,
+            simple=simple,
         )
 
     else:

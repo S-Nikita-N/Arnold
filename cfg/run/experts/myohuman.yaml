@@ -1,6 +1,4 @@
 type: myohuman
 config_path: null
 checkpoint_epoch: 0
-overrides: []
-train_overrides: []
-valid_overrides: []
+simple: false

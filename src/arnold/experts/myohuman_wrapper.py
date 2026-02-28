@@ -91,6 +91,7 @@ class MyoHumanWrapper:
         device: str = "cpu",
         overrides: list = [],
         mode: str = "train",
+        simple: bool = False,
     ):
         """
         Args:
@@ -100,21 +101,19 @@ class MyoHumanWrapper:
             device: Устройство ("cpu" или "cuda")
             overrides: Hydra overrides
             mode: "train" или "valid" — определяет motion file и настройки
+            simple: Использовать упрощённую модель (simpletorso)
         """
         self.mode = mode
+        self.simple = simple
         self.device = torch.device(device)
-        self._expert_policy = None  # Загружается опционально
+        self._expert_policy = None
 
-        # Сохраняем cwd и переключаемся на MyoHuman root
-        # (MyoHuman использует относительные пути от своего корня)
         original_cwd = os.getcwd()
         os.chdir(MYOHUMAN_ROOT)
 
         try:
-            # Импортируем после добавления путей
             from myohuman.env.myolegs_im import MyoLegsIm
 
-            # Загружаем или используем готовый конфиг
             if expert_cfg is not None:
                 self.cfg = expert_cfg
             else:
@@ -128,6 +127,14 @@ class MyoHumanWrapper:
                     "no_log=True",
                     "test=True" if mode == "valid" else "test=False",
                 ]
+
+                if simple:
+                    xml_path = MYOHUMAN_ROOT / "xml" / "myohuman_simpletorso.xml"
+                    pose_file = "ik_test_simpletorso.pkl" if mode == "valid" else "ik_test_simpletorso.pkl"
+                    pose_path = MYOHUMAN_ROOT / "data" / "inverse_kinematics" / pose_file
+                    default_overrides.append(f"run.xml_path={xml_path}")
+                    default_overrides.append(f"run.initial_pose_file={pose_path}")
+
                 if overrides:
                     default_overrides.extend(overrides)
 
