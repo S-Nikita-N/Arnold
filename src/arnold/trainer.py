@@ -1230,8 +1230,28 @@ class ArnoldTrainer:
             self.epoch = 0
             self.num_steps = 0
 
-            logger.info("Transfer mode: resetting observation normalizer statistics")
-            self.policy.obs_normalizer.stats.clear()
+            # Normalizer stats keyed by semantic signature (e.g. "femur|r|position|x"),
+            # so stats from source expert transfer naturally to target expert
+            # for shared body parts. Only prune stats not needed by any new expert.
+            ckpt_keys = set(self.policy.obs_normalizer.stats.keys())
+            needed_keys = set()
+            for ctx in self.experts.values():
+                for sig in ctx.parser.obs_signatures:
+                    needed_keys.add(self.policy.obs_normalizer._sig_key(sig))
+
+            reused = ckpt_keys & needed_keys
+            pruned = ckpt_keys - needed_keys
+            fresh = needed_keys - ckpt_keys
+
+            for key in pruned:
+                del self.policy.obs_normalizer.stats[key]
+            self.policy.obs_normalizer._invalidate_cache()
+
+            logger.info(
+                f"Transfer mode: normalizer stats — "
+                f"{len(reused)} reused, {len(fresh)} new (no stats yet), "
+                f"{len(pruned)} pruned (not in target experts)"
+            )
 
             logger.info("Transfer mode: reinitializing value decoder and value head")
             for module in [self.policy.value_decoder, self.policy.value_head]:
