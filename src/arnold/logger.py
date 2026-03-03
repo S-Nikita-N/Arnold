@@ -165,12 +165,12 @@ class OBCLogger:
     
     # ==================== Logging ====================
     
-    def get_log_str(self, epoch: int, exp_name: str = "") -> str:
+    def get_log_str(self, epoch: int, expert_name: str) -> str:
         """Возвращает строку для печати."""
         reward_str = " ".join([f"{np.mean(v):.3f}" for k, v in self.info_dict.items() if v])
         
         return (
-            f"Ep: {epoch} \t {exp_name} "
+            f"Ep: {epoch} \t {expert_name} "
             f"T_s {self.sample_time:.2f} T_u {self.update_time:.2f} \t "
             f"eps_R_avg {self.avg_episode_reward:.4f} "
             f"R_avg {self.avg_reward:.4f} "

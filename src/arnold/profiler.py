@@ -39,6 +39,16 @@ class SamplingProfiler:
         self._counts.clear()
         self._starts.clear()
 
+    def to_dict(self) -> Dict[str, any]:
+        return {"totals": dict(self._totals), "counts": dict(self._counts)}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, any]) -> "SamplingProfiler":
+        p = cls()
+        p._totals = data["totals"]
+        p._counts = data["counts"]
+        return p
+
     def total_tracked(self) -> float:
         """Суммарное время по всем ключам верхнего уровня (без policy_*)."""
         return sum(

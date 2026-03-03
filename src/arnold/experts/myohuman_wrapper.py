@@ -130,7 +130,7 @@ class MyoHumanWrapper:
 
                 if simple:
                     xml_path = MYOHUMAN_ROOT / "xml" / "myohuman_simpletorso.xml"
-                    pose_file = "ik_test_simpletorso.pkl" if mode == "valid" else "ik_test_simpletorso.pkl"
+                    pose_file = "ik_test_simpletorso.pkl" if mode == "valid" else "ik_train_simpletorso.pkl"
                     pose_path = MYOHUMAN_ROOT / "data" / "inverse_kinematics" / pose_file
                     default_overrides.append(f"run.xml_path={xml_path}")
                     default_overrides.append(f"run.initial_pose_file={pose_path}")

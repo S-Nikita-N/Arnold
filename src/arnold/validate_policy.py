@@ -74,7 +74,24 @@ def load_policy(
         dropout=dropout,
     )
 
-    policy.load_state_dict(checkpoint["policy"])
+    try:
+        policy.load_state_dict(checkpoint["policy"])
+    except RuntimeError:
+        logger.info("Strict load failed, using partial match (cross-environment checkpoint)...")
+        model_state = policy.state_dict()
+        ckpt_state = checkpoint["policy"]
+        filtered = {}
+        for k, v in ckpt_state.items():
+            if (
+                k in model_state
+                and hasattr(model_state[k], 'shape')
+                and hasattr(v, 'shape')
+                and model_state[k].shape != v.shape
+            ):
+                continue
+            filtered[k] = v
+        policy.load_state_dict(filtered, strict=False)
+
     policy.to(device)
     policy.eval()
 

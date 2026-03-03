@@ -6,11 +6,14 @@ Encoder-Decoder Transformer для управления мышцами.
 - Shared Encoder обрабатывает body-level embeddings
 - Action Decoder генерирует muscle activations
 - Value Decoder генерирует state value
+
+Multi-expert: поддерживает forward с expert_name для корректного
+выбора index-буферов в BodyTokenizer и group signatures.
 """
 
 import torch
 import torch.nn as nn
-from typing import List, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.torch_model.normalization import SignatureNormalizerModule
@@ -30,7 +33,7 @@ class TransformerPolicy(nn.Module):
     def __init__(
         self,
         vocab: SensorimotorVocabulary,
-        groups: List[BodyGroup],
+        groups: Union[List[BodyGroup], Dict[str, List[BodyGroup]]],
         history_len: int = 5,
         embed_dim: int = 128,
         ff_dim: int = 512,
@@ -41,6 +44,11 @@ class TransformerPolicy(nn.Module):
         dropout: float = 0.0,
         detached_value_encoder: bool = False,
     ):
+        """
+        Args:
+            groups: List[BodyGroup] (single-expert) или
+                    Dict[expert_name → List[BodyGroup]] (multi-expert)
+        """
         super().__init__()
 
         self.vocab = vocab
@@ -49,7 +57,6 @@ class TransformerPolicy(nn.Module):
 
         self.obs_normalizer = SignatureNormalizerModule()
 
-        # Body tokenizer: flat obs → body-level tokens
         self.body_tokenizer = BodyTokenizer(groups, history_len, embed_dim)
 
         # Transformer Encoder
@@ -107,14 +114,8 @@ class TransformerPolicy(nn.Module):
 
         self._init_weights()
 
-        # Инициализируем action_mean около нуля, чтобы не было изначального взрыва
         nn.init.orthogonal_(self.action_mean_head.weight, gain=0.1)
         nn.init.zeros_(self.action_mean_head.bias)
-        
-        # # Инициализируем std независимым от состояния, около -0.5 (std ~ 0.6)
-        # # Это даст нормальное начальное исследование (exploration) без softmax
-        # nn.init.zeros_(self.action_std_head.weight)
-        # nn.init.constant_(self.action_std_head.bias, -0.5)
 
     def enable_profiling(self, profiler: SamplingProfiler) -> None:
         self.profiler = profiler
@@ -135,6 +136,7 @@ class TransformerPolicy(nn.Module):
         obs_timeseries: torch.Tensor,
         obs_signatures: List[Tuple[str, ...]],
         action_signatures: List[Tuple[str, ...]],
+        expert_name: Optional[str] = None,
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -145,6 +147,7 @@ class TransformerPolicy(nn.Module):
             obs_timeseries: [batch, n_obs_flat, history_len] — flat наблюдения
             obs_signatures: per-scalar сигнатуры (для нормализатора)
             action_signatures: сигнатуры для мышц
+            expert_name: ключ эксперта для BodyTokenizer
             return_std: если False — не считать std head
             return_value: если False — не считать value decoder
 
@@ -156,19 +159,20 @@ class TransformerPolicy(nn.Module):
         p = self.profiler
         batch_size = obs_timeseries.shape[0]
 
-        # 1. Per-scalar нормализация (obs_signatures нужны нормализатору)
+        # 1. Per-scalar нормализация
         if p: p.tick("  normalizer")
         obs_timeseries = self.obs_normalizer(obs_signatures, obs_timeseries)
         if p: p.tock("  normalizer")
 
         # 2. Body tokenizer: [B, n_obs_flat, history_len] → [B, n_tokens, embed_dim]
         if p: p.tick("  body_tokenizer")
-        sensory_emb = self.body_tokenizer(obs_timeseries)
+        sensory_emb = self.body_tokenizer(obs_timeseries, expert_name=expert_name)
         if p: p.tock("  body_tokenizer")
 
         # 3. Role embeddings для body-level групп
         if p: p.tick("  vocab_embed_obs")
-        role_emb = self.vocab.get_embedding_batch(self.body_tokenizer.group_signatures)
+        group_sigs = self.body_tokenizer.get_group_signatures(expert_name)
+        role_emb = self.vocab.get_embedding_batch(group_sigs)
         role_emb = role_emb.unsqueeze(0).expand(batch_size, -1, -1)
         sensory_emb = sensory_emb + role_emb
         if p: p.tock("  vocab_embed_obs")
@@ -219,6 +223,7 @@ class TransformerPolicy(nn.Module):
         obs_timeseries: torch.Tensor,
         obs_signatures: List[Tuple[str, ...]],
         action_signatures: List[Tuple[str, ...]],
+        expert_name: Optional[str] = None,
         deterministic: bool = False,
         return_std: bool = True,
         return_value: bool = True,
@@ -230,6 +235,7 @@ class TransformerPolicy(nn.Module):
             obs_timeseries: [batch, n_obs, history_len]
             obs_signatures: per-scalar сигнатуры
             action_signatures: сигнатуры мышц
+            expert_name: ключ эксперта для BodyTokenizer (None → default)
             deterministic: если True — без шума
             return_std: если False — не считать std head
             return_value: если False — не считать value decoder
@@ -243,6 +249,7 @@ class TransformerPolicy(nn.Module):
             obs_timeseries,
             obs_signatures,
             action_signatures,
+            expert_name=expert_name,
             return_std=return_std,
             return_value=return_value,
         )
@@ -273,14 +280,14 @@ class TransformerPolicy(nn.Module):
         obs_signatures: List[Tuple[str, ...]],
         action_signatures: List[Tuple[str, ...]],
         actions: torch.Tensor,
+        expert_name: Optional[str] = None,
     ) -> torch.Tensor:
-        """
-        Вычисляет log probability для заданных действий.
-        """
+        """Вычисляет log probability для заданных действий."""
         mean, log_std, _ = self.forward(
             obs_timeseries,
             obs_signatures,
-            action_signatures
+            action_signatures,
+            expert_name=expert_name,
         )
         return self._compute_log_prob(actions, mean, log_std)
 
@@ -290,9 +297,7 @@ class TransformerPolicy(nn.Module):
         mean: torch.Tensor,
         log_std: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        log N(a | μ, σ) = -0.5 * (log(2π) + 2*log(σ) + ((a-μ)/σ)²)
-        """
+        """log N(a | μ, σ) = -0.5 * (log(2π) + 2·log(σ) + ((a-μ)/σ)²)"""
         var = (log_std * 2).exp()
         log_prob = -0.5 * (
             torch.log(torch.tensor(2 * 3.14159265359, device=actions.device, dtype=actions.dtype)) +

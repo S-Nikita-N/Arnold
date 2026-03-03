@@ -2,30 +2,56 @@
 """
 Скрипт обучения Arnold.
 
-Режим определяется автоматически по весам лоссов:
-  OBC:      ppo_weight=0,  imitation_weight>0
-  OBC-PPO:  ppo_weight>0,  imitation_weight>0
-  PPO:      ppo_weight>0,  imitation_weight=0
+Поддерживает single- и multi-expert обучение.
+Per-expert режим определяется по loss-весам каждого эксперта.
 
 Примеры:
 
-    # OBC дистилляция из Kinesis
-    poetry run python -m arnold.train_arnold exp_name=obc_kinesis
-
-    # PPO на MyoHuman, с переносом знаний из OBC чекпоинта
+    # Single expert — OBC дистилляция из Kinesis
     poetry run python -m arnold.train_arnold \
-        env=myohuman \
-        device=mps \
-        'run.experts=[{type: myohuman, config_path: null, checkpoint_epoch: 0}]' \
-        run.num_threads=5 \
-        resume_checkpoint=data/trained_models/obc_run_A100_80GB_3/model_best_ep_length.pth \
-        learning.ppo_weight=1.0 \
-        learning.imitation_weight=0 \
-        learning.entropy_weight=0.001 \
-        learning.value_weight=0.5 \
-        learning.batch_size=64 \
-        learning.min_batch_size=5120 \
-        exp_name=ppo_myohuman_transfer_1
+        '+run/experts@run.experts.kin=kinesis' \
+        exp_name=obc_kinesis
+
+    # Single expert — PPO на MyoHuman
+    poetry run python -m arnold.train_arnold \
+        '+run/experts@run.experts.myo=myohuman' \
+        run.experts.myo.simple=true \
+        run.experts.myo.learning.ppo_weight=1.0 \
+        run.experts.myo.learning.imitation_weight=0 \
+        run.experts.myo.learning.entropy_weight=0.0001 \
+        run.experts.myo.learning.value_weight=0.5 \
+        run.num_threads=15 \
+        exp_name=ppo_myohuman
+
+    # Multi-expert — MyoHuman (PPO) + Kinesis (OBC)
+    poetry run python -m arnold.train_arnold \
+        device=cuda \
+        '+run/experts@run.experts.myo=myohuman' \
+        '+run/experts@run.experts.kin=kinesis' \
+        \
+        run.experts.myo.simple=true \
+        run.experts.myo.num_threads=10 \
+        run.experts.myo.min_batch_size=20480 \
+        run.experts.myo.learning.ppo_weight=1.0 \
+        run.experts.myo.learning.imitation_weight=0 \
+        run.experts.myo.learning.entropy_weight=0.0001 \
+        run.experts.myo.learning.value_weight=0.5 \
+        \
+        run.experts.kin.num_threads=5 \
+        run.experts.kin.min_batch_size=10240 \
+        run.experts.kin.learning.ppo_weight=0.0 \
+        run.experts.kin.learning.imitation_weight=1.0 \
+        run.experts.kin.learning.entropy_weight=0.0 \
+        run.experts.kin.learning.value_weight=0.0 \
+        \
+        learning.batch_size=256 \
+        learning.learning_rate=1e-4 \
+        learning.grad_clip=15 \
+        learning.opt_num_epochs=5 \
+        learning.tokenizer_granularity=per_spec \
+        \
+        resume_checkpoint=path/to/pretrained.pth \
+        exp_name=multi_myo_kin
 """
 
 import os
@@ -70,13 +96,28 @@ def main(cfg: DictConfig) -> None:
 
     logger = setup_logging(output_dir)
 
-    # Определяем режим
-    if cfg.learning.imitation_weight > 0 and cfg.learning.ppo_weight > 0:
-        mode_str = "OBC-PPO"
-    elif cfg.learning.imitation_weight > 0:
-        mode_str = "OBC"
+    # Определяем режим по экспертам
+    experts_cfg = cfg.run.experts
+    expert_names = list(experts_cfg.keys()) if experts_cfg else []
+
+    if len(expert_names) > 1:
+        mode_str = f"MULTI-EXPERT ({', '.join(expert_names)})"
+    elif len(expert_names) == 1:
+        entry = list(experts_cfg.values())[0]
+        ppo_w = entry.get("learning", {}).get("ppo_weight", cfg.learning.ppo_weight)
+        im_w = entry.get("learning", {}).get("imitation_weight", cfg.learning.imitation_weight)
+        if ppo_w is None:
+            ppo_w = cfg.learning.ppo_weight
+        if im_w is None:
+            im_w = cfg.learning.imitation_weight
+        if im_w > 0 and ppo_w > 0:
+            mode_str = "OBC-PPO"
+        elif im_w > 0:
+            mode_str = "OBC"
+        else:
+            mode_str = "PPO"
     else:
-        mode_str = "PPO"
+        mode_str = "NO EXPERTS"
 
     logger.info("=" * 60)
     logger.info(f"Arnold Training — {mode_str}")
