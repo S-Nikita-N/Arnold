@@ -830,6 +830,17 @@ class ArnoldTrainer:
                 "val_post_std": val_post_std,
             }
 
+        # Update normalizer stats ONCE with the full batch data.
+        # Must happen before the PPO loop — stats are frozen during updates
+        # to avoid drift between new_log_probs and fixed_log_probs.
+        with torch.no_grad():
+            for expert_name, ed in expert_data.items():
+                self.policy.obs_normalizer.update(
+                    ed["obs_signatures"],
+                    ed["states"],
+                )
+
+
         return all_diagnostics
 
     # ------------------------------------------------------------------

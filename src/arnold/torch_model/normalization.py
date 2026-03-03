@@ -153,9 +153,6 @@ class SignatureNormalizerModule(nn.Module):
             return out
 
     def forward(self, signatures: List[Tuple[str, ...]], values: torch.Tensor) -> torch.Tensor:
-        if self.training:
-            with torch.no_grad():
-                self.update(signatures, values)
         return self.normalize(signatures, values)
 
     def get_extra_state(self) -> Dict[str, Any]:
