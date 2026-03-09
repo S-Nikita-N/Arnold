@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 def load_policy(
     checkpoint_path: str,
     device: torch.device,
-    learning_cfg,
+    expert_config: DictConfig,
+    learning_config: DictConfig,
     parser: ObservationParser,
 ) -> tuple:
     """
@@ -49,17 +50,17 @@ def load_policy(
     logger.info(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    embed_dim = learning_cfg.embed_dim
-    ff_dim = learning_cfg.ff_dim
-    num_heads = learning_cfg.num_heads
-    num_enc_layers = learning_cfg.num_enc_layers
-    num_act_dec_layers = learning_cfg.num_act_dec_layers
-    num_val_dec_layers = learning_cfg.num_val_dec_layers
-    dropout = learning_cfg.dropout
-    history_len = learning_cfg.history_len
+    embed_dim = learning_config.embed_dim
+    ff_dim = learning_config.ff_dim
+    num_heads = learning_config.num_heads
+    num_enc_layers = learning_config.num_enc_layers
+    num_act_dec_layers = learning_config.num_act_dec_layers
+    num_val_dec_layers = learning_config.num_val_dec_layers
+    dropout = learning_config.dropout
+    history_len = learning_config.history_len
 
-    granularity = learning_cfg.tokenizer_granularity
-    groups = parser.get_body_groups(granularity)
+    granularity = learning_config.tokenizer_granularity
+    groups = {expert_config.type: parser.get_body_groups(granularity)}
     vocab = SensorimotorVocabulary(embed_dim=embed_dim)
     policy = TransformerPolicy(
         vocab=vocab,
@@ -132,12 +133,15 @@ def validate(cfg: DictConfig) -> dict:
     logger.info(f"Loading expert environment (valid mode, headless={headless})...")
 
     experts_list = list(cfg.run.experts.values())
-    if len(experts_list) == 0:
+    if len(cfg.run.experts) == 0:
         raise ValueError("cfg.run.experts is empty")
-    expert_entry = experts_list[0]
+    elif len(cfg.run.experts) > 1:
+        raise ValueError("cfg.run.experts has multiple experts")
+ 
+    expert_config = experts_list[0]
 
     overrides = [f"run.headless={str(headless).lower()}"]
-    expert = create_expert_wrapper(expert_entry, mode="valid", overrides=overrides)
+    expert = create_expert_wrapper(expert_config, mode="valid", overrides=overrides)
     logger.info(f"Expert loaded. Obs dim: {expert.obs_dim}, Action dim: {expert.action_dim}")
 
     # Создаём парсер (нужен для body groups при создании policy)
@@ -145,7 +149,7 @@ def validate(cfg: DictConfig) -> dict:
     logger.info(f"Parser: {parser.n_obs_elements} observation elements")
 
     # Загружаем политику (архитектура из cfg.learning, groups из parser)
-    policy, hp = load_policy(checkpoint, device, cfg.learning, parser)
+    policy, hp = load_policy(checkpoint, device, expert_config, cfg.learning, parser)
     
     # Собираем метрики
     episode_rewards = []
@@ -203,6 +207,7 @@ def validate(cfg: DictConfig) -> dict:
                         deterministic=True,
                         return_std=not fast_eval,
                         return_value=not fast_eval,
+                        expert_name=expert_config.type
                     )
                 profile_times["policy_get_action"] += time.perf_counter() - t0
                 

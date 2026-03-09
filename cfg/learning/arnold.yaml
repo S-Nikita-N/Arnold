@@ -36,3 +36,4 @@ max_epochs: 100000
 use_scheduler: false
 transfer_mode: true
 use_compile: false
+use_bfloat16: false

@@ -136,7 +136,7 @@ class TransformerPolicy(nn.Module):
         obs_timeseries: torch.Tensor,
         obs_signatures: List[Tuple[str, ...]],
         action_signatures: List[Tuple[str, ...]],
-        expert_name: Optional[str] = None,
+        expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -223,7 +223,7 @@ class TransformerPolicy(nn.Module):
         obs_timeseries: torch.Tensor,
         obs_signatures: List[Tuple[str, ...]],
         action_signatures: List[Tuple[str, ...]],
-        expert_name: Optional[str] = None,
+        expert_name: str,
         deterministic: bool = False,
         return_std: bool = True,
         return_value: bool = True,

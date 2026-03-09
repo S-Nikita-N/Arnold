@@ -23,6 +23,7 @@ import math
 import time
 import random
 import logging
+import contextlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -186,6 +187,7 @@ class ArnoldTrainer:
         self.max_epochs = cfg.learning.max_epochs
         self.use_scheduler = cfg.learning.use_scheduler
         self.use_compile = cfg.learning.use_compile
+        self.use_bfloat16 = cfg.learning.use_bfloat16
 
         # Run
         self.save_frequency = cfg.run.save_frequency
@@ -677,70 +679,77 @@ class ArnoldTrainer:
                 mini_fixed_lp = ed["fixed_log_probs"][batch_indices]
                 mini_old_values = ed["old_values"][batch_indices]
 
-                pred_actions, log_std, values = self.policy(
-                    mini_states,
-                    ed["obs_signatures"],
-                    ed["action_signatures"],
-                    expert_name=expert_name,
+                autocast_ctx = (
+                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    if self.use_bfloat16 and self.device.type == "cuda"
+                    else contextlib.nullcontext()
                 )
 
-                new_log_probs = self.policy._compute_log_prob(
-                    mini_actions, pred_actions, log_std,
-                )
-
-                loss = torch.tensor(0.0, device=self.device)
-
-                # --- PPO ---
-                if ctx.ppo_weight > 0:
-                    log_ratio = new_log_probs - mini_fixed_lp
-                    ratio = torch.exp(log_ratio)
-                    surr1 = ratio * mini_advantages
-                    surr2 = torch.clamp(
-                        ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon,
-                    ) * mini_advantages
-                    ppo_loss = -torch.min(surr1, surr2).mean()
-                    loss = loss + ctx.ppo_weight * ppo_loss
-                    per_expert_losses[expert_name]["ppo"].append(ppo_loss.item())
-
-                    with torch.no_grad():
-                        approx_kl = ((ratio - 1) - log_ratio).mean().item()
-                        clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
-                        per_expert_diag[expert_name]["ratios"].append(ratio.mean().item())
-                        per_expert_diag[expert_name]["clip_fracs"].append(clip_frac)
-                        per_expert_diag[expert_name]["approx_kls"].append(approx_kl)
-
-                # --- Imitation ---
-                if ctx.use_expert and ctx.imitation_weight > 0:
-                    mini_expert = ed["expert_actions"][batch_indices]
-                    imitation_loss = nn.functional.mse_loss(pred_actions, mini_expert)
-                    loss = loss + ctx.imitation_weight * imitation_loss
-                    per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
-
-                # --- Value ---
-                if ctx.value_weight > 0:
-                    vf_loss_unclipped = (values - mini_returns) ** 2
-                    v_clipped = mini_old_values + torch.clamp(
-                        values - mini_old_values,
-                        -self.clip_epsilon,
-                        self.clip_epsilon,
+                with autocast_ctx:
+                    pred_actions, log_std, values = self.policy(
+                        mini_states,
+                        ed["obs_signatures"],
+                        ed["action_signatures"],
+                        expert_name=expert_name,
                     )
-                    vf_loss_clipped = (v_clipped - mini_returns) ** 2
-                    value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
-                    loss = loss + ctx.value_weight * value_loss
-                    per_expert_losses[expert_name]["value"].append(value_loss.item())
 
-                # --- Entropy ---
-                if ctx.entropy_weight > 0:
-                    entropy = 0.5 * (1 + 1.8378770664093453) + log_std.mean()
-                    entropy_loss = -entropy
-                    loss = loss + ctx.entropy_weight * entropy_loss
-                    per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
+                    new_log_probs = self.policy._compute_log_prob(
+                        mini_actions, pred_actions, log_std,
+                    )
 
-                # Apply expert loss scale
-                loss = loss * ctx.loss_scale
+                    loss = torch.tensor(0.0, device=self.device)
 
-                self.optimizer.zero_grad()
-                loss.backward()
+                    # --- PPO ---
+                    if ctx.ppo_weight > 0:
+                        log_ratio = new_log_probs - mini_fixed_lp
+                        ratio = torch.exp(log_ratio)
+                        surr1 = ratio * mini_advantages
+                        surr2 = torch.clamp(
+                            ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon,
+                        ) * mini_advantages
+                        ppo_loss = -torch.min(surr1, surr2).mean()
+                        loss = loss + ctx.ppo_weight * ppo_loss
+                        per_expert_losses[expert_name]["ppo"].append(ppo_loss.item())
+
+                        with torch.no_grad():
+                            approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                            clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
+                            per_expert_diag[expert_name]["ratios"].append(ratio.mean().item())
+                            per_expert_diag[expert_name]["clip_fracs"].append(clip_frac)
+                            per_expert_diag[expert_name]["approx_kls"].append(approx_kl)
+
+                    # --- Imitation ---
+                    if ctx.use_expert and ctx.imitation_weight > 0:
+                        mini_expert = ed["expert_actions"][batch_indices]
+                        imitation_loss = nn.functional.mse_loss(pred_actions, mini_expert)
+                        loss = loss + ctx.imitation_weight * imitation_loss
+                        per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
+
+                    # --- Value ---
+                    if ctx.value_weight > 0:
+                        vf_loss_unclipped = (values - mini_returns) ** 2
+                        v_clipped = mini_old_values + torch.clamp(
+                            values - mini_old_values,
+                            -self.clip_epsilon,
+                            self.clip_epsilon,
+                        )
+                        vf_loss_clipped = (v_clipped - mini_returns) ** 2
+                        value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
+                        loss = loss + ctx.value_weight * value_loss
+                        per_expert_losses[expert_name]["value"].append(value_loss.item())
+
+                    # --- Entropy ---
+                    if ctx.entropy_weight > 0:
+                        entropy = 0.5 * (1 + 1.8378770664093453) + log_std.mean()
+                        entropy_loss = -entropy
+                        loss = loss + ctx.entropy_weight * entropy_loss
+                        per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
+
+                    # Apply expert loss scale
+                    loss = loss * ctx.loss_scale
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
 
                 if self.grad_clip > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -839,7 +848,6 @@ class ArnoldTrainer:
                     ed["obs_signatures"],
                     ed["states"],
                 )
-
 
         return all_diagnostics
 
