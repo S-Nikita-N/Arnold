@@ -1,15 +1,22 @@
 # Arnold Architecture & Learning Config
 
-# ==================== Architecture ====================
-embed_dim: 128
-ff_dim: 512
-num_heads: 4
-num_enc_layers: 6
-num_act_dec_layers: 6
-num_val_dec_layers: 1
-dropout: 0.0
+# ==================== Policy Type ====================
+policy: transformer  # transformer | lattice
+
+# ==================== Global (parser, sampling) ====================
 history_len: 5
 tokenizer_granularity: scalar  # scalar | per_spec | per_body
+
+# ==================== Transformer (только при policy: transformer) ====================
+transformer:
+  embed_dim: 128
+  ff_dim: 512
+  num_heads: 4
+  num_enc_layers: 6
+  num_act_dec_layers: 6
+  num_val_dec_layers: 1
+  dropout: 0.0
+  detached_value_encoder: false
 
 # ==================== PPO ====================
 batch_size: 128
@@ -27,9 +34,6 @@ imitation_weight: 1.0
 value_weight: 0.5
 entropy_weight: 0
 
-# Отключать градиенты в энкодер при обучении value decoder
-detached_value_encoder: false
-
 # ==================== Training ====================
 min_batch_size: 51200
 max_epochs: 100000
@@ -37,3 +41,10 @@ use_scheduler: false
 transfer_mode: true
 use_compile: false
 use_bfloat16: false
+
+# ==================== Lattice (только при policy_type: lattice) ====================
+lattice:
+  mlp_units: [2048, 1536, 1024, 1024, 512, 512]
+  mlp_activation: silu
+  fix_std: false
+  log_std_init: 0

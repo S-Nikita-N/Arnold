@@ -33,7 +33,7 @@ import warnings
 fork_ctx = mp.get_context('fork')
 
 from dataclasses import dataclass
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from typing import Dict, List, Tuple, Optional, Any
 from tqdm import tqdm
 
@@ -163,15 +163,8 @@ class ArnoldTrainer:
         self.dtype = dtype
         self.device = torch.device(device if device else cfg.device)
 
-        # Architecture
+        # Global (parser, sampling)
         self.history_len = cfg.learning.history_len
-        self.embed_dim = cfg.learning.embed_dim
-        self.ff_dim = cfg.learning.ff_dim
-        self.num_heads = cfg.learning.num_heads
-        self.num_enc_layers = cfg.learning.num_enc_layers
-        self.num_act_dec_layers = cfg.learning.num_act_dec_layers
-        self.num_val_dec_layers = cfg.learning.num_val_dec_layers
-        self.dropout = cfg.learning.dropout
         self.tokenizer_granularity = cfg.learning.tokenizer_granularity
 
         # Training (global defaults, per-expert overrides possible)
@@ -183,11 +176,11 @@ class ArnoldTrainer:
         self.clip_epsilon = cfg.learning.clip_epsilon
         self.opt_num_epochs = cfg.learning.opt_num_epochs
         self.grad_clip = cfg.learning.grad_clip
-        self.detached_value_encoder = cfg.learning.detached_value_encoder
         self.max_epochs = cfg.learning.max_epochs
         self.use_scheduler = cfg.learning.use_scheduler
         self.use_compile = cfg.learning.use_compile
         self.use_bfloat16 = cfg.learning.use_bfloat16
+        self.policy = None  # устанавливается в setup_policy()
 
         # Run
         self.save_frequency = cfg.run.save_frequency
@@ -319,26 +312,19 @@ class ArnoldTrainer:
             self.best_eval_imitation_loss[name] = float('inf')
 
     def setup_policy(self) -> None:
-        """Создаёт TransformerPolicy с merged группами всех экспертов."""
+        """Создаёт policy: TransformerPolicy или LatticePolicy."""
         logger.info("Setting up Arnold policy...")
 
-        self.vocab = SensorimotorVocabulary(embed_dim=self.embed_dim)
+        if self.cfg.learning.policy == "transformer":
+            self._setup_transformer_policy()
+        elif self.cfg.learning.policy == "lattice":
+            self._setup_lattice_policy()
+        else:
+            raise ValueError(
+                f"Unknown policy: {self.cfg.learning.policy}. "
+                f"Supported: transformer, lattice"
+            )
 
-        groups = {name: ctx.groups for name, ctx in self.experts.items()}
-
-        self.policy = TransformerPolicy(
-            vocab=self.vocab,
-            groups=groups,
-            history_len=self.history_len,
-            embed_dim=self.embed_dim,
-            ff_dim=self.ff_dim,
-            num_heads=self.num_heads,
-            num_enc_layers=self.num_enc_layers,
-            num_act_dec_layers=self.num_act_dec_layers,
-            num_val_dec_layers=self.num_val_dec_layers,
-            dropout=self.dropout,
-            detached_value_encoder=self.detached_value_encoder,
-        )
         self.policy.to(self.device)
 
         if self.use_compile:
@@ -346,7 +332,49 @@ class ArnoldTrainer:
             logger.info("torch.compile applied (mode=reduce-overhead)")
 
         logger.info(
-            f"Arnold policy created. Parameters: {sum(p.numel() for p in self.policy.parameters()):,}"
+            f"Arnold policy created ({self.policy}). "
+            f"Parameters: {sum(p.numel() for p in self.policy.parameters()):,}"
+        )
+
+    def _setup_transformer_policy(self) -> None:
+        """TransformerPolicy с merged группами всех экспертов."""
+        transformer_cfg = OmegaConf.to_container(
+            self.cfg.learning.transformer, resolve=True
+        )
+        self.vocab = SensorimotorVocabulary(embed_dim=transformer_cfg["embed_dim"])
+        groups = {name: ctx.groups for name, ctx in self.experts.items()}
+
+        self.policy = TransformerPolicy(
+            vocab=self.vocab,
+            groups=groups,
+            history_len=self.history_len,
+            **transformer_cfg,
+        )
+
+    def _setup_lattice_policy(self) -> None:
+        """LatticePolicy — MLP с полной ковариацией (как в Kinesis). Только single-expert."""
+        from arnold.torch_model.policy_lattice import LatticePolicy
+
+        if len(self.experts) > 1:
+            raise ValueError(
+                f"Lattice policy поддерживает только одного эксперта, "
+                f"сейчас: {list(self.experts.keys())}. "
+                "Используйте policy=transformer для multi-expert."
+            )
+
+        ctx = next(iter(self.experts.values()))
+        # Kinesis: только текущий state, без истории (history_len=1)
+        state_dim = ctx.parser.n_obs_elements
+        action_dim = ctx.wrapper.action_dim
+
+        lattice_cfg = OmegaConf.to_container(
+            self.cfg.learning.lattice, resolve=True
+        )
+
+        self.policy = LatticePolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            **lattice_cfg
         )
 
     def setup_optimizer(self) -> None:
@@ -826,7 +854,6 @@ class ArnoldTrainer:
                 "ret_std": ret_std,
                 "val_mean": val_mean,
                 "val_std": val_std,
-                "sigma_global": self.policy.log_sigma_global.item(),
                 "act_mean": act_mean,
                 "act_std": act_std,
                 "act_abs_mean": act_abs_mean,
@@ -975,6 +1002,7 @@ class ArnoldTrainer:
     def log_training_config(self) -> None:
         """Логирует конфигурацию обучения при старте."""
         logger.info(self._section_header("Training Configuration"))
+        logger.info(f"  policy: {self.policy}")
         for expert_name, ctx in self.experts.items():
             logger.info(
                 f"  {expert_name}: mode={ctx.training_mode.upper()}  "
@@ -1261,14 +1289,19 @@ class ArnoldTrainer:
                 f"{len(pruned)} pruned (not in target experts)"
             )
 
-            logger.info("Transfer mode: reinitializing value decoder and value head")
-            for module in [self.policy.value_decoder, self.policy.value_head]:
-                for param in module.parameters():
-                    if param.dim() >= 2:
-                        nn.init.xavier_uniform_(param)
-                    elif param.dim() == 1:
-                        nn.init.zeros_(param)
-            nn.init.normal_(self.policy.value_query.data)
+            logger.info("Transfer mode: reinitializing value nets")
+            if self.cfg.learning.policy == "transformer":
+                for module in [self.policy.value_decoder, self.policy.value_head]:
+                    for param in module.parameters():
+                        if param.dim() >= 2:
+                            nn.init.xavier_uniform_(param)
+                        elif param.dim() == 1:
+                            nn.init.zeros_(param)
+                nn.init.normal_(self.policy.value_query.data)
+            else:
+                raise NotImplementedError(
+                    "Transfer mode not implemented for lattice policy"
+                )
 
         prev_mode = checkpoint.get("training_mode", "unknown")
         src_epoch = checkpoint.get("epoch", "?")
