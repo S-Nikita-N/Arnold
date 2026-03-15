@@ -7,12 +7,18 @@ Encoder-Decoder Transformer для управления мышцами.
 - Action Decoder генерирует muscle activations
 - Value Decoder генерирует state value
 
+Action distribution: LowRankMultivariateNormal, Lattice-like.
+- cov_mode "action_out": W = action_out, cov_factor = action_out * σ_latent
+- cov_mode "head": W = action_factor_head(action_out), cov_factor = W * σ_latent
+- log_std [action_dim + latent_dim] как в Lattice MLP
+
 Multi-expert: поддерживает forward с expert_name для корректного
 выбора index-буферов в BodyTokenizer и group signatures.
 """
 
 import torch
 import torch.nn as nn
+from torch.distributions import LowRankMultivariateNormal
 from typing import List, Dict, Optional, Tuple, Union
 
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
@@ -43,23 +49,42 @@ class TransformerPolicy(nn.Module):
         num_val_dec_layers: int = 1,
         dropout: float = 0.0,
         detached_value_encoder: bool = False,
+        max_action_dim: int = 512,
+        action_cov_rank: int = 16,
+        cov_mode: str = "head",
+        min_diag_std: float = 1e-4,
+        log_std_init: float = 0.0,
+        fix_std: bool = False,
     ):
         """
         Args:
             groups: List[BodyGroup] (single-expert) или
                     Dict[expert_name → List[BodyGroup]] (multi-expert)
+            cov_mode: "action_out" — W=action_out, latent_dim=embed_dim
+                      "head" — W=projection(action_out), latent_dim=action_cov_rank
+            log_std: [1, max_action_dim + latent_dim] как в Lattice
         """
         super().__init__()
 
         self.vocab = vocab
         self.embed_dim = embed_dim
         self.detached_value_encoder = detached_value_encoder
+        self.max_action_dim = max_action_dim
+        self.action_cov_rank = action_cov_rank
+        self.cov_mode = cov_mode
+        self.min_diag_std = min_diag_std
+
+        if action_cov_rank == 0:
+            self.latent_dim = 0
+        elif cov_mode == "action_out":
+            self.latent_dim = embed_dim
+        else:
+            self.latent_dim = action_cov_rank
 
         self.obs_normalizer = SignatureNormalizerModule()
 
         self.body_tokenizer = BodyTokenizer(groups, history_len, embed_dim)
 
-        # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -72,7 +97,6 @@ class TransformerPolicy(nn.Module):
         encoder_norm = nn.LayerNorm(embed_dim)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_enc_layers, norm=encoder_norm)
 
-        # Action Decoder
         action_decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -87,7 +111,6 @@ class TransformerPolicy(nn.Module):
             action_decoder_layer, num_act_dec_layers, norm=action_decoder_norm
         )
 
-        # Value Decoder
         value_decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -102,13 +125,19 @@ class TransformerPolicy(nn.Module):
             value_decoder_layer, num_val_dec_layers, norm=value_decoder_norm
         )
 
-        # Output heads
         self.action_mean_head = nn.Linear(embed_dim, 1)
-        self.action_std_head = nn.Linear(embed_dim, 1)
         self.value_head = nn.Linear(embed_dim, 1)
-
-        self.log_sigma_global = nn.Parameter(torch.zeros(1))
         self.value_query = nn.Parameter(torch.randn(1, 1, embed_dim))
+
+        self.log_std = nn.Parameter(
+            torch.ones(1, max_action_dim + self.latent_dim) * log_std_init,
+            requires_grad=not fix_std,
+        )
+
+        if cov_mode == "head" and action_cov_rank > 0:
+            self.action_factor_head = nn.Linear(embed_dim, action_cov_rank)
+        else:
+            self.action_factor_head = None
 
         self.profiler: Optional[SamplingProfiler] = None
 
@@ -116,6 +145,9 @@ class TransformerPolicy(nn.Module):
 
         nn.init.orthogonal_(self.action_mean_head.weight, gain=0.1)
         nn.init.zeros_(self.action_mean_head.bias)
+        if self.action_factor_head is not None:
+            nn.init.orthogonal_(self.action_factor_head.weight, gain=0.05)
+            nn.init.zeros_(self.action_factor_head.bias)
 
     def enable_profiling(self, profiler: SamplingProfiler) -> None:
         self.profiler = profiler
@@ -124,7 +156,6 @@ class TransformerPolicy(nn.Module):
         self.profiler = None
 
     def _init_weights(self):
-        """Xavier инициализация для всех Linear слоев."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -139,37 +170,18 @@ class TransformerPolicy(nn.Module):
         expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Forward pass.
-
-        Args:
-            obs_timeseries: [batch, n_obs_flat, history_len] — flat наблюдения
-            obs_signatures: per-scalar сигнатуры (для нормализатора)
-            action_signatures: сигнатуры для мышц
-            expert_name: ключ эксперта для BodyTokenizer
-            return_std: если False — не считать std head
-            return_value: если False — не считать value decoder
-
-        Returns:
-            actions: [batch, num_actions]
-            log_std: [batch, num_actions] или None
-            value: [batch, 1] или None
-        """
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         p = self.profiler
         batch_size = obs_timeseries.shape[0]
 
-        # 1. Per-scalar нормализация
         if p: p.tick("  normalizer")
         obs_timeseries = self.obs_normalizer(obs_signatures, obs_timeseries)
         if p: p.tock("  normalizer")
 
-        # 2. Body tokenizer: [B, n_obs_flat, history_len] → [B, n_tokens, embed_dim]
         if p: p.tick("  body_tokenizer")
         sensory_emb = self.body_tokenizer(obs_timeseries, expert_name=expert_name)
         if p: p.tock("  body_tokenizer")
 
-        # 3. Role embeddings для body-level групп
         if p: p.tick("  vocab_embed_obs")
         group_sigs = self.body_tokenizer.get_group_signatures(expert_name)
         role_emb = self.vocab.get_embedding_batch(group_sigs)
@@ -177,36 +189,38 @@ class TransformerPolicy(nn.Module):
         sensory_emb = sensory_emb + role_emb
         if p: p.tock("  vocab_embed_obs")
 
-        # 4. Transformer Encoder
         if p: p.tick("  transformer_encoder")
         encoder_out = self.encoder(sensory_emb)
         if p: p.tock("  transformer_encoder")
 
-        # 5. Action queries из vocabulary
         if p: p.tick("  vocab_embed_act")
         action_query = self.vocab.get_embedding_batch(action_signatures)
         action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)
         if p: p.tock("  vocab_embed_act")
 
-        # 6. Action Decoder
         if p: p.tick("  action_decoder")
         action_out = self.action_decoder(action_query, encoder_out)
-        actions = self.action_mean_head(action_out).squeeze(-1)
+        mean = self.action_mean_head(action_out).squeeze(-1)
         if p: p.tock("  action_decoder")
 
-        log_std = None
+        cov_factor = None
+        diag_std = None
         if return_std:
             num_actions = action_out.shape[1]
-            std_logits = self.action_std_head(action_out).squeeze(-1)
-            log_soft = torch.log_softmax(std_logits, dim=-1)
-            log_sigma_global = self.log_sigma_global.view(1, 1)
-            log_norm_factor = torch.log(torch.tensor(
-                num_actions, dtype=log_soft.dtype, device=log_soft.device, requires_grad=False
-            ))
-            log_std = log_sigma_global + log_soft + log_norm_factor
-            log_std = torch.clamp(log_std, min=-4.6, max=2.3)
+            std = torch.nn.functional.softplus(self.log_std) + self.min_diag_std
+            diag_std = std[:, :num_actions].expand(batch_size, -1)
 
-        # 7. Value Decoder
+            if self.latent_dim == 0:
+                cov_factor = torch.zeros(batch_size, num_actions, 1, device=mean.device, dtype=mean.dtype)
+            else:
+                latent_std = std[:, self.max_action_dim: self.max_action_dim + self.latent_dim].squeeze(0)
+
+                if self.cov_mode == "action_out":
+                    cov_factor = action_out * latent_std.unsqueeze(0).unsqueeze(0)
+                else:
+                    W = self.action_factor_head(action_out)
+                    cov_factor = W * latent_std.unsqueeze(0).unsqueeze(0)
+
         value = None
         if return_value:
             if p: p.tick("  value_decoder")
@@ -216,7 +230,7 @@ class TransformerPolicy(nn.Module):
             value = self.value_head(value_out).squeeze(-1)
             if p: p.tock("  value_decoder")
 
-        return actions, log_std, value
+        return mean, cov_factor, diag_std, value
 
     def get_action(
         self,
@@ -228,24 +242,7 @@ class TransformerPolicy(nn.Module):
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Получает действие для среды.
-
-        Args:
-            obs_timeseries: [batch, n_obs, history_len]
-            obs_signatures: per-scalar сигнатуры
-            action_signatures: сигнатуры мышц
-            expert_name: ключ эксперта для BodyTokenizer (None → default)
-            deterministic: если True — без шума
-            return_std: если False — не считать std head
-            return_value: если False — не считать value decoder
-
-        Returns:
-            action: [batch, num_muscles]
-            log_prob: [batch, 1] или None при return_std=False
-            value: [batch, 1] или None при return_value=False
-        """
-        mean, log_std, value = self.forward(
+        mean, cov_factor, diag_std, value = self.forward(
             obs_timeseries,
             obs_signatures,
             action_signatures,
@@ -258,21 +255,13 @@ class TransformerPolicy(nn.Module):
             action = mean
             log_prob = None if return_std else torch.zeros(mean.shape[0], 1, device=mean.device)
         else:
-            if log_std is None:
+            if cov_factor is None:
                 raise ValueError("return_std=False допустим только при deterministic=True")
-            action = self.sample_action(mean, log_std)
-            log_prob = self._compute_log_prob(action, mean, log_std)
+            dist = self._build_action_dist(mean, cov_factor, diag_std)
+            action = dist.rsample()
+            log_prob = dist.log_prob(action).unsqueeze(-1)
 
         return action, log_prob, value
-
-    def sample_action(
-        self,
-        mean: torch.Tensor,
-        log_std: torch.Tensor,
-    ) -> torch.Tensor:
-        std = log_std.exp()
-        noise = torch.randn_like(mean)
-        return mean + noise * std
 
     def get_log_prob(
         self,
@@ -282,26 +271,52 @@ class TransformerPolicy(nn.Module):
         actions: torch.Tensor,
         expert_name: Optional[str] = None,
     ) -> torch.Tensor:
-        """Вычисляет log probability для заданных действий."""
-        mean, log_std, _ = self.forward(
+        mean, cov_factor, diag_std, value = self.forward(
             obs_timeseries,
             obs_signatures,
             action_signatures,
-            expert_name=expert_name,
+            expert_name=expert_name or "",
         )
-        return self._compute_log_prob(actions, mean, log_std)
+        return self._compute_log_prob(actions, mean, cov_factor, diag_std)
+
+    def _build_action_dist(
+        self,
+        mean: torch.Tensor,
+        cov_factor: torch.Tensor,
+        diag_std: torch.Tensor,
+    ) -> LowRankMultivariateNormal:
+        """diag_std уже готовый: σ = softplus(log_std) + min."""
+        device = mean.device
+        device_type = "cuda" if device.type == "cuda" else "cpu"
+        autocast = torch.autocast(device_type=device_type, enabled=False)
+
+        with autocast:
+            mean_f = mean.float()
+            cov_factor_f = cov_factor.float()
+            diag_std_f = diag_std.float()
+            cov_diag = diag_std_f.pow(2) + 1e-6
+
+            return LowRankMultivariateNormal(
+                loc=mean_f,
+                cov_factor=cov_factor_f,
+                cov_diag=cov_diag,
+            )
+
+    def _compute_entropy(
+        self,
+        mean: torch.Tensor,
+        cov_factor: torch.Tensor,
+        diag_std: torch.Tensor,
+    ) -> torch.Tensor:
+        dist = self._build_action_dist(mean, cov_factor, diag_std)
+        return dist.entropy().mean()
 
     def _compute_log_prob(
         self,
         actions: torch.Tensor,
         mean: torch.Tensor,
-        log_std: torch.Tensor,
+        cov_factor: torch.Tensor,
+        diag_std: torch.Tensor,
     ) -> torch.Tensor:
-        """log N(a | μ, σ) = -0.5 * (log(2π) + 2·log(σ) + ((a-μ)/σ)²)"""
-        var = (log_std * 2).exp()
-        log_prob = -0.5 * (
-            torch.log(torch.tensor(2 * 3.14159265359, device=actions.device, dtype=actions.dtype)) +
-            2 * log_std +
-            (actions - mean).pow(2) / var
-        )
-        return log_prob.sum(dim=-1, keepdim=True)
+        dist = self._build_action_dist(mean, cov_factor, diag_std)
+        return dist.log_prob(actions.float()).unsqueeze(-1)

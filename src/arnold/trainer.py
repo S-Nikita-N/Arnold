@@ -343,11 +343,13 @@ class ArnoldTrainer:
         )
         self.vocab = SensorimotorVocabulary(embed_dim=transformer_cfg["embed_dim"])
         groups = {name: ctx.groups for name, ctx in self.experts.items()}
+        max_action_dim = max(ctx.wrapper.action_dim for ctx in self.experts.values())
 
         self.policy = TransformerPolicy(
             vocab=self.vocab,
             groups=groups,
             history_len=self.history_len,
+            max_action_dim=max_action_dim,
             **transformer_cfg,
         )
 
@@ -667,7 +669,7 @@ class ArnoldTrainer:
             for n in self.experts
         }
         per_expert_diag: Dict[str, Dict[str, list]] = {
-            n: {"ratios": [], "clip_fracs": [], "approx_kls": [], "grad_norms": []}
+            n: {"ratios": [], "clip_fracs": [], "value_clip_fracs": [], "approx_kls": [], "grad_norms": []}
             for n in self.experts
         }
 
@@ -714,7 +716,7 @@ class ArnoldTrainer:
                 )
 
                 with autocast_ctx:
-                    pred_actions, log_std, values = self.policy(
+                    pred_mean, cov_factor, diag_std, values = self.policy(
                         mini_states,
                         ed["obs_signatures"],
                         ed["action_signatures"],
@@ -722,7 +724,7 @@ class ArnoldTrainer:
                     )
 
                     new_log_probs = self.policy._compute_log_prob(
-                        mini_actions, pred_actions, log_std,
+                        mini_actions, pred_mean, cov_factor, diag_std,
                     )
 
                     loss = torch.tensor(0.0, device=self.device)
@@ -749,7 +751,7 @@ class ArnoldTrainer:
                     # --- Imitation ---
                     if ctx.use_expert and ctx.imitation_weight > 0:
                         mini_expert = ed["expert_actions"][batch_indices]
-                        imitation_loss = nn.functional.mse_loss(pred_actions, mini_expert)
+                        imitation_loss = nn.functional.mse_loss(pred_mean, mini_expert)
                         loss = loss + ctx.imitation_weight * imitation_loss
                         per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
 
@@ -765,10 +767,15 @@ class ArnoldTrainer:
                         value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
                         loss = loss + ctx.value_weight * value_loss
                         per_expert_losses[expert_name]["value"].append(value_loss.item())
+                        with torch.no_grad():
+                            value_clip_frac = (
+                                (values - mini_old_values).abs() > self.clip_epsilon
+                            ).float().mean().item()
+                            per_expert_diag[expert_name]["value_clip_fracs"].append(value_clip_frac)
 
                     # --- Entropy ---
                     if ctx.entropy_weight > 0:
-                        entropy = 0.5 * (1 + 1.8378770664093453) + log_std.mean()
+                        entropy = self.policy._compute_entropy(pred_mean, cov_factor, diag_std)
                         entropy_loss = -entropy
                         loss = loss + ctx.entropy_weight * entropy_loss
                         per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
@@ -809,20 +816,20 @@ class ArnoldTrainer:
             with torch.no_grad():
                 bs = ed["batch_size"]
                 diag_idx = np.arange(min(512, bs))
-                diag_actions, diag_log_std, diag_values = self.policy(
+                diag_actions, diag_cov_factor, diag_std, diag_values = self.policy(
                     ed["states"][diag_idx],
                     ed["obs_signatures"],
                     ed["action_signatures"],
                     expert_name=expert_name,
                 )
+                logstd_mean = diag_std.log().mean().item()
+                logstd_min = diag_std.log().min().item()
+                logstd_max = diag_std.log().max().item()
                 act_mean = diag_actions.mean().item()
                 act_std = diag_actions.std().item()
                 act_abs_mean = diag_actions.abs().mean().item()
                 act_min = diag_actions.min().item()
                 act_max = diag_actions.max().item()
-                logstd_mean = diag_log_std.mean().item() if diag_log_std is not None else 0.0
-                logstd_min = diag_log_std.min().item() if diag_log_std is not None else 0.0
-                logstd_max = diag_log_std.max().item() if diag_log_std is not None else 0.0
                 val_post_mean = diag_values.mean().item() if diag_values is not None else 0.0
                 val_post_std = diag_values.std().item() if diag_values is not None else 0.0
 
@@ -845,6 +852,7 @@ class ArnoldTrainer:
                 "entropy_loss": float(np.mean(losses["entropy"])) if losses["entropy"] else 0.0,
                 "approx_kl": float(np.mean(diag["approx_kls"])) if diag["approx_kls"] else 0.0,
                 "clip_frac": float(np.mean(diag["clip_fracs"])) if diag["clip_fracs"] else 0.0,
+                "value_clip_frac": float(np.mean(diag["value_clip_fracs"])) if diag["value_clip_fracs"] else 0.0,
                 "ratio_mean": float(np.mean(diag["ratios"])) if diag["ratios"] else 1.0,
                 "grad_norm": float(np.mean(diag["grad_norms"])) if diag["grad_norms"] else 0.0,
                 "explained_var": explained_var,
@@ -1002,7 +1010,7 @@ class ArnoldTrainer:
     def log_training_config(self) -> None:
         """Логирует конфигурацию обучения при старте."""
         logger.info(self._section_header("Training Configuration"))
-        logger.info(f"  policy: {self.policy}")
+        logger.info(f"  policy: {self.cfg.learning.policy}")
         for expert_name, ctx in self.experts.items():
             logger.info(
                 f"  {expert_name}: mode={ctx.training_mode.upper()}  "
@@ -1035,6 +1043,7 @@ class ArnoldTrainer:
                     f"  [{expert_name}] PPO diag: "
                     f"approx_kl={d.get('approx_kl', 0):.4f}  "
                     f"clip_frac={d.get('clip_frac', 0):.3f}  "
+                    f"val_clip_frac={d.get('value_clip_frac', 0):.3f}  "
                     f"ratio={d.get('ratio_mean', 1):.4f}  "
                     f"grad_norm={d.get('grad_norm', 0):.3f}  "
                     f"σ_global={d.get('sigma_global', 0):.4f}  "

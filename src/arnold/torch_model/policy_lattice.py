@@ -1,17 +1,17 @@
 """
-Lattice Policy — MLP с полной ковариационной матрицей (латентные факторы).
+Lattice Policy — MLP с low-rank ковариацией (латентные факторы).
 
 Адаптировано из Kinesis policy_lattice.py.
-Ковариация: Σ = W·diag(σ²_latent)·W^T + diag(σ²_action).
-Позволяет моделировать корреляции между действиями через латентное пространство.
+Ковариация: Σ = W·diag(σ²_latent)·W^T + diag(σ²_action) = F·F^T + diag(σ²_action).
+Использует LowRankMultivariateNormal (как Transformer) — единый интерфейс.
 
 Только single-expert (multi-expert не поддерживается).
-Интерфейс совместим с Arnold Trainer (forward, get_action, _compute_log_prob).
+Интерфейс: forward → (mean, cov_factor, diag_std, value).
 """
 
 import torch
 import torch.nn as nn
-from torch.distributions import MultivariateNormal
+from torch.distributions import LowRankMultivariateNormal
 from typing import List, Tuple, Optional
 
 from arnold.torch_model.mlp import MLP
@@ -25,8 +25,7 @@ class LatticePolicy(nn.Module):
     Как в Kinesis: использует только текущий state (последний timestep),
     без истории. obs_timeseries [batch, n_obs, history_len] → берём [:, :, -1].
 
-    Вход: obs_timeseries [batch, n_obs, history_len]
-    Выход: action_mean, log_std (диагональ для entropy), value.
+    Интерфейс совместим с TransformerPolicy: (mean, cov_factor, diag_std, value).
     """
 
     def __init__(
@@ -37,12 +36,13 @@ class LatticePolicy(nn.Module):
         mlp_activation: str = "silu",
         fix_std: bool = False,
         log_std_init: float = 0.0,
+        min_diag_std: float = 1e-4,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
-        # latent_dim = размер последнего слоя MLP (для ковариации W @ diag(σ²) @ W^T)
         self.latent_dim = mlp_units[-1]
+        self.min_diag_std = min_diag_std
 
         self.obs_normalizer = SignatureNormalizerModule()
 
@@ -57,13 +57,11 @@ class LatticePolicy(nn.Module):
             requires_grad=not fix_std,
         )
 
-        # Value head: отдельный MLP на том же входе (как в Kinesis)
         self.value_net = MLP(state_dim, mlp_units, mlp_activation)
         self.value_head = nn.Linear(self.value_net.out_dim, 1)
         self.value_head.weight.data.mul_(0.1)
         self.value_head.bias.data.zero_()
 
-        self._last_dist: Optional[MultivariateNormal] = None
         self.profiler = None
 
     def enable_profiling(self, profiler) -> None:
@@ -80,59 +78,36 @@ class LatticePolicy(nn.Module):
         expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Forward pass.
-
-        Args:
-            obs_timeseries: [batch, n_obs, history_len]
-            obs_signatures, action_signatures: для нормализатора (action не используется)
-            expert_name: для совместимости с интерфейсом
-
         Returns:
-            action_mean: [batch, action_dim]
-            log_std: [batch, action_dim] — диагональ ковариации для entropy
+            mean: [batch, action_dim]
+            cov_factor: [batch, action_dim, latent_dim]
+            diag_std: [batch, action_dim] — σ = softplus(log_std) + min, уже готовый
             value: [batch, 1] или None
         """
-        # 1. Нормализация
         obs_norm = self.obs_normalizer(obs_signatures, obs_timeseries)
-        # Kinesis: только последний timestep (текущий state), без истории
-        x = obs_norm[:, :, -1]  # [batch, n_obs] = [batch, state_dim]
+        x = obs_norm[:, :, -1]
 
-        # 2. Policy backbone (h: [batch, latent_dim])
         action_mean = self.action_mean(self.net(x))
 
-        # 3. Lattice covariance: Σ = W @ diag(σ²_latent) @ W^T + diag(σ²_action)
-        std = torch.exp(self.log_std)
-        action_var = std[:, :self.action_dim].pow(2)  # [1, action_dim]
-        latent_var = std[:, self.action_dim:].pow(2)  # [1, latent_dim]
+        cov_factor = None
+        diag_std = None
+        if return_std:
+            std = torch.nn.functional.softplus(self.log_std) + self.min_diag_std
+            diag_std = std[:, : self.action_dim].expand(x.shape[0], -1)
+            latent_std = std[:, self.action_dim:].squeeze(0)
 
-        W = self.action_mean.weight  # [action_dim, latent_dim]
-        # (W * latent_var) @ W^T -> [action_dim, action_dim], then expand to batch
-        sigma_mat = (W * latent_var).matmul(W.T)
-        sigma_mat = sigma_mat.unsqueeze(0).expand(x.shape[0], -1, -1).clone()
-        sigma_mat[:, torch.arange(self.action_dim), torch.arange(self.action_dim)] += (
-            action_var.squeeze(0)
-        )
-        sigma_mat = sigma_mat + 1e-6 * torch.eye(
-            self.action_dim, device=sigma_mat.device, dtype=sigma_mat.dtype
-        )
-
-        # log_std для entropy (диагональ ковариации), [batch, action_dim]
-        sigma_diag = action_var.squeeze(0) + (W * latent_var).matmul(W.T).diag()
-        log_std_diag = (0.5 * torch.log(sigma_diag + 1e-8)).unsqueeze(0).expand(
-            x.shape[0], -1
-        )
-
-        dist = MultivariateNormal(action_mean, covariance_matrix=sigma_mat)
-        self._last_dist = dist
+            W = self.action_mean.weight
+            cov_factor = (W * latent_std.unsqueeze(0)).unsqueeze(0).expand(
+                x.shape[0], -1, -1
+            )
 
         value = None
         if return_value:
             value = self.value_head(self.value_net(x))
 
-        log_std_out = log_std_diag if return_std else None
-        return action_mean, log_std_out, value
+        return action_mean, cov_factor, diag_std, value
 
     def get_action(
         self,
@@ -144,7 +119,7 @@ class LatticePolicy(nn.Module):
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        mean, log_std, value = self.forward(
+        mean, cov_factor, diag_std, value = self.forward(
             obs_timeseries,
             obs_signatures,
             action_signatures,
@@ -155,29 +130,56 @@ class LatticePolicy(nn.Module):
 
         if deterministic:
             action = mean
-            log_prob = torch.zeros(mean.shape[0], 1, device=mean.device)
+            log_prob = None if return_std else torch.zeros(mean.shape[0], 1, device=mean.device)
+            
         else:
-            action = self._last_dist.rsample()
-            log_prob = self._last_dist.log_prob(action).unsqueeze(-1)
+            if cov_factor is None:
+                raise ValueError("return_std=False допустим только при deterministic=True")
+
+            dist = self._build_action_dist(mean, cov_factor, diag_std)
+            action = dist.rsample()
+            log_prob = dist.log_prob(action).unsqueeze(-1)
 
         return action, log_prob, value
+
+    def _build_action_dist(
+        self,
+        mean: torch.Tensor,
+        cov_factor: torch.Tensor,
+        diag_std: torch.Tensor,
+    ) -> LowRankMultivariateNormal:
+        """diag_std уже готовый: σ = softplus(log_std) + min."""
+        device = mean.device
+        device_type = "cuda" if device.type == "cuda" else "cpu"
+        autocast = torch.autocast(device_type=device_type, enabled=False)
+
+        with autocast:
+            mean_f = mean.float()
+            cov_factor_f = cov_factor.float()
+            diag_std_f = diag_std.float()
+            cov_diag = diag_std_f.pow(2) + 1e-6
+
+            return LowRankMultivariateNormal(
+                loc=mean_f,
+                cov_factor=cov_factor_f,
+                cov_diag=cov_diag,
+            )
+
+    def _compute_entropy(
+        self,
+        mean: torch.Tensor,
+        cov_factor: torch.Tensor,
+        diag_std: torch.Tensor,
+    ) -> torch.Tensor:
+        dist = self._build_action_dist(mean, cov_factor, diag_std)
+        return dist.entropy().mean()
 
     def _compute_log_prob(
         self,
         actions: torch.Tensor,
         mean: torch.Tensor,
-        log_std: torch.Tensor,
+        cov_factor: torch.Tensor,
+        diag_std: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Log probability действий. Для Lattice используем _last_dist.
-        """
-        if self._last_dist is not None:
-            return self._last_dist.log_prob(actions).unsqueeze(-1)
-        # Fallback: diagonal Gaussian (если _last_dist не установлен)
-        var = (log_std * 2).exp()
-        log_prob = -0.5 * (
-            torch.log(torch.tensor(2 * 3.14159265359, device=actions.device, dtype=actions.dtype))
-            + 2 * log_std
-            + (actions - mean).pow(2) / var
-        )
-        return log_prob.sum(dim=-1, keepdim=True)
+        dist = self._build_action_dist(mean, cov_factor, diag_std)
+        return dist.log_prob(actions.float()).unsqueeze(-1)
