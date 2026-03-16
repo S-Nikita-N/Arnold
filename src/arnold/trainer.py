@@ -161,7 +161,16 @@ class ArnoldTrainer:
     ):
         self.cfg = cfg
         self.dtype = dtype
-        self.device = torch.device(device if device else cfg.device)
+
+        # DataParallel: device_ids=[0, 1] → обучение на 2 GPU
+        device_ids = cfg.get("device_ids", None)
+        base_device = str(device if device else cfg.device)
+        if device_ids is not None and len(device_ids) >= 2 and "cuda" in base_device:
+            self.device_ids = list(device_ids)
+            self.device = torch.device(f"cuda:{self.device_ids[0]}")
+        else:
+            self.device_ids = None
+            self.device = torch.device(device if device else cfg.device)
 
         # Global (parser, sampling)
         self.history_len = cfg.learning.history_len
@@ -181,6 +190,9 @@ class ArnoldTrainer:
         self.use_compile = cfg.learning.use_compile
         self.use_bfloat16 = cfg.learning.use_bfloat16
         self.policy = None  # устанавливается в setup_policy()
+
+        # Run (для доступа к submodules при DataParallel)
+        self.policy_module = None  # устанавливается в setup_policy()
 
         # Run
         self.save_frequency = cfg.run.save_frequency
@@ -330,6 +342,13 @@ class ArnoldTrainer:
         if self.use_compile:
             self.policy = torch.compile(self.policy, mode="reduce-overhead")
             logger.info("torch.compile applied (mode=reduce-overhead)")
+
+        if self.device_ids is not None:
+            self.policy = nn.DataParallel(self.policy, device_ids=self.device_ids)
+            self.policy_module = self.policy.module
+            logger.info(f"DataParallel enabled on GPUs {self.device_ids}")
+        else:
+            self.policy_module = self.policy
 
         logger.info(
             f"Arnold policy created ({self.policy}). "
@@ -879,7 +898,7 @@ class ArnoldTrainer:
         # to avoid drift between new_log_probs and fixed_log_probs.
         with torch.no_grad():
             for expert_name, ed in expert_data.items():
-                self.policy.obs_normalizer.update(
+                self.policy_module.obs_normalizer.update(
                     ed["obs_signatures"],
                     ed["states"],
                 )
@@ -1203,7 +1222,7 @@ class ArnoldTrainer:
         checkpoint = {
             "epoch": self.epoch,
             "num_steps": self.num_steps,
-            "policy": self.policy.state_dict(),
+            "policy": self.policy_module.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "expert_names": list(self.experts.keys()),
             "expert_modes": expert_modes,
@@ -1238,13 +1257,18 @@ class ArnoldTrainer:
     def load_from_path(self, path: str, resume_training: bool = True) -> None:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
+        # DataParallel: убираем префикс "module." в checkpoint если есть
+        policy_state = checkpoint["policy"]
+        if policy_state and next(iter(policy_state.keys()), "").startswith("module."):
+            policy_state = {k.replace("module.", "", 1): v for k, v in policy_state.items()}
+
         try:
-            self.policy.load_state_dict(checkpoint["policy"])
+            self.policy_module.load_state_dict(policy_state)
         except RuntimeError as e:
             logger.warning(f"Strict load failed. Exception: {e}")
             logger.info("Filtering checkpoint for size mismatches (cross-environment transfer)...")
 
-            model_state = self.policy.state_dict()
+            model_state = self.policy_module.state_dict()
             ckpt_state = checkpoint["policy"]
             filtered_state = {}
 
@@ -1262,7 +1286,7 @@ class ArnoldTrainer:
                     continue
                 filtered_state[k] = v
 
-            self.policy.load_state_dict(filtered_state, strict=False)
+            self.policy_module.load_state_dict(filtered_state, strict=False)
 
         if resume_training:
             self.epoch = checkpoint["epoch"] + 1
@@ -1278,19 +1302,19 @@ class ArnoldTrainer:
             # Normalizer stats keyed by semantic signature (e.g. "femur|r|position|x"),
             # so stats from source expert transfer naturally to target expert
             # for shared body parts. Only prune stats not needed by any new expert.
-            ckpt_keys = set(self.policy.obs_normalizer.stats.keys())
+            ckpt_keys = set(self.policy_module.obs_normalizer.stats.keys())
             needed_keys = set()
             for ctx in self.experts.values():
                 for sig in ctx.parser.obs_signatures:
-                    needed_keys.add(self.policy.obs_normalizer._sig_key(sig))
+                    needed_keys.add(self.policy_module.obs_normalizer._sig_key(sig))
 
             reused = ckpt_keys & needed_keys
             pruned = ckpt_keys - needed_keys
             fresh = needed_keys - ckpt_keys
 
             for key in pruned:
-                del self.policy.obs_normalizer.stats[key]
-            self.policy.obs_normalizer._invalidate_cache()
+                del self.policy_module.obs_normalizer.stats[key]
+            self.policy_module.obs_normalizer._invalidate_cache()
 
             logger.info(
                 f"Transfer mode: normalizer stats — "
@@ -1300,13 +1324,13 @@ class ArnoldTrainer:
 
             logger.info("Transfer mode: reinitializing value nets")
             if self.cfg.learning.policy == "transformer":
-                for module in [self.policy.value_decoder, self.policy.value_head]:
+                for module in [self.policy_module.value_decoder, self.policy_module.value_head]:
                     for param in module.parameters():
                         if param.dim() >= 2:
                             nn.init.xavier_uniform_(param)
                         elif param.dim() == 1:
                             nn.init.zeros_(param)
-                nn.init.normal_(self.policy.value_query.data)
+                nn.init.normal_(self.policy_module.value_query.data)
             else:
                 raise NotImplementedError(
                     "Transfer mode not implemented for lattice policy"

@@ -10,6 +10,7 @@ notes: "Arnold Training"
 
 # ==================== Hardware ====================
 device: cuda
+device_ids: null # null | [0, 1]
 seed: 42
 
 # ==================== Logging ====================

@@ -23,6 +23,12 @@ Per-expert режим определяется по loss-весам каждог
         run.num_threads=15 \
         exp_name=ppo_myohuman
 
+    # DataParallel — обучение на 2 GPU
+    poetry run python -m arnold.train_arnold \
+        device_ids=[0,1] \
+        '+run/experts@run.experts.kin=kinesis' \
+        exp_name=obc_2gpu
+
     # Multi-expert — MyoHuman (PPO) + Kinesis (OBC)
     poetry run python -m arnold.train_arnold \
         device=cuda \
