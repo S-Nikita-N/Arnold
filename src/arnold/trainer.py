@@ -453,7 +453,7 @@ class ArnoldTrainer:
 
         profiler = SamplingProfiler() if enable_profiler else None
         if profiler is not None:
-            self.policy.enable_profiling(profiler)
+            self.policy_module.enable_profiling(profiler)
 
         if not ctx.use_expert:
             zero_expert = torch.zeros(wrapper.action_dim, dtype=torch.float32)
@@ -471,7 +471,7 @@ class ArnoldTrainer:
 
                     if profiler: profiler.tick("policy.forward")
                     with torch.no_grad():
-                        student_action, log_prob, value = self.policy.get_action(
+                        student_action, log_prob, value = self.policy_module.get_action(
                             obs_ts, obs_sigs, act_sigs,
                             expert_name=expert_name,
                             deterministic=False,
@@ -530,7 +530,7 @@ class ArnoldTrainer:
 
         finally:
             if profiler is not None:
-                self.policy.disable_profiling()
+                self.policy_module.disable_profiling()
 
             profiler_data = profiler.to_dict() if profiler is not None else None
             queue.put([pid, expert_name, memory.to_transfer_dict(), obc_logger, profiler_data])
@@ -1150,7 +1150,7 @@ class ArnoldTrainer:
                 act_sigs = valid_parser.action_signatures
 
                 with torch.no_grad():
-                    action, _, value = self.policy.get_action(
+                    action, _, value = self.policy_module.get_action(
                         obs_ts, obs_sigs, act_sigs,
                         expert_name=expert_name,
                         deterministic=True,
