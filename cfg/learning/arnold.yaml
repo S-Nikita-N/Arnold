@@ -18,7 +18,7 @@ transformer:
   dropout: 0.0
   detached_value_encoder: false
   action_cov_rank: 16  # 0 = independent (diagonal), >0 = low-rank (Lattice-like)
-  cov_mode: head  # action_out | head — W=action_out или projection в K
+  cov_mode: head  # action_out | head
   min_diag_std: 0.0001
   log_std_init: 0
 

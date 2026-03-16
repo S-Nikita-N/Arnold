@@ -722,7 +722,7 @@ class ArnoldTrainer:
                         ed["action_signatures"],
                         expert_name=expert_name,
                     )
-
+                    
                     new_log_probs = self.policy._compute_log_prob(
                         mini_actions, pred_mean, cov_factor, diag_std,
                     )

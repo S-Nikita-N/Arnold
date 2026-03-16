@@ -217,6 +217,7 @@ class TransformerPolicy(nn.Module):
 
                 if self.cov_mode == "action_out":
                     cov_factor = action_out * latent_std.unsqueeze(0).unsqueeze(0)
+                    cov_factor = cov_factor / (self.latent_dim ** 0.5)
                 else:
                     W = self.action_factor_head(action_out)
                     cov_factor = W * latent_std.unsqueeze(0).unsqueeze(0)
