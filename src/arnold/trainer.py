@@ -742,7 +742,7 @@ class ArnoldTrainer:
                         expert_name=expert_name,
                     )
                     
-                    new_log_probs = self.policy._compute_log_prob(
+                    new_log_probs = self.policy_module._compute_log_prob(
                         mini_actions, pred_mean, cov_factor, diag_std,
                     )
 
@@ -794,7 +794,7 @@ class ArnoldTrainer:
 
                     # --- Entropy ---
                     if ctx.entropy_weight > 0:
-                        entropy = self.policy._compute_entropy(pred_mean, cov_factor, diag_std)
+                        entropy = self.policy_module._compute_entropy(pred_mean, cov_factor, diag_std)
                         entropy_loss = -entropy
                         loss = loss + ctx.entropy_weight * entropy_loss
                         per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
