@@ -210,11 +210,14 @@ class ActionTokenizer(nn.Module):
             muscle_means = self.expand_heads[key](g_emb)
             mean_parts.append(muscle_means)
 
-            # Hidden: modulate group embedding by per-muscle role directions
-            # W_norm[i] — единичный вектор роли мышцы i в группе
-            # Антагонисты получат противоположные hidden → отрицательная корреляция
+            # Hidden: per-muscle hidden states для covariance.
+            # g_emb после LayerNorm: ||g_emb|| ≈ √D.
+            # W_norm — единичные направления ролей мышц в группе.
+            # g_emb ⊙ W_norm даёт ||hidden|| ≈ 1, а в оригинальном пути
+            # ||action_out|| ≈ √D. Масштабируем на √D для совместимости с cov_factor.
             W_norm = F.normalize(self.expand_heads[key].weight, dim=-1)  # [n_muscles, D]
-            hidden_parts.append(g_emb.unsqueeze(1) * W_norm.unsqueeze(0))  # [B, n_muscles, D]
+            muscle_h = g_emb.unsqueeze(1) * W_norm.unsqueeze(0)  # [B, n_muscles, D]
+            hidden_parts.append(muscle_h * (D ** 0.5))
 
         # Concatenate в grouped order
         mean_grouped = torch.cat(mean_parts, dim=1)     # [B, A_total]

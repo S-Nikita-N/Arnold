@@ -178,6 +178,10 @@ class TransformerPolicy(nn.Module):
         if self.action_factor_head is not None:
             nn.init.orthogonal_(self.action_factor_head.weight, gain=0.05)
             nn.init.zeros_(self.action_factor_head.bias)
+        if self.action_tokenizer is not None:
+            for head in self.action_tokenizer.expand_heads.values():
+                nn.init.orthogonal_(head.weight, gain=0.1)
+                nn.init.zeros_(head.bias)
 
     def enable_profiling(self, profiler: SamplingProfiler) -> None:
         self.profiler = profiler
