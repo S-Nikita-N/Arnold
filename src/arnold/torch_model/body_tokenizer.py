@@ -94,12 +94,14 @@ class BodyTokenizer(nn.Module):
             input_dim = n_features * history_len
             self.projectors[gtype] = nn.Linear(input_dim, embed_dim)
 
-    def forward(
+    def encode(
         self,
         obs_timeseries: torch.Tensor,
         expert_name: Optional[str] = None,
     ) -> torch.Tensor:
         """
+        Кодирует raw observations в body-level tokens.
+
         Args:
             obs_timeseries: [B, n_obs_flat, history_len]
             expert_name: ключ эксперта (None → default / единственный)

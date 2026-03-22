@@ -4,8 +4,13 @@ Arnold Transformer Policy.
 Encoder-Decoder Transformer для управления мышцами.
 - Body Tokenizer группирует наблюдения по телам (~70 токенов вместо ~953)
 - Shared Encoder обрабатывает body-level embeddings
-- Action Decoder генерирует muscle activations
+- Action Decoder генерирует muscle activations (с опциональной грануляцией)
 - Value Decoder генерирует state value
+
+Action granulation (action_granulation != "none"):
+- Вместо A muscle queries используются G group queries (G << A)
+- ActionTokenizer раскрывает group embeddings в per-muscle activations
+- Сложность decoder: O(G²) вместо O(A²)
 
 Action distribution: LowRankMultivariateNormal, Lattice-like.
 - cov_mode "action_out": W = action_out, cov_factor = action_out * σ_latent
@@ -13,19 +18,24 @@ Action distribution: LowRankMultivariateNormal, Lattice-like.
 - log_std [action_dim + latent_dim] как в Lattice MLP
 
 Multi-expert: поддерживает forward с expert_name для корректного
-выбора index-буферов в BodyTokenizer и group signatures.
+выбора index-буферов в BodyTokenizer, ActionTokenizer и group signatures.
 """
 
 import torch
 import torch.nn as nn
 from torch.distributions import LowRankMultivariateNormal
 from typing import List, Dict, Optional, Tuple, Union
+import logging
 
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.torch_model.normalization import SignatureNormalizerModule
 from arnold.torch_model.body_tokenizer import BodyTokenizer
+from arnold.torch_model.action_tokenizer import ActionTokenizer
+from arnold.action_parser import MuscleGrouping
 from arnold.observation_parser import BodyGroup
 from arnold.profiler import SamplingProfiler
+
+logger = logging.getLogger(__name__)
 
 
 class TransformerPolicy(nn.Module):
@@ -55,6 +65,9 @@ class TransformerPolicy(nn.Module):
         min_diag_std: float = 1e-4,
         log_std_init: float = 0.0,
         fix_std: bool = False,
+        action_granulation: str = "none",
+        action_groupings: Optional[Dict[str, MuscleGrouping]] = None,
+        action_signatures_by_expert: Optional[Dict[str, List[Tuple[str, ...]]]] = None,
     ):
         """
         Args:
@@ -63,6 +76,9 @@ class TransformerPolicy(nn.Module):
             cov_mode: "action_out" — W=action_out, latent_dim=embed_dim
                       "head" — W=projection(action_out), latent_dim=action_cov_rank
             log_std: [1, max_action_dim + latent_dim] как в Lattice
+            action_granulation: "none" | "anatomical" | "functional"
+            action_groupings: expert_name → MuscleGrouping (если granulation != "none")
+            action_signatures_by_expert: expert_name → action signatures (если granulation != "none")
         """
         super().__init__()
 
@@ -84,6 +100,20 @@ class TransformerPolicy(nn.Module):
         self.obs_normalizer = SignatureNormalizerModule()
 
         self.body_tokenizer = BodyTokenizer(groups, history_len, embed_dim)
+
+        # Action Tokenizer (грануляция action-side)
+        if action_granulation != "none" and action_groupings is not None:
+            self.action_tokenizer = ActionTokenizer(
+                groupings=action_groupings,
+                action_signatures=action_signatures_by_expert,
+                embed_dim=embed_dim,
+            )
+            logger.info(
+                f"Action granulation enabled: strategy={action_granulation}, "
+                f"decoder queries reduced to group-level"
+            )
+        else:
+            self.action_tokenizer = None
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
@@ -179,7 +209,7 @@ class TransformerPolicy(nn.Module):
         if p: p.tock("  normalizer")
 
         if p: p.tick("  body_tokenizer")
-        sensory_emb = self.body_tokenizer(obs_timeseries, expert_name=expert_name)
+        sensory_emb = self.body_tokenizer.encode(obs_timeseries, expert_name=expert_name)
         if p: p.tock("  body_tokenizer")
 
         if p: p.tick("  vocab_embed_obs")
@@ -193,15 +223,32 @@ class TransformerPolicy(nn.Module):
         encoder_out = self.encoder(sensory_emb)
         if p: p.tock("  transformer_encoder")
 
-        if p: p.tick("  vocab_embed_act")
-        action_query = self.vocab.get_embedding_batch(action_signatures)
-        action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)
-        if p: p.tock("  vocab_embed_act")
+        if self.action_tokenizer is not None:
+            # Granulated path: G group queries instead of A muscle queries
+            if p: p.tick("  vocab_embed_act_groups")
+            act_group_sigs = self.action_tokenizer.get_group_signatures(expert_name)
+            group_query = self.vocab.get_embedding_batch(act_group_sigs)
+            group_query = group_query.unsqueeze(0).expand(batch_size, -1, -1)
+            if p: p.tock("  vocab_embed_act_groups")
 
-        if p: p.tick("  action_decoder")
-        action_out = self.action_decoder(action_query, encoder_out)
-        mean = self.action_mean_head(action_out).squeeze(-1)
-        if p: p.tock("  action_decoder")
+            if p: p.tick("  action_decoder")
+            group_out = self.action_decoder(group_query, encoder_out)
+            if p: p.tock("  action_decoder")
+
+            if p: p.tick("  action_tokenizer")
+            mean, action_out = self.action_tokenizer.decode(group_out, expert_name)
+            if p: p.tock("  action_tokenizer")
+        else:
+            # Original path: per-muscle queries
+            if p: p.tick("  vocab_embed_act")
+            action_query = self.vocab.get_embedding_batch(action_signatures)
+            action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)
+            if p: p.tock("  vocab_embed_act")
+
+            if p: p.tick("  action_decoder")
+            action_out = self.action_decoder(action_query, encoder_out)
+            mean = self.action_mean_head(action_out).squeeze(-1)
+            if p: p.tock("  action_decoder")
 
         cov_factor = None
         diag_std = None

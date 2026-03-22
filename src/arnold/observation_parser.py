@@ -71,7 +71,6 @@ class ObservationParser:
         
         self.obs_specs = self._build_observation_specs()
         self.n_obs_elements = sum(spec.size for spec in self.obs_specs)
-        self.action_signatures = self._build_action_signatures()
         self.obs_signatures = self._build_obs_signatures()
         self.history: Optional[np.ndarray] = None
     
@@ -324,14 +323,6 @@ class ObservationParser:
 
         return specs
 
-    def _build_action_signatures(self) -> List[Tuple[str, ...]]:
-        """Строит signatures для action outputs (muscle activations)."""
-        signatures = []
-        for muscle in self.muscle_names:
-            base, side = self._parse_side(muscle)
-            signatures.append((base, side, "muscle", "activation"))
-        return signatures
-    
     def _build_obs_signatures(self) -> List[Tuple[str, ...]]:
         """Строит flat список signatures."""
         signatures = []

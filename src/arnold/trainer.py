@@ -40,6 +40,7 @@ from tqdm import tqdm
 from arnold.torch_model.transformer_policy import TransformerPolicy
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.observation_parser import ObservationParser, BodyGroup
+from arnold.action_parser import ActionParser
 from arnold.memory import OBCMemory, OBCBatch
 from arnold.logger import OBCLogger
 from arnold.wandb_logger import WandbLogger
@@ -65,6 +66,7 @@ class ExpertContext:
     name: str
     wrapper: Any                    # KinesisWrapper | MyoHumanWrapper
     parser: ObservationParser
+    action_parser: ActionParser
     groups: List[BodyGroup]
 
     # Per-expert loss weights
@@ -79,6 +81,9 @@ class ExpertContext:
 
     # Per-expert loss scale (multiplier applied to all losses)
     loss_scale: float = 1.0
+
+    # Action granulation (опционально)
+    muscle_grouping: Optional[Any] = None
 
     @property
     def use_expert(self) -> bool:
@@ -270,6 +275,7 @@ class ArnoldTrainer:
             wrapper = create_expert_wrapper(entry, mode="train")
 
             parser = ObservationParser.from_env(wrapper.env, history_len=self.history_len)
+            action_parser = ActionParser.from_env(wrapper.env)
             groups = parser.get_body_groups(self.tokenizer_granularity)
 
             learning_cfg = entry.get("learning", {})
@@ -281,10 +287,24 @@ class ArnoldTrainer:
             mbs = learning_cfg.get("min_batch_size")
             n_threads = entry.get("num_threads", 1)
 
+            # Action granulation
+            muscle_grouping = None
+            action_gran = self._get_action_granulation()
+            if action_gran != "none":
+                muscle_grouping = action_parser.get_muscle_grouping(strategy=action_gran)
+                logger.info(
+                    f"  action granulation [{action_gran}]: "
+                    f"{muscle_grouping.n_muscles} muscles -> {muscle_grouping.n_groups} groups"
+                )
+                for gid in muscle_grouping.group_order:
+                    n_in_group = len(muscle_grouping.groups[gid])
+                    logger.info(f"    {gid}: {n_in_group} muscles")
+
             ctx = ExpertContext(
                 name=name,
                 wrapper=wrapper,
                 parser=parser,
+                action_parser=action_parser,
                 groups=groups,
                 ppo_weight=ppo_w,
                 imitation_weight=im_w,
@@ -293,6 +313,7 @@ class ArnoldTrainer:
                 num_threads=n_threads,
                 min_batch_size=mbs,
                 loss_scale=loss_scale,
+                muscle_grouping=muscle_grouping,
             )
             self.experts[name] = ctx
 
@@ -355,20 +376,50 @@ class ArnoldTrainer:
             f"Parameters: {sum(p.numel() for p in self.policy.parameters()):,}"
         )
 
+    def _get_action_granulation(self) -> str:
+        """Получает стратегию action granulation из конфига."""
+        if self.cfg.learning.policy != "transformer":
+            return "none"
+        transformer_cfg = self.cfg.learning.get("transformer", {})
+        return transformer_cfg.get("action_granulation", "none")
+
     def _setup_transformer_policy(self) -> None:
         """TransformerPolicy с merged группами всех экспертов."""
         transformer_cfg = OmegaConf.to_container(
             self.cfg.learning.transformer, resolve=True
         )
+
+        # Pop action_granulation — не передаётся как **kwarg в TransformerPolicy
+        action_granulation = transformer_cfg.pop("action_granulation", "none")
+
         self.vocab = SensorimotorVocabulary(embed_dim=transformer_cfg["embed_dim"])
         groups = {name: ctx.groups for name, ctx in self.experts.items()}
         max_action_dim = max(ctx.wrapper.action_dim for ctx in self.experts.values())
+
+        # Action granulation: собираем groupings и signatures per expert
+        action_groupings = None
+        action_sigs_by_expert = None
+        if action_granulation != "none":
+            action_groupings = {}
+            action_sigs_by_expert = {}
+            for name, ctx in self.experts.items():
+                if ctx.muscle_grouping is None:
+                    raise ValueError(
+                        f"action_granulation={action_granulation!r} but expert "
+                        f"'{name}' has no muscle_grouping. "
+                        f"Check that setup_experts() ran before setup_policy()."
+                    )
+                action_groupings[name] = ctx.muscle_grouping
+                action_sigs_by_expert[name] = ctx.action_parser.action_signatures
 
         self.policy = TransformerPolicy(
             vocab=self.vocab,
             groups=groups,
             history_len=self.history_len,
             max_action_dim=max_action_dim,
+            action_granulation=action_granulation,
+            action_groupings=action_groupings,
+            action_signatures_by_expert=action_sigs_by_expert,
             **transformer_cfg,
         )
 
@@ -447,6 +498,7 @@ class ArnoldTrainer:
         ctx = self.experts[expert_name]
         wrapper = ctx.wrapper
         worker_parser = ObservationParser.from_env(wrapper.env, self.history_len)
+        worker_action_parser = ActionParser.from_env(wrapper.env)
 
         memory = OBCMemory()
         obc_logger = OBCLogger()
@@ -466,7 +518,7 @@ class ArnoldTrainer:
                 for t in range(10000):
                     if profiler: profiler.tick("parser.get_obs")
                     obs_ts, obs_sigs = worker_parser.get_observation(torch.device("cpu"))
-                    act_sigs = worker_parser.action_signatures
+                    act_sigs = worker_action_parser.action_signatures
                     if profiler: profiler.tock("parser.get_obs")
 
                     if profiler: profiler.tick("policy.forward")
@@ -1125,6 +1177,7 @@ class ArnoldTrainer:
         """Evaluation для одного эксперта."""
         self.policy.eval()
         valid_parser = ObservationParser.from_env(valid_wrapper.env, self.history_len)
+        valid_action_parser = ActionParser.from_env(valid_wrapper.env)
 
         episode_rewards = []
         episode_lengths = []
@@ -1147,7 +1200,7 @@ class ArnoldTrainer:
 
             for t in range(10000):
                 obs_ts, obs_sigs = valid_parser.get_observation(self.device)
-                act_sigs = valid_parser.action_signatures
+                act_sigs = valid_action_parser.action_signatures
 
                 with torch.no_grad():
                     action, _, value = self.policy_module.get_action(

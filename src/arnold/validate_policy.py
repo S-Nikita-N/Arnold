@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from arnold.trainer import create_expert_wrapper
 from arnold.observation_parser import ObservationParser
+from arnold.action_parser import ActionParser
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.torch_model.transformer_policy import TransformerPolicy
 
@@ -146,6 +147,7 @@ def validate(cfg: DictConfig) -> dict:
 
     # Создаём парсер (нужен для body groups при создании policy)
     parser = ObservationParser.from_env(expert.env, history_len=history_len)
+    action_parser = ActionParser.from_env(expert.env)
     logger.info(f"Parser: {parser.n_obs_elements} observation elements")
 
     # Загружаем политику (архитектура из cfg.learning, groups из parser)
@@ -196,7 +198,7 @@ def validate(cfg: DictConfig) -> dict:
             for t in range(10000):
                 t0 = time.perf_counter()
                 obs_ts, obs_sigs = parser.get_observation(device)
-                act_sigs = parser.action_signatures
+                act_sigs = action_parser.action_signatures
                 profile_times["get_observation"] += time.perf_counter() - t0
                 
                 t0 = time.perf_counter()

@@ -21,6 +21,7 @@ transformer:
   cov_mode: head  # action_out | head
   min_diag_std: 0.0001
   log_std_init: 0
+  action_granulation: none  # none | anatomical | functional
 
 # ==================== PPO ====================
 batch_size: 128
