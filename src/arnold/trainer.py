@@ -822,7 +822,11 @@ class ArnoldTrainer:
                     # --- Imitation ---
                     if ctx.use_expert and ctx.imitation_weight > 0:
                         mini_expert = ed["expert_actions"][batch_indices]
-                        imitation_loss = nn.functional.mse_loss(pred_mean, mini_expert)
+                        if cov_factor is not None and diag_std is not None:
+                            dist = self.policy_module._build_action_dist(pred_mean, cov_factor, diag_std)
+                            imitation_loss = -dist.log_prob(mini_expert.float()).mean()
+                        else:
+                            imitation_loss = nn.functional.mse_loss(pred_mean, mini_expert)
                         loss = loss + ctx.imitation_weight * imitation_loss
                         per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
 
