@@ -832,7 +832,7 @@ class ArnoldTrainer:
                                 pred_mean.detach(), cov_factor, diag_std,
                             )
                             sigma_loss = -dist.log_prob(mini_expert.float()).mean()
-                            loss = loss + 0.01 * sigma_loss
+                            loss = loss + 0.001 * sigma_loss
 
                     # --- Value ---
                     if ctx.value_weight > 0:
