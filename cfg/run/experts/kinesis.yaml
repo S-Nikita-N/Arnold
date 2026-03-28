@@ -1,6 +1,8 @@
 type: kinesis
 config_path: null
 checkpoint_epoch: -1
+model_type: legs  # legs | legs_abs | legs_back
+overrides: []     # Hydra overrides для Kinesis конфига, e.g. ["run.num_motions=200"]
 
 # Per-expert parallelism (null = use global run.num_threads / learning.min_batch_size)
 num_threads: null

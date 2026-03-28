@@ -51,6 +51,10 @@ BODY_TOKENS: List[str] = [
     "trapezoid", "triquetrum", "ulna",
 
     "lumbar", "thoracic",
+
+    # Kinesis legs_back: промежуточное тело-крепление головы на торсе.
+    # Нельзя удалить из XML — обученная модель зависит от его наблюдений (453 -> 438 без него).
+    "head_attach",
 ]
 
 JOINT_TOKENS: List[str] = [

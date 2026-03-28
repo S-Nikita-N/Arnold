@@ -32,31 +32,33 @@ if str(KINESIS_SRC) not in sys.path:
 def load_kinesis_config(
     config_dir: str = None,
     overrides: list = None,
+    config_name: str = "config_legs",
 ) -> DictConfig:
     """
     Загружает полный конфиг Kinesis через Hydra.
-    
+
     Args:
         config_dir: Путь к директории cfg Kinesis (по умолчанию - из submodule)
         overrides: Список Hydra overrides
-    
+        config_name: Имя конфига (config_legs | config_legs_abs | config_legs_back)
+
     Returns:
         DictConfig с полным конфигом
     """
     if config_dir is None:
         config_dir = str(KINESIS_CFG)
-    
+
     if overrides is None:
         overrides = []
-    
+
     # Очищаем предыдущую инициализацию Hydra если есть
     if GlobalHydra.instance().is_initialized():
         GlobalHydra.instance().clear()
-    
+
     # Инициализируем Hydra с абсолютным путём
     with initialize_config_dir(config_dir=config_dir, version_base=None):
-        cfg = compose(config_name="config", overrides=overrides)
-    
+        cfg = compose(config_name=config_name, overrides=overrides)
+
     return cfg
 
 
@@ -75,6 +77,7 @@ class KinesisWrapper:
         device: str = "cpu",
         overrides: list = [],
         mode: str = "train",
+        model_type: str = "legs",
     ):
         """
         Args:
@@ -82,35 +85,37 @@ class KinesisWrapper:
             expert_cfg: Готовый DictConfig (для multiprocessing, вместо cfg_path)
             checkpoint_epoch: Эпоха чекпоинта (-1 для latest)
             device: Устройство ("cpu" или "cuda")
-            overrides: Hydra overrides (e.g., ["run=eval_run"])
+            overrides: Hydra overrides (e.g., ["run=eval_run_legs"])
             mode: "train" или "valid" — определяет какой motion_file использовать
                   train: kit_train_motion_dict.pkl
                   valid: kit_test_motion_dict.pkl
+            model_type: "legs" | "legs_abs" | "legs_back"
         """
         self.mode = mode
-        
+        self.model_type = model_type
+
         # Сохраняем текущую директорию и меняем на Kinesis root
         # (Kinesis использует относительные пути от своего корня)
         original_cwd = os.getcwd()
         os.chdir(KINESIS_ROOT)
-        
+
         try:
             # Импортируем после добавления путей
             from agents.agent_im import AgentIM
             from learning.learning_utils import to_test
-            
+
             # Используем готовый cfg или загружаем через Hydra
             if expert_cfg is not None:
                 # Используем готовый конфиг (для multiprocessing workers)
                 self.cfg = expert_cfg
             else:
                 # Загружаем конфиг через Hydra
-                # Выбираем run config в зависимости от mode
+                # Выбираем run config в зависимости от mode и model_type
                 if mode == "valid":
-                    run_config = "run=eval_run"  # kit_test_motion_dict.pkl
+                    run_config = f"run=eval_run_{model_type}"
                 else:
-                    run_config = "run=train_run"  # kit_train_motion_dict.pkl
-                
+                    run_config = f"run=train_run_{model_type}"
+
                 default_overrides = [
                     run_config,
                     "no_log=True",
@@ -123,14 +128,19 @@ class KinesisWrapper:
 
                 if not any(override.startswith("run.headless=") for override in overrides):
                     default_overrides.append("run.headless=True")
-                
+
                 cfg_dir = cfg_path if cfg_path else str(KINESIS_CFG)
-                self.cfg = load_kinesis_config(config_dir=cfg_dir, overrides=default_overrides)
-            
+                config_name = f"config_{model_type}"
+                self.cfg = load_kinesis_config(
+                    config_dir=cfg_dir,
+                    overrides=default_overrides,
+                    config_name=config_name,
+                )
+
             self.device = torch.device(device)
-            
+
             # Устанавливаем output_dir для загрузки модели
-            models_dir = KINESIS_DATA / "trained_models" / "kinesis-moe-imitation"
+            models_dir = KINESIS_DATA / "trained_models" / model_type / "kinesis-moe-imitation"
             self.cfg.output_dir = str(models_dir)
             
             # Инициализируем агента (он сам поднимет env внутри)

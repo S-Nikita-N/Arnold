@@ -122,12 +122,17 @@ def create_expert_wrapper(
 
     if expert_type == "kinesis":
         from arnold.experts.kinesis_wrapper import KinesisWrapper
+        model_type = expert_entry.get("model_type", "legs")
+        expert_overrides = list(expert_entry.get("overrides", []))
+        if overrides:
+            expert_overrides.extend(overrides)
         return KinesisWrapper(
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
             device="cpu",
-            overrides=overrides or [],
+            overrides=expert_overrides,
             mode=mode,
+            model_type=model_type,
         )
 
     elif expert_type == "myohuman":
