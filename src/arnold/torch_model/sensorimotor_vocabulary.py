@@ -128,6 +128,27 @@ MUSCLE_TOKENS: List[str] = [
     "ercspn", "intobl", "extobl",
 ]
 
+MUSCLE_GROUPING_TOKENS: List[str] = [
+    # Torso fascicle groups (anatomical/hybrid)
+    "pectoralis", "deltoids", "latissimus",
+    "gluteus_max", "gluteus_med", "gluteus_min",
+    "iliocostalis", "longissimus", "multifidus", "quadratus_lumborum",
+    "external_oblique", "internal_oblique", "rectus_abdominis",
+    "paraspinal", "erector_spinae_cervical",
+    "internal_oblique_simple", "external_oblique_simple",
+    # Functional torso groups
+    "spine_flexors", "spine_extensors",
+    # Functional hip group (not in hybrid)
+    "hip_extensors",
+    # Limb functional groups (shared hybrid + functional)
+    "hip_flexors", "hip_adductors", "hip_abductors",
+    "knee_extensors", "knee_flexors",
+    "ankle_plantarflexors", "ankle_dorsiflexors",
+    "shoulder_flexors", "shoulder_extensors", "shoulder_abductors",
+    "rotator_cuff", "elbow_flexors", "elbow_extensors",
+    "pronators_supinators",
+]
+
 PROPRIOCEPTIVE_TOKENS: List[str] = [
     "root_height",
     "root_tilt",
@@ -208,7 +229,8 @@ class SensorimotorVocabulary(nn.Module):
         for tokens in [
             SIDE_TOKENS, COORD_TOKENS, SEMANTIC_TOKENS,
             ORIENTATION_TOKENS, SPECIAL_TOKENS, BODY_TOKENS,
-            JOINT_TOKENS, MUSCLE_TOKENS, PROPRIOCEPTIVE_TOKENS
+            JOINT_TOKENS, MUSCLE_TOKENS, MUSCLE_GROUPING_TOKENS,
+            PROPRIOCEPTIVE_TOKENS
         ]:
             for token in tokens:
                 if token in seen:

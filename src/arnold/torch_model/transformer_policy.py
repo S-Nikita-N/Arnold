@@ -107,6 +107,7 @@ class TransformerPolicy(nn.Module):
                 groupings=action_groupings,
                 action_signatures=action_signatures_by_expert,
                 embed_dim=embed_dim,
+                strategy=action_granulation,
             )
             logger.info(
                 f"Action granulation enabled: strategy={action_granulation}, "
