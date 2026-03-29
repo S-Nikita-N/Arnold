@@ -28,16 +28,28 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class SizeBucket:
+    """Один bucket групп с похожими размерами для batched SDPA."""
+    group_indices: torch.Tensor  # [n_bucket] — индексы групп в этом bucket
+    max_size: int                # max group size в bucket
+    gather_idx: torch.Tensor     # [n_bucket, max_size] — индексы мышц
+    pad_mask: torch.Tensor       # [n_bucket, max_size+1] — True = padding
+    attn_mask: torch.Tensor      # [n_bucket, 1, max_size+1, max_size+1] — float mask для SDPA
+
+
+@dataclass
 class GroupMuscleMap:
     """Precomputed indices for gather/scatter in within_group attention.
 
     Все индексы в grouped order (не в оригинальном порядке мышц).
+    Buckets группируют группы по похожим размерам чтобы минимизировать padding waste.
     """
     n_groups: int
     max_group_size: int
-    gather_idx: torch.Tensor    # [G, max_group_size] — индексы мышц в grouped order, padded с 0
-    group_sizes: torch.Tensor   # [G] — реальные размеры групп
-    pad_mask: torch.Tensor      # [G, max_group_size+1] — True для padding (pos 0 = group token, всегда valid)
+    group_sizes: torch.Tensor          # [G] — реальные размеры групп
+    scatter_src_mask: torch.Tensor     # [G, max_group_size] — True для valid muscles
+    scatter_tgt_idx: torch.Tensor      # [A_total] — target indices для vectorized scatter
+    buckets: List[SizeBucket]          # buckets отсортированные по max_size
 
 
 class ActionTokenizer(nn.Module):
@@ -198,12 +210,11 @@ class ActionTokenizer(nn.Module):
     def build_group_muscle_maps(self) -> None:
         """Строит GroupMuscleMap буферы для каждого эксперта."""
         for expert_name in self.expert_names:
-
             sizes = self.expert_group_sizes[expert_name]
-            group_sizes = torch.tensor(sizes, dtype=torch.long)
+            group_sizes_t = torch.tensor(sizes, dtype=torch.long)
             max_group_size = max(sizes)
             n_groups = len(sizes)
-        
+
             # gather_idx: [G, max_gs] — позиции мышц в grouped order
             offset = 0
             gather_idx = torch.zeros(n_groups, max_group_size, dtype=torch.long)
@@ -211,24 +222,93 @@ class ActionTokenizer(nn.Module):
                 gather_idx[g, :sz] = torch.arange(offset, offset + sz)
                 offset += sz
 
-            # pad_mask: [G, max_gs+1], True = padding
-            pad_mask = torch.ones(n_groups, max_group_size + 1, dtype=torch.bool)
-            for g, sz in enumerate(sizes):
-                pad_mask[g, :sz + 1] = False
+            # valid_mask для vectorized scatter: [G, max_gs]
+            valid_mask = torch.arange(max_group_size).unsqueeze(0) < group_sizes_t.unsqueeze(1)
+            scatter_tgt_idx = gather_idx[valid_mask]  # [A_total]
 
-            self.register_buffer(f"gm_gather_{expert_name}", gather_idx)
-            self.register_buffer(f"gm_sizes_{expert_name}", group_sizes)
-            self.register_buffer(f"gm_pad_mask_{expert_name}", pad_mask)
+            # Buckets: группируем по размеру, threshold = ближайшая степень 2
+            bucket_thresholds = [4, 8, 16, 32, 64, max_group_size]
+            bucket_groups: Dict[int, List[int]] = {}
+            for g, sz in enumerate(sizes):
+                for thr in bucket_thresholds:
+                    if sz <= thr:
+                        bucket_groups.setdefault(thr, []).append(g)
+                        break
+
+            bucket_idx = 0
+            for thr in bucket_thresholds:
+                if thr not in bucket_groups:
+                    continue
+                g_list = bucket_groups[thr]
+                g_indices = torch.tensor(g_list, dtype=torch.long)
+                n_b = len(g_list)
+                b_max = max(sizes[g] for g in g_list)
+                seq_len = b_max + 1
+
+                # Per-bucket gather_idx: [n_b, b_max]
+                b_gather = torch.zeros(n_b, b_max, dtype=torch.long)
+                b_pad = torch.ones(n_b, seq_len, dtype=torch.bool)
+                for i, g in enumerate(g_list):
+                    sz = sizes[g]
+                    b_gather[i, :sz] = gather_idx[g, :sz]
+                    b_pad[i, :sz + 1] = False
+
+                # Pre-compute float attention mask: [n_b, 1, seq_len, seq_len]
+                kv_mask = b_pad.unsqueeze(1).unsqueeze(2)   # [n_b, 1, 1, seq_len]
+                q_mask = b_pad.unsqueeze(1).unsqueeze(3)    # [n_b, 1, seq_len, 1]
+                b_attn_mask = torch.where(
+                    kv_mask | q_mask,
+                    torch.tensor(-1e9),
+                    torch.tensor(0.0),
+                )
+
+                self.register_buffer(f"gm_bkt_{expert_name}_{bucket_idx}_gidx", g_indices)
+                self.register_buffer(f"gm_bkt_{expert_name}_{bucket_idx}_gather", b_gather)
+                self.register_buffer(f"gm_bkt_{expert_name}_{bucket_idx}_pad", b_pad)
+                self.register_buffer(f"gm_bkt_{expert_name}_{bucket_idx}_attn", b_attn_mask)
+                bucket_idx += 1
+
+            self.register_buffer(f"gm_sizes_{expert_name}", group_sizes_t)
+            self.register_buffer(f"gm_valid_mask_{expert_name}", valid_mask)
+            self.register_buffer(f"gm_scatter_tgt_{expert_name}", scatter_tgt_idx)
+
+            # Store bucket count and max sizes for reconstruction
+            self._gm_bucket_counts = getattr(self, '_gm_bucket_counts', {})
+            self._gm_bucket_counts[expert_name] = bucket_idx
+            self._gm_bucket_max_sizes = getattr(self, '_gm_bucket_max_sizes', {})
+            self._gm_bucket_max_sizes[expert_name] = [
+                max(sizes[g] for g in bucket_groups[thr])
+                for thr in bucket_thresholds if thr in bucket_groups
+            ]
+
+            logger.info(
+                f"  GroupMuscleMap [{expert_name}]: {n_groups} groups, "
+                f"{bucket_idx} buckets (sizes: {[len(bucket_groups[t]) for t in bucket_thresholds if t in bucket_groups]})"
+            )
 
     def get_group_muscle_map(self, expert_name: str) -> GroupMuscleMap:
         """Возвращает GroupMuscleMap для within_group attention."""
         sizes = self.expert_group_sizes[expert_name]
+        n_buckets = self._gm_bucket_counts[expert_name]
+        max_sizes = self._gm_bucket_max_sizes[expert_name]
+
+        buckets = []
+        for i in range(n_buckets):
+            buckets.append(SizeBucket(
+                group_indices=getattr(self, f"gm_bkt_{expert_name}_{i}_gidx"),
+                max_size=max_sizes[i],
+                gather_idx=getattr(self, f"gm_bkt_{expert_name}_{i}_gather"),
+                pad_mask=getattr(self, f"gm_bkt_{expert_name}_{i}_pad"),
+                attn_mask=getattr(self, f"gm_bkt_{expert_name}_{i}_attn"),
+            ))
+
         return GroupMuscleMap(
             n_groups=len(sizes),
             max_group_size=max(sizes),
-            gather_idx=getattr(self, f"gm_gather_{expert_name}"),
             group_sizes=getattr(self, f"gm_sizes_{expert_name}"),
-            pad_mask=getattr(self, f"gm_pad_mask_{expert_name}"),
+            scatter_src_mask=getattr(self, f"gm_valid_mask_{expert_name}"),
+            scatter_tgt_idx=getattr(self, f"gm_scatter_tgt_{expert_name}"),
+            buckets=buckets,
         )
 
     def log_summary(

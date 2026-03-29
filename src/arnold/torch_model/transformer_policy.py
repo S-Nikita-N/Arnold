@@ -31,7 +31,7 @@ import logging
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.torch_model.normalization import SignatureNormalizerModule
 from arnold.torch_model.body_tokenizer import BodyTokenizer
-from arnold.torch_model.action_tokenizer import ActionTokenizer, GroupMuscleMap
+from arnold.torch_model.action_tokenizer import ActionTokenizer, GroupMuscleMap, SizeBucket
 from arnold.action_parser import MuscleGrouping
 from arnold.observation_parser import BodyGroup
 from arnold.profiler import SamplingProfiler
@@ -173,86 +173,70 @@ class WithinGroupLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         B, G, D = group_tokens.shape
-        max_gs = gm_map.max_group_size
         head_dim = D // self.num_heads
-        seq_len = max_gs + 1
+        dropout_p = self.attn_dropout if self.training else 0.0
 
-        # --- Gather: собираем muscle tokens по группам ---
-        # gather_idx: [G, max_gs] — индексы в muscle_tokens (grouped order)
-        gathered_muscle_tokens = muscle_tokens[:, gm_map.gather_idx]  # [B, G, max_gs, D]
-
-        # Prepend group token
-        x = torch.cat(
-            [
-                group_tokens.unsqueeze(2),  # [B, G, 1, D]
-                gathered_muscle_tokens      # [B, G, max_gs, D]
-            ],
-            dim=2,                          # [B, G, max_gs+1, D]
-        ).reshape(B * G, seq_len, D)        # [B*G, seq_len, D]
-        
-        # Fused qkv projection [B*G, seq_len, 3, num_heads, head_dim]
-        qkv = self.qkv_proj(
-            self.sa_norm(x)
-        ).reshape(B * G, seq_len, 3, self.num_heads, head_dim)
-
-        q, k, v = qkv.unbind(dim=2) # [B*G, seq_len, num_heads, head_dim]
-        q = q.transpose(1, 2)       # [B*G, num_heads, seq_len, head_dim]
-        k = k.transpose(1, 2)       # [B*G, num_heads, seq_len, head_dim]
-        v = v.transpose(1, 2)       # [B*G, num_heads, seq_len, head_dim]
-
-        # Attention mask from pad_mask
-        attn_mask = gm_map.pad_mask.unsqueeze(0).expand(B, -1, -1)  # [B, G, seq_len]
-        attn_mask = attn_mask.reshape(B * G, seq_len)               # [B*G, seq_len]
-
-        kv_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # [B*G, 1, 1, seq_len]
-        q_mask = attn_mask.unsqueeze(1).unsqueeze(3)   # [B*G, 1, seq_len, 1]
-        full_mask = kv_mask | q_mask                   # [B*G, 1, seq_len, seq_len]
-        float_mask = torch.where(
-            full_mask,
-            torch.tensor(-1e9, device=x.device, dtype=x.dtype),
-            torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        )
-
-        # [B*G, num_heads, seq_len, head_dim]
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=float_mask,
-            dropout_p=self.attn_dropout if self.training else 0.0,
-        )                                                               # [B*G, num_heads, seq_len, head_dim]
-        attn_out = attn_out.transpose(1, 2).reshape(B * G, seq_len, D)  # [B*G, seq_len, D]
-        x = x + self.out_proj(attn_out)                                 # [B*G, seq_len, D]
-
-        # --- Cross-attention (optional, on full flattened sequence) ---
-        if self.cross_attention and encoder_out is not None:
-            # Expand encoder_out: [B, S, D] → [B*G, S, D]
-            enc_expanded = (
-                encoder_out.unsqueeze(1)
-                .expand(-1, G, -1, -1)
-                .reshape(B * G, -1, D)
-            )
-            x = (
-                x + 
-                self.ca(
-                    self.ca_norm(x),
-                    enc_expanded,
-                    enc_expanded,
-                    need_weights=False
-                )[0]
-            )
-  
-        # --- FFN ---
-        x = x + self.ff(self.ff_norm(x))
-
-        # --- Scatter back ---
-        x_out = x.reshape(B, G, seq_len, D)
-        group_tokens_out = x_out[:, :, 0, :]       # [B, G, D]
-        muscles_gathered_out = x_out[:, :, 1:, :]  # [B, G, max_gs, D]
-
-        # Scatter valid muscles back
+        group_tokens_out = group_tokens.clone()
         muscle_tokens_out = muscle_tokens.clone()
-        for g in range(G):
-            sz = gm_map.group_sizes[g].item()
-            muscle_tokens_out[:, gm_map.gather_idx[g, :sz]] = muscles_gathered_out[:, g, :sz]
+
+        for bucket in gm_map.buckets:
+            n_b = bucket.group_indices.shape[0]
+            max_gs = bucket.max_size
+            seq_len = max_gs + 1
+
+            # Gather group tokens for this bucket: [B, n_b, D]
+            b_group = group_tokens[:, bucket.group_indices]
+            # Gather muscle tokens: [B, n_b, max_gs, D]
+            b_muscles = muscle_tokens[:, bucket.gather_idx]
+
+            # Assemble sequence: [group_token, muscle_1, ..., muscle_k, PAD...]
+            x = torch.cat(
+                [
+                    b_group.unsqueeze(2),
+                    b_muscles
+                ],
+                dim=2,
+            ).reshape(B * n_b, seq_len, D)
+
+            # --- Self-attention with pre-computed mask ---
+            qkv = self.qkv_proj(self.sa_norm(x)).reshape(
+                B * n_b, seq_len, 3, self.num_heads, head_dim
+            )
+            q, k, v = qkv.unbind(dim=2)
+            q = q.transpose(1, 2)  # [B*n_b, H, seq_len, head_dim]
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            # Expand pre-computed mask: [n_b, 1, seq_len, seq_len] → [B*n_b, 1, seq_len, seq_len]
+            attn_mask = bucket.attn_mask.unsqueeze(0).expand(B, -1, -1, -1, -1).reshape(
+                B * n_b, 1, seq_len, seq_len
+            )
+
+            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+            attn_out = attn_out.transpose(1, 2).reshape(B * n_b, seq_len, D)
+            x = x + self.out_proj(attn_out)
+
+            # --- Cross-attention (optional) ---
+            if self.cross_attention and encoder_out is not None:
+                enc_expanded = (
+                    encoder_out.unsqueeze(1)
+                    .expand(-1, n_b, -1, -1)
+                    .reshape(B * n_b, -1, D)
+                )
+                x = x + self.ca(self.ca_norm(x), enc_expanded, enc_expanded, need_weights=False)[0]
+
+            # --- FFN ---
+            x = x + self.ff(self.ff_norm(x))
+
+            # --- Scatter back ---
+            x = x.reshape(B, n_b, seq_len, D)
+            group_tokens_out[:, bucket.group_indices] = x[:, :, 0, :]
+
+            # Vectorized scatter muscles
+            b_muscles_out = x[:, :, 1:, :]  # [B, n_b, max_gs, D]
+            valid = ~bucket.pad_mask[:, 1:]  # [n_b, max_gs] — True = valid
+            tgt_idx = bucket.gather_idx[valid]  # [n_valid]
+            muscle_tokens_out[:, tgt_idx] = b_muscles_out[:, valid]
 
         return group_tokens_out, muscle_tokens_out
 
