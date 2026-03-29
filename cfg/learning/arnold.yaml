@@ -21,7 +21,12 @@ transformer:
   cov_mode: head  # action_out | head
   min_diag_std: 0.0001
   log_std_init: 0
-  action_granulation: none  # none | anatomical | functional
+  action_granulation: none  # none | anatomical | functional | hybrid
+  # Hierarchical decoder (optional, overrides num_act_dec_layers):
+  # Types: g2g (group_to_group) | wg (within_group). cross_attn defaults: g2g=true, wg=false.
+  # Example:
+  #   [{type: g2g, cross_attn: true}, {type: g2g, cross_attn: true}, {type: wg, cross_attn: false}]
+  action_decoder_layers: null
 
 # ==================== PPO ====================
 batch_size: 128

@@ -470,7 +470,11 @@ class ActionParser:
         if singleton_fallback:
             return base + side_suffix
 
-        return f"other{side_suffix}"
+        raise ValueError(
+            f"Muscle '{muscle_name}' (base='{base}') not matched by any "
+            f"torso regex or limb map entry. Add it to the appropriate map "
+            f"or use singleton_fallback=True for anatomical strategy."
+        )
 
     def granulate(
         self,

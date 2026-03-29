@@ -394,8 +394,9 @@ class ArnoldTrainer:
             self.cfg.learning.transformer, resolve=True
         )
 
-        # Pop action_granulation — не передаётся как **kwarg в TransformerPolicy
+        # Pop параметры, которые передаются как explicit kwargs, не через **transformer_cfg
         action_granulation = transformer_cfg.pop("action_granulation", "none")
+        action_decoder_layers = transformer_cfg.pop("action_decoder_layers", None)
 
         self.vocab = SensorimotorVocabulary(embed_dim=transformer_cfg["embed_dim"])
         groups = {name: ctx.groups for name, ctx in self.experts.items()}
@@ -425,6 +426,7 @@ class ArnoldTrainer:
             action_granulation=action_granulation,
             action_groupings=action_groupings,
             action_signatures_by_expert=action_sigs_by_expert,
+            action_decoder_layers=action_decoder_layers,
             **transformer_cfg,
         )
 
@@ -741,7 +743,7 @@ class ArnoldTrainer:
 
         # Accumulators per expert
         per_expert_losses: Dict[str, Dict[str, list]] = {
-            n: {"ppo": [], "imitation": [], "value": [], "entropy": []}
+            n: {"ppo": [], "imitation": [], "value": [], "entropy": [], "sigma": []}
             for n in self.experts
         }
         per_expert_diag: Dict[str, Dict[str, list]] = {
@@ -792,7 +794,13 @@ class ArnoldTrainer:
                 )
 
                 with autocast_ctx:
-                    pred_mean, cov_factor, diag_std, values = self.policy(
+                    (
+                        pred_mean,
+                        cov_factor,
+                        diag_std,
+                        values,
+                        latent_std,
+                    ) = self.policy(
                         mini_states,
                         ed["obs_signatures"],
                         ed["action_signatures"],
@@ -838,6 +846,7 @@ class ArnoldTrainer:
                             )
                             sigma_loss = -dist.log_prob(mini_expert.float()).mean()
                             loss = loss + 0.001 * sigma_loss
+                            per_expert_losses[expert_name]["sigma"].append(sigma_loss.item())
 
                     # --- Value ---
                     if ctx.value_weight > 0:
@@ -900,15 +909,22 @@ class ArnoldTrainer:
             with torch.no_grad():
                 bs = ed["batch_size"]
                 diag_idx = np.arange(min(512, bs))
-                diag_actions, diag_cov_factor, diag_std, diag_values = self.policy(
+                (
+                    diag_actions,
+                    diag_cov_factor,
+                    diag_diag_std,
+                    diag_values,
+                    diag_latent_std,
+                ) = self.policy(
                     ed["states"][diag_idx],
                     ed["obs_signatures"],
                     ed["action_signatures"],
                     expert_name=expert_name,
                 )
-                logstd_mean = diag_std.log().mean().item()
-                logstd_min = diag_std.log().min().item()
-                logstd_max = diag_std.log().max().item()
+
+                logstd_mean = diag_diag_std.log().mean().item()
+                logstd_min = diag_diag_std.log().min().item()
+                logstd_max = diag_diag_std.log().max().item()
                 act_mean = diag_actions.mean().item()
                 act_std = diag_actions.std().item()
                 act_abs_mean = diag_actions.abs().mean().item()
@@ -916,6 +932,16 @@ class ArnoldTrainer:
                 act_max = diag_actions.max().item()
                 val_post_mean = diag_values.mean().item() if diag_values is not None else 0.0
                 val_post_std = diag_values.std().item() if diag_values is not None else 0.0
+                latent_std_mean = diag_latent_std.mean().item() if diag_latent_std is not None else 0.0
+                latent_std_min = diag_latent_std.min().item() if diag_latent_std is not None else 0.0
+                latent_std_max = diag_latent_std.max().item() if diag_latent_std is not None else 0.0
+
+                if diag_cov_factor is not None:
+                    lr_var = diag_cov_factor.pow(2).sum(dim=-1).mean().item()
+                    diag_var = diag_diag_std.pow(2).mean().item()
+                    cov_factor_norm = diag_cov_factor.norm(dim=-1).mean().item()
+                    lr_fraction = lr_var / (lr_var + diag_var + 1e-8)
+                    cov_factor_abs_max = diag_cov_factor.abs().max().item()
 
                 adv = ed["advantages"]
                 ret = ed["returns"]
@@ -934,6 +960,7 @@ class ArnoldTrainer:
                 "imitation_loss": float(np.mean(losses["imitation"])) if losses["imitation"] else 0.0,
                 "value_loss": float(np.mean(losses["value"])) if losses["value"] else 0.0,
                 "entropy_loss": float(np.mean(losses["entropy"])) if losses["entropy"] else 0.0,
+                "sigma_loss": float(np.mean(losses["sigma"])) if losses["sigma"] else 0.0,
                 "approx_kl": float(np.mean(diag["approx_kls"])) if diag["approx_kls"] else 0.0,
                 "clip_frac": float(np.mean(diag["clip_fracs"])) if diag["clip_fracs"] else 0.0,
                 "value_clip_frac": float(np.mean(diag["value_clip_fracs"])) if diag["value_clip_fracs"] else 0.0,
@@ -956,6 +983,12 @@ class ArnoldTrainer:
                 "logstd_max": logstd_max,
                 "val_post_mean": val_post_mean,
                 "val_post_std": val_post_std,
+                "latent_std_mean": latent_std_mean,
+                "latent_std_min": latent_std_min,
+                "latent_std_max": latent_std_max,
+                "cov_factor_norm": cov_factor_norm,
+                "lr_fraction": lr_fraction,
+                "cov_factor_abs_max": cov_factor_abs_max,
             }
 
         # Update normalizer stats ONCE with the full batch data.
@@ -1144,6 +1177,14 @@ class ArnoldTrainer:
                     f"act_range=[{d.get('act_min', 0):.3f}, {d.get('act_max', 0):.3f}]  "
                     f"logstd={d.get('logstd_mean', 0):.3f} [{d.get('logstd_min', 0):.3f}, {d.get('logstd_max', 0):.3f}]  "
                     f"val_post={d.get('val_post_mean', 0):.3f}±{d.get('val_post_std', 0):.3f}  "
+                )
+                logger.info(
+                    f"  [{expert_name}] Covariance: "
+                    f"sigma_loss={d.get('sigma_loss', 0):.4f}  "
+                    f"latent_std={d.get('latent_std_mean', 0):.4f} [{d.get('latent_std_min', 0):.4f}, {d.get('latent_std_max', 0):.4f}]  "
+                    f"cov_norm={d.get('cov_factor_norm', 0):.4f}  "
+                    f"lr_frac={d.get('lr_fraction', 0):.3f}  "
+                    f"cov_max={d.get('cov_factor_abs_max', 0):.4f}"
                 )
 
         # Per-expert sampling profiler — только эпоха 0

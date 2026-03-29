@@ -18,12 +18,26 @@ Vocabulary signatures:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import logging
 
 from arnold.action_parser import MuscleGrouping, get_canonical_granules
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GroupMuscleMap:
+    """Precomputed indices for gather/scatter in within_group attention.
+
+    Все индексы в grouped order (не в оригинальном порядке мышц).
+    """
+    n_groups: int
+    max_group_size: int
+    gather_idx: torch.Tensor    # [G, max_group_size] — индексы мышц в grouped order, padded с 0
+    group_sizes: torch.Tensor   # [G] — реальные размеры групп
+    pad_mask: torch.Tensor      # [G, max_group_size+1] — True для padding (pos 0 = group token, всегда valid)
 
 
 class ActionTokenizer(nn.Module):
@@ -52,6 +66,7 @@ class ActionTokenizer(nn.Module):
         # Per-expert metadata: (granule_base, side) tuples instead of string group_ids
         self.expert_groups: Dict[str, List[Tuple[str, str]]] = {}  # [(base, side), ...]
         self.expert_group_sizes: Dict[str, List[int]] = {}
+        self.expert_muscle_sigs_grouped: Dict[str, List[Tuple[str, ...]]] = {}  # per-muscle sigs in grouped order
 
         self.build_grouping(groupings, action_signatures)
         self.log_summary(groupings)
@@ -70,6 +85,7 @@ class ActionTokenizer(nn.Module):
 
             group_signatures: List[Tuple[str, str]] = []  # (granule_base, side)
             group_sizes: List[int] = []
+            muscle_sigs_grouped: List[Tuple[str, ...]] = []
 
             for g_idx, group_id in enumerate(grouping.group_order):
                 muscles = grouping.groups[group_id]
@@ -78,6 +94,16 @@ class ActionTokenizer(nn.Module):
 
                 group_signatures.append((granule_base, side))
                 group_sizes.append(len(muscles))
+
+                # Per-muscle vocab signatures in grouped order
+                for muscle_name in muscles:
+                    if muscle_name.endswith("_r"):
+                        base = muscle_name[:-2]
+                    elif muscle_name.endswith("_l"):
+                        base = muscle_name[:-2]
+                    else:
+                        base = muscle_name
+                    muscle_sigs_grouped.append((base, side, "muscle", "activation"))
 
                 # Canonical head size
                 if "." in granule_base or "-" in granule_base:
@@ -102,6 +128,7 @@ class ActionTokenizer(nn.Module):
 
             self.expert_groups[expert_name] = group_signatures
             self.expert_group_sizes[expert_name] = group_sizes
+            self.expert_muscle_sigs_grouped[expert_name] = muscle_sigs_grouped
 
             # reorder_idx: grouped order → original muscle order
             reorder_idx = self.build_reorder_idx(grouping, act_sigs)
@@ -111,6 +138,7 @@ class ActionTokenizer(nn.Module):
             )
 
         self.build_output_heads(head_output_dims)
+        self.build_group_muscle_maps()
 
     def build_select_idx(
         self,
@@ -167,6 +195,42 @@ class ActionTokenizer(nn.Module):
             nn.init.orthogonal_(head.weight, gain=0.1)
             nn.init.zeros_(head.bias)
 
+    def build_group_muscle_maps(self) -> None:
+        """Строит GroupMuscleMap буферы для каждого эксперта."""
+        for expert_name in self.expert_names:
+
+            sizes = self.expert_group_sizes[expert_name]
+            group_sizes = torch.tensor(sizes, dtype=torch.long)
+            max_group_size = max(sizes)
+            n_groups = len(sizes)
+        
+            # gather_idx: [G, max_gs] — позиции мышц в grouped order
+            offset = 0
+            gather_idx = torch.zeros(n_groups, max_group_size, dtype=torch.long)
+            for g, sz in enumerate(sizes):
+                gather_idx[g, :sz] = torch.arange(offset, offset + sz)
+                offset += sz
+
+            # pad_mask: [G, max_gs+1], True = padding
+            pad_mask = torch.ones(n_groups, max_group_size + 1, dtype=torch.bool)
+            for g, sz in enumerate(sizes):
+                pad_mask[g, :sz + 1] = False
+
+            self.register_buffer(f"gm_gather_{expert_name}", gather_idx)
+            self.register_buffer(f"gm_sizes_{expert_name}", group_sizes)
+            self.register_buffer(f"gm_pad_mask_{expert_name}", pad_mask)
+
+    def get_group_muscle_map(self, expert_name: str) -> GroupMuscleMap:
+        """Возвращает GroupMuscleMap для within_group attention."""
+        sizes = self.expert_group_sizes[expert_name]
+        return GroupMuscleMap(
+            n_groups=len(sizes),
+            max_group_size=max(sizes),
+            gather_idx=getattr(self, f"gm_gather_{expert_name}"),
+            group_sizes=getattr(self, f"gm_sizes_{expert_name}"),
+            pad_mask=getattr(self, f"gm_pad_mask_{expert_name}"),
+        )
+
     def log_summary(
         self,
         groupings: Dict[str, MuscleGrouping]
@@ -199,6 +263,13 @@ class ActionTokenizer(nn.Module):
             (base, side, "muscle", "activation")
             for base, side in self.expert_groups[expert_name]
         ]
+
+    def get_muscle_signatures(
+        self,
+        expert_name: str
+    ) -> List[Tuple[str, ...]]:
+        """Возвращает per-muscle signatures в grouped order для vocab embedding lookup."""
+        return self.expert_muscle_sigs_grouped[expert_name]
 
     def decode(
         self,
