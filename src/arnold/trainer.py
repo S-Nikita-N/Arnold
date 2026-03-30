@@ -840,13 +840,13 @@ class ArnoldTrainer:
                         per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
 
                         # σ calibration: detached NLL trains covariance to match residuals
-                        if cov_factor is not None and diag_std is not None:
-                            dist = self.policy_module._build_action_dist(
-                                pred_mean.detach(), cov_factor, diag_std,
-                            )
-                            sigma_loss = -dist.log_prob(mini_expert.float()).mean()
-                            loss = loss + 0.001 * sigma_loss
-                            per_expert_losses[expert_name]["sigma"].append(sigma_loss.item())
+                        # if cov_factor is not None and diag_std is not None:
+                        #     dist = self.policy_module._build_action_dist(
+                        #         pred_mean.detach(), cov_factor, diag_std,
+                        #     )
+                        #     sigma_loss = -dist.log_prob(mini_expert.float()).mean()
+                        #     loss = loss + 0.001 * sigma_loss
+                        #     per_expert_losses[expert_name]["sigma"].append(sigma_loss.item())
 
                     # --- Value ---
                     if ctx.value_weight > 0:
