@@ -1104,6 +1104,7 @@ class ArnoldTrainer:
                     imitation_loss=diag["imitation_loss"],
                     value_loss=diag["value_loss"],
                     entropy_loss=diag["entropy_loss"],
+                    load_balance_loss=diag["load_balance_loss"],
                 )
                 total_steps_epoch += obc_lg.num_steps
 
