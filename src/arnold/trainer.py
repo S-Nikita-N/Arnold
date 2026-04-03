@@ -927,7 +927,7 @@ class ArnoldTrainer:
                         per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
 
                     # --- MoE load balancing ---
-                    if ctx.load_balance_weight > 0:
+                    if ctx.load_balance_weight > 0 and hasattr(self.policy_module, 'last_load_balance_loss'):
                         lb_loss = self.policy_module.last_load_balance_loss
                         loss = loss + ctx.load_balance_weight * lb_loss
                         per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())

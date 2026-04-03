@@ -103,7 +103,7 @@ class MoELatticePolicy(nn.Module):
         self.value_head.bias.data.zero_()
 
         # Сохраняем последний load balancing loss для trainer
-        self.last_load_balance_loss = 0.0
+        self.register_buffer('last_load_balance_loss', torch.zeros(1), persistent=False)
 
         self.profiler = None
 
