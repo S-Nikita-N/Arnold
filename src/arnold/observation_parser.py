@@ -94,7 +94,12 @@ class ObservationParser:
             muscle_names.append(env.mj_model.actuator(i).name)
         
         # Track bodies (для imitation task)
-        track_bodies = getattr(env, 'track_bodies', body_names[:7])
+        if not hasattr(env, 'tracked_bodies'):
+            raise AttributeError(
+                f"env {type(env).__name__} has no 'tracked_bodies' attribute. "
+                f"Available attrs: {[a for a in dir(env) if 'track' in a.lower() or 'body' in a.lower()]}"
+            )
+        track_bodies = env.tracked_bodies
         
         return cls(
             body_names=body_names,

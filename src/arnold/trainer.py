@@ -74,6 +74,7 @@ class ExpertContext:
     imitation_weight: float = 0.0
     value_weight: float = 0.0
     entropy_weight: float = 0.0
+    load_balance_weight: float = 0.0
 
     # Per-expert parallelism
     num_threads: int = 1
@@ -288,6 +289,7 @@ class ArnoldTrainer:
             im_w = learning_cfg.get("imitation_weight")
             val_w = learning_cfg.get("value_weight")
             ent_w = learning_cfg.get("entropy_weight")
+            lb_w = learning_cfg.get("load_balance_weight", 0.0)
             loss_scale = learning_cfg.get("loss_scale", 1)
             mbs = learning_cfg.get("min_batch_size")
             n_threads = entry.get("num_threads", 1)
@@ -315,6 +317,7 @@ class ArnoldTrainer:
                 imitation_weight=im_w,
                 value_weight=val_w,
                 entropy_weight=ent_w,
+                load_balance_weight=lb_w,
                 num_threads=n_threads,
                 min_batch_size=mbs,
                 loss_scale=loss_scale,
@@ -333,7 +336,7 @@ class ArnoldTrainer:
             )
             logger.info(
                 f"  threads={n_threads}  min_batch={mbs}  "
-                f"ppo={ppo_w}  im={im_w}  val={val_w}  ent={ent_w}  scale={loss_scale}"
+                f"ppo={ppo_w}  im={im_w}  val={val_w}  ent={ent_w}  lb={lb_w}  scale={loss_scale}"
             )
             logger.info(
                 f"  parser: {parser.n_obs_elements} obs elements, "
@@ -357,10 +360,12 @@ class ArnoldTrainer:
             self._setup_transformer_policy()
         elif self.cfg.learning.policy == "lattice":
             self._setup_lattice_policy()
+        elif self.cfg.learning.policy == "moe":
+            self._setup_moe_policy()
         else:
             raise ValueError(
                 f"Unknown policy: {self.cfg.learning.policy}. "
-                f"Supported: transformer, lattice"
+                f"Supported: transformer, lattice, moe"
             )
 
         self.policy.to(self.device)
@@ -454,6 +459,36 @@ class ArnoldTrainer:
             state_dim=state_dim,
             action_dim=action_dim,
             **lattice_cfg
+        )
+
+    def _setup_moe_policy(self) -> None:
+        """MoE-Lattice Policy — Mixture of Experts с low-rank covariance. Только single-expert."""
+        from arnold.torch_model.policy_moe import MoELatticePolicy
+
+        if len(self.experts) > 1:
+            raise ValueError(
+                f"MoE policy поддерживает только одного эксперта, "
+                f"сейчас: {list(self.experts.keys())}. "
+                "Используйте policy=transformer для multi-expert."
+            )
+
+        ctx = next(iter(self.experts.values()))
+        state_dim = ctx.parser.n_obs_elements
+        action_dim = ctx.wrapper.action_dim
+
+        logger.info(
+            f"MoE setup: state_dim={state_dim} (n_obs_elements from setup parser), "
+            f"obs_dim={ctx.wrapper.obs_dim} (raw env), action_dim={action_dim}"
+        )
+
+        moe_cfg = OmegaConf.to_container(
+            self.cfg.learning.moe, resolve=True
+        )
+
+        self.policy = MoELatticePolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            **moe_cfg,
         )
 
     def setup_optimizer(self) -> None:
@@ -627,6 +662,7 @@ class ArnoldTrainer:
 
                 # Spawn ALL workers as background (daemon) processes
                 total_workers = 0
+                workers: List[fork_ctx.Process] = []
                 for expert_name, ctx in self.experts.items():
                     thread_batch = int(math.floor(ctx.min_batch_size / ctx.num_threads))
                     for worker_num in range(ctx.num_threads):
@@ -642,6 +678,7 @@ class ArnoldTrainer:
                             daemon=True,
                         )
                         worker.start()
+                        workers.append(worker)
                         total_workers += 1
 
                 # Main process: только мониторинг progress bars
@@ -658,6 +695,22 @@ class ArnoldTrainer:
                     for expert_name, counter in step_counters.items():
                         pbars[expert_name].n = min(counter.value, pbars[expert_name].total)
                         pbars[expert_name].refresh()
+
+                    # Check for dead workers (segfault, SIGKILL, etc.)
+                    dead_workers = [
+                        w for w in workers
+                        if not w.is_alive() and w.exitcode is not None and w.exitcode != 0
+                    ]
+                    finished_not_reported = sum(
+                        1 for w in workers if not w.is_alive()
+                    ) - len(results)
+                    if finished_not_reported > 0 and len(dead_workers) > 0:
+                        exit_codes = {w.pid: w.exitcode for w in dead_workers}
+                        raise RuntimeError(
+                            f"Sampling workers crashed (exit codes: {exit_codes}). "
+                            f"This usually means a segfault in forked process. "
+                            f"Check worker logs above for details."
+                        )
 
                     try:
                         result = queue.get(timeout=0.15)
@@ -743,7 +796,7 @@ class ArnoldTrainer:
 
         # Accumulators per expert
         per_expert_losses: Dict[str, Dict[str, list]] = {
-            n: {"ppo": [], "imitation": [], "value": [], "entropy": [], "sigma": []}
+            n: {"ppo": [], "imitation": [], "value": [], "entropy": [], "sigma": [], "load_balance": []}
             for n in self.experts
         }
         per_expert_diag: Dict[str, Dict[str, list]] = {
@@ -873,6 +926,12 @@ class ArnoldTrainer:
                         loss = loss + ctx.entropy_weight * entropy_loss
                         per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
 
+                    # --- MoE load balancing ---
+                    if ctx.load_balance_weight > 0:
+                        lb_loss = self.policy_module.last_load_balance_loss
+                        loss = loss + ctx.load_balance_weight * lb_loss
+                        per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
+
                     # Apply expert loss scale
                     loss = loss * ctx.loss_scale
 
@@ -961,6 +1020,7 @@ class ArnoldTrainer:
                 "value_loss": float(np.mean(losses["value"])) if losses["value"] else 0.0,
                 "entropy_loss": float(np.mean(losses["entropy"])) if losses["entropy"] else 0.0,
                 "sigma_loss": float(np.mean(losses["sigma"])) if losses["sigma"] else 0.0,
+                "load_balance_loss": float(np.mean(losses["load_balance"])) if losses["load_balance"] else 0.0,
                 "approx_kl": float(np.mean(diag["approx_kls"])) if diag["approx_kls"] else 0.0,
                 "clip_frac": float(np.mean(diag["clip_fracs"])) if diag["clip_fracs"] else 0.0,
                 "value_clip_frac": float(np.mean(diag["value_clip_fracs"])) if diag["value_clip_fracs"] else 0.0,

@@ -28,10 +28,12 @@ from torch.distributions import LowRankMultivariateNormal
 from typing import Any, List, Dict, Optional, Tuple, Union
 import logging
 
+from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
+
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.torch_model.normalization import SignatureNormalizerModule
 from arnold.torch_model.body_tokenizer import BodyTokenizer
-from arnold.torch_model.action_tokenizer import ActionTokenizer, GroupMuscleMap, SizeBucket
+from arnold.torch_model.action_tokenizer import ActionTokenizer, GroupMuscleMap
 from arnold.action_parser import MuscleGrouping
 from arnold.observation_parser import BodyGroup
 from arnold.profiler import SamplingProfiler
@@ -665,7 +667,7 @@ class TransformerPolicy(nn.Module):
                 raise ValueError("return_std=False допустим только при deterministic=True")
             dist = self._build_action_dist(mean, cov_factor, diag_std)
             action = dist.rsample()
-            log_prob = dist.log_prob(action).unsqueeze(-1)
+            log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
 
         return action, log_prob, value
 
@@ -725,4 +727,4 @@ class TransformerPolicy(nn.Module):
         diag_std: torch.Tensor,
     ) -> torch.Tensor:
         dist = self._build_action_dist(mean, cov_factor, diag_std)
-        return dist.log_prob(actions.float()).unsqueeze(-1)
+        return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)

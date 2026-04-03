@@ -1,7 +1,7 @@
 # Arnold Architecture & Learning Config
 
 # ==================== Policy Type ====================
-policy: transformer  # transformer | lattice
+policy: transformer  # transformer | lattice | moe
 
 # ==================== Global (parser, sampling) ====================
 history_len: 5
@@ -43,6 +43,7 @@ ppo_weight: 0
 imitation_weight: 1.0
 value_weight: 0.5
 entropy_weight: 0
+load_balance_weight: 0
 
 # ==================== Training ====================
 min_batch_size: 51200
@@ -51,6 +52,19 @@ use_scheduler: false
 transfer_mode: true
 use_compile: false
 use_bfloat16: false
+
+# ==================== MoE-Lattice (только при policy: moe) ====================
+moe:
+  num_experts: 5
+  top_k: 2
+  shared_units: [2048, 1536, 1024]
+  expert_units: [512, 512]
+  gate_units: [512, 256]
+  activation: silu
+  lattice_mode: weighted  # weighted | max_score
+  fix_std: false
+  log_std_init: 0
+  min_diag_std: 0.0001
 
 # ==================== Lattice (только при policy_type: lattice) ====================
 lattice:

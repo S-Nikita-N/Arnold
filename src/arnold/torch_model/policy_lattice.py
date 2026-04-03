@@ -14,6 +14,8 @@ import torch.nn as nn
 from torch.distributions import LowRankMultivariateNormal
 from typing import List, Tuple, Optional
 
+from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
+
 from arnold.torch_model.mlp import MLP
 from arnold.torch_model.normalization import SignatureNormalizerModule
 
@@ -93,6 +95,7 @@ class LatticePolicy(nn.Module):
 
         cov_factor = None
         diag_std = None
+        latent_std = None
         if return_std:
             std = torch.nn.functional.softplus(self.log_std) + self.min_diag_std
             diag_std = std[:, : self.action_dim].expand(x.shape[0], -1)
@@ -107,7 +110,7 @@ class LatticePolicy(nn.Module):
         if return_value:
             value = self.value_head(self.value_net(x))
 
-        return action_mean, cov_factor, diag_std, value
+        return action_mean, cov_factor, diag_std, value, latent_std
 
     def get_action(
         self,
@@ -119,7 +122,7 @@ class LatticePolicy(nn.Module):
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        mean, cov_factor, diag_std, value = self.forward(
+        mean, cov_factor, diag_std, value, latent_std = self.forward(
             obs_timeseries,
             obs_signatures,
             action_signatures,
@@ -138,7 +141,7 @@ class LatticePolicy(nn.Module):
 
             dist = self._build_action_dist(mean, cov_factor, diag_std)
             action = dist.rsample()
-            log_prob = dist.log_prob(action).unsqueeze(-1)
+            log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
 
         return action, log_prob, value
 
@@ -182,4 +185,4 @@ class LatticePolicy(nn.Module):
         diag_std: torch.Tensor,
     ) -> torch.Tensor:
         dist = self._build_action_dist(mean, cov_factor, diag_std)
-        return dist.log_prob(actions.float()).unsqueeze(-1)
+        return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)
