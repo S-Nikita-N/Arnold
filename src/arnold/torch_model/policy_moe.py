@@ -102,10 +102,9 @@ class MoELatticePolicy(nn.Module):
         self.value_head.weight.data.mul_(0.1)
         self.value_head.bias.data.zero_()
 
-        # Сохраняем последний load balancing loss для trainer
-        self.register_buffer('last_load_balance_loss', torch.zeros(1), persistent=False)
-
         self.profiler = None
+        self.cached_gate_probs: Optional[torch.Tensor] = None
+        self.cached_top_k_indices: Optional[torch.Tensor] = None
 
     def enable_profiling(self, profiler) -> None:
         self.profiler = profiler
@@ -130,20 +129,6 @@ class MoELatticePolicy(nn.Module):
         top_k_weights = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
 
         return top_k_weights, top_k_indices, gate_probs
-
-    def _compute_load_balance_loss(self, gate_probs: torch.Tensor, top_k_indices: torch.Tensor) -> torch.Tensor:
-        """
-        Switch Transformer load balancing: L = α * N * Σ(f_i * P_i)
-        f_i = fraction of tokens routed to expert i
-        P_i = mean gate probability for expert i
-        """
-        N = self.num_experts
-        # f_i: fraction of tokens where expert i is in top-k
-        one_hot = F.one_hot(top_k_indices, N).float()  # [batch, top_k, N]
-        f = one_hot.sum(dim=1).mean(dim=0)  # [N]
-        # P_i: mean gate probability
-        P = gate_probs.mean(dim=0)  # [N]
-        return N * (f * P).sum()
 
     def forward(
         self,
@@ -177,28 +162,23 @@ class MoELatticePolicy(nn.Module):
         # Shared trunk
         h = self.shared_trunk(x) if self.shared_trunk is not None else x
 
-        # Gate routing
+        # Gate routing (cache for load balance loss computation by trainer)
         top_k_weights, top_k_indices, gate_probs = self._gate_forward(h)
-        self.last_load_balance_loss = self._compute_load_balance_loss(gate_probs, top_k_indices)
+        self.cached_gate_probs = gate_probs
+        self.cached_top_k_indices = top_k_indices
 
-        # Compute all expert outputs (only for selected experts, masked)
-        # For efficiency: compute all experts, then gather top-k
-        all_expert_out = []  # [num_experts, batch, latent_dim]
-        all_expert_mean = []  # [num_experts, batch, action_dim]
-        for i in range(self.num_experts):
-            e_out = self.expert_nets[i](h)  # [batch, latent_dim]
-            e_mean = self.expert_heads[i](e_out)  # [batch, action_dim]
-            all_expert_out.append(e_out)
-            all_expert_mean.append(e_mean)
+        # Sparse expert computation: each expert processes only its routed samples
+        selected_means = h.new_zeros(batch_size, self.top_k, self.action_dim)
+        for k in range(self.top_k):
+            slot_indices = top_k_indices[:, k]  # [batch] — expert index for this slot
+            for i in range(self.num_experts):
+                mask = slot_indices == i
+                if not mask.any():
+                    continue
+                e_out = self.expert_nets[i](h[mask])
+                selected_means[mask, k] = self.expert_heads[i](e_out)
 
-        all_expert_out = torch.stack(all_expert_out, dim=1)   # [batch, num_experts, latent_dim]
-        all_expert_mean = torch.stack(all_expert_mean, dim=1)  # [batch, num_experts, action_dim]
-
-        # Gather top-k experts
-        idx_expand_mean = top_k_indices.unsqueeze(-1).expand(-1, -1, self.action_dim)
-        selected_means = torch.gather(all_expert_mean, 1, idx_expand_mean)  # [batch, top_k, action_dim]
-
-        # Weighted sum of action means
+        # Weighted sum
         w = top_k_weights.unsqueeze(-1)  # [batch, top_k, 1]
         mean = (selected_means * w).sum(dim=1)  # [batch, action_dim]
 
@@ -235,6 +215,30 @@ class MoELatticePolicy(nn.Module):
             value = self.value_head(self.value_net(x))
 
         return mean, cov_factor, diag_std, value, latent_std
+
+    def compute_load_balance_loss(self) -> torch.Tensor:
+        """Compute LB loss from cached gate state )."""
+        N = self.num_experts
+        # f_i: fraction of tokens where expert i is in top-k
+        one_hot = F.one_hot(self.cached_top_k_indices, N).float()  # [batch, top_k, N]
+        f = one_hot.sum(dim=1).mean(dim=0)  # [N]
+        # P_i: mean gate probability
+        P = self.cached_gate_probs.mean(dim=0)  # [N]
+        return (N * (f * P).sum()).unsqueeze(0)
+
+    def get_gate_stats(self, h: torch.Tensor) -> dict:
+        """Gate diagnostics: per-expert routing fractions and probabilities."""
+        top_k_weights, top_k_indices, gate_probs = self._gate_forward(h)
+        N = self.num_experts
+        one_hot = F.one_hot(top_k_indices, N).float()
+        routing_fracs = one_hot.sum(dim=1).mean(dim=0)  # [N]
+        mean_probs = gate_probs.mean(dim=0)  # [N]
+        gate_entropy = -(gate_probs * (gate_probs + 1e-8).log()).sum(dim=-1).mean()
+        return {
+            "routing_fracs": routing_fracs.detach(),
+            "mean_probs": mean_probs.detach(),
+            "gate_entropy": gate_entropy.item(),
+        }
 
     def get_action(
         self,

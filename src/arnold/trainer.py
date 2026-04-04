@@ -927,8 +927,8 @@ class ArnoldTrainer:
                         per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
 
                     # --- MoE load balancing ---
-                    if ctx.load_balance_weight > 0 and hasattr(self.policy_module, 'last_load_balance_loss'):
-                        lb_loss = self.policy_module.last_load_balance_loss
+                    if ctx.load_balance_weight > 0 and hasattr(self.policy_module, 'compute_load_balance_loss'):
+                        lb_loss = self.policy_module.compute_load_balance_loss()
                         loss = loss + ctx.load_balance_weight * lb_loss
                         per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
 
@@ -1002,6 +1002,19 @@ class ArnoldTrainer:
                     lr_fraction = lr_var / (lr_var + diag_var + 1e-8)
                     cov_factor_abs_max = diag_cov_factor.abs().max().item()
 
+                # MoE gate diagnostics
+                gate_stats = None
+                if hasattr(self.policy_module, 'get_gate_stats'):
+                    obs_norm = self.policy_module.obs_normalizer(
+                        ed["obs_signatures"], ed["states"][diag_idx],
+                    )
+                    x_diag = obs_norm[:, :, -1]
+                    if self.policy_module.shared_trunk is not None:
+                        h_diag = self.policy_module.shared_trunk(x_diag)
+                    else:
+                        h_diag = x_diag
+                    gate_stats = self.policy_module.get_gate_stats(h_diag)
+
                 adv = ed["advantages"]
                 ret = ed["returns"]
                 old_v = ed["old_values"]
@@ -1050,6 +1063,15 @@ class ArnoldTrainer:
                 "lr_fraction": lr_fraction,
                 "cov_factor_abs_max": cov_factor_abs_max,
             }
+            if gate_stats is not None:
+                d = all_diagnostics[expert_name]
+                d["gate_entropy"] = gate_stats["gate_entropy"]
+                for i, (f, p) in enumerate(zip(
+                    gate_stats["routing_fracs"].tolist(),
+                    gate_stats["mean_probs"].tolist(),
+                )):
+                    d[f"gate_frac_{i}"] = f
+                    d[f"gate_prob_{i}"] = p
 
         # Update normalizer stats ONCE with the full batch data.
         # Must happen before the PPO loop — stats are frozen during updates
@@ -1247,6 +1269,16 @@ class ArnoldTrainer:
                     f"lr_frac={d.get('lr_fraction', 0):.3f}  "
                     f"cov_max={d.get('cov_factor_abs_max', 0):.4f}"
                 )
+                if "gate_entropy" in d:
+                    n_experts = self.policy_module.num_experts if hasattr(self.policy_module, 'num_experts') else 0
+                    fracs = " ".join(f"{d.get(f'gate_frac_{i}', 0):.3f}" for i in range(n_experts))
+                    probs = " ".join(f"{d.get(f'gate_prob_{i}', 0):.3f}" for i in range(n_experts))
+                    logger.info(
+                        f"  [{expert_name}] Gate: "
+                        f"entropy={d['gate_entropy']:.3f}  "
+                        f"routing=[{fracs}]  "
+                        f"probs=[{probs}]"
+                    )
 
         # Per-expert sampling profiler — только эпоха 0
         if epoch == 0 and self.profiler_reports:
