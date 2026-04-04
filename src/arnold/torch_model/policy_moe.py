@@ -123,6 +123,7 @@ class MoELatticePolicy(nn.Module):
         gate_probs = F.softmax(logits, dim=-1)
 
         top_k_vals, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+        top_k_indices = top_k_indices.long()  # one_hot requires LongTensor (bfloat16 autocast)
         # Renormalize top-k weights to sum to 1
         top_k_weights = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
 
