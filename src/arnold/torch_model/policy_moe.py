@@ -174,7 +174,7 @@ class MoELatticePolicy(nn.Module):
 
         # Gate routing
         top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
-        load_balance_loss = self.compute_load_balance_loss(gate_probs, top_k_indices)
+        load_balance_loss = self.compute_load_balance_loss(top_k_indices, gate_probs)
 
         # Sparse expert computation: each expert processes only its routed samples
         selected_means = h.new_zeros(batch_size, self.top_k, self.action_dim)
