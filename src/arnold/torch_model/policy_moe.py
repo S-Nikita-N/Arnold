@@ -110,7 +110,7 @@ class MoELatticePolicy(nn.Module):
     def disable_profiling(self) -> None:
         self.profiler = None
 
-    def _gate_forward(self, h: torch.Tensor):
+    def gate_forward(self, h: torch.Tensor):
         """
         Gate → top-k routing.
 
@@ -127,6 +127,20 @@ class MoELatticePolicy(nn.Module):
         top_k_weights = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
 
         return top_k_weights, top_k_indices, gate_probs
+
+    def compute_load_balance_loss(
+        self,
+        top_k_indices: torch.Tensor,
+        gate_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute LB loss from cached gate state )."""
+        N = self.num_experts
+        # f_i: fraction of tokens where expert i is in top-k
+        one_hot = F.one_hot(top_k_indices, N).float()  # [batch, top_k, N]
+        f = one_hot.sum(dim=1).mean(dim=0)  # [N]
+        # P_i: mean gate probability
+        P = gate_probs.mean(dim=0)  # [N]
+        return (N * (f * P).sum()).unsqueeze(0)
 
     def forward(
         self,
@@ -158,8 +172,8 @@ class MoELatticePolicy(nn.Module):
         h = self.shared_trunk(x) if self.shared_trunk is not None else x
 
         # Gate routing
-        top_k_weights, top_k_indices, gate_probs = self._gate_forward(h)
-        load_balance_loss = self._compute_load_balance_loss(gate_probs, top_k_indices)
+        top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
+        load_balance_loss = self.compute_load_balance_loss(gate_probs, top_k_indices)
 
         # Sparse expert computation: each expert processes only its routed samples
         selected_means = h.new_zeros(batch_size, self.top_k, self.action_dim)
@@ -212,7 +226,7 @@ class MoELatticePolicy(nn.Module):
 
     def get_gate_stats(self, h: torch.Tensor) -> dict:
         """Gate diagnostics: per-expert routing fractions and probabilities."""
-        top_k_weights, top_k_indices, gate_probs = self._gate_forward(h)
+        top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
         N = self.num_experts
         one_hot = F.one_hot(top_k_indices, N).float()
         routing_fracs = one_hot.sum(dim=1).mean(dim=0)  # [N]
