@@ -847,18 +847,14 @@ class ArnoldTrainer:
                 )
 
                 with autocast_ctx:
-                    (
-                        pred_mean,
-                        cov_factor,
-                        diag_std,
-                        values,
-                        latent_std,
-                    ) = self.policy(
+                    policy_out = self.policy(
                         mini_states,
                         ed["obs_signatures"],
                         ed["action_signatures"],
                         expert_name=expert_name,
                     )
+                    pred_mean, cov_factor, diag_std, values, latent_std = policy_out[:5]
+                    forward_lb_loss = policy_out[5] if len(policy_out) > 5 else None
                     
                     new_log_probs = self.policy_module._compute_log_prob(
                         mini_actions, pred_mean, cov_factor, diag_std,
@@ -927,8 +923,8 @@ class ArnoldTrainer:
                         per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
 
                     # --- MoE load balancing ---
-                    if ctx.load_balance_weight > 0 and hasattr(self.policy_module, 'compute_load_balance_loss'):
-                        lb_loss = self.policy_module.compute_load_balance_loss()
+                    if ctx.load_balance_weight > 0 and forward_lb_loss is not None:
+                        lb_loss = forward_lb_loss.mean()
                         loss = loss + ctx.load_balance_weight * lb_loss
                         per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
 
@@ -968,18 +964,13 @@ class ArnoldTrainer:
             with torch.no_grad():
                 bs = ed["batch_size"]
                 diag_idx = np.arange(min(512, bs))
-                (
-                    diag_actions,
-                    diag_cov_factor,
-                    diag_diag_std,
-                    diag_values,
-                    diag_latent_std,
-                ) = self.policy(
+                diag_out = self.policy(
                     ed["states"][diag_idx],
                     ed["obs_signatures"],
                     ed["action_signatures"],
                     expert_name=expert_name,
                 )
+                diag_actions, diag_cov_factor, diag_diag_std, diag_values, diag_latent_std = diag_out[:5]
 
                 logstd_mean = diag_diag_std.log().mean().item()
                 logstd_min = diag_diag_std.log().min().item()

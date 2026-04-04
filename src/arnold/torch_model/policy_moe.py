@@ -103,8 +103,6 @@ class MoELatticePolicy(nn.Module):
         self.value_head.bias.data.zero_()
 
         self.profiler = None
-        self.cached_gate_probs: Optional[torch.Tensor] = None
-        self.cached_top_k_indices: Optional[torch.Tensor] = None
 
     def enable_profiling(self, profiler) -> None:
         self.profiler = profiler
@@ -138,14 +136,11 @@ class MoELatticePolicy(nn.Module):
         expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
         """
         Returns:
-            mean: [batch, action_dim]
-            cov_factor: [batch, action_dim, latent_dim]
-            diag_std: [batch, action_dim]
-            value: [batch, 1] or None
-            latent_std: [latent_dim] or None
+            mean, cov_factor, diag_std, value, latent_std — как у других policy
+            load_balance_loss: [1] — Switch Transformer LB loss (MoE-specific)
         """
         obs_norm = self.obs_normalizer(obs_signatures, obs_timeseries)
         x = obs_norm[:, :, -1]  # [batch, state_dim] — последний timestep
@@ -162,10 +157,9 @@ class MoELatticePolicy(nn.Module):
         # Shared trunk
         h = self.shared_trunk(x) if self.shared_trunk is not None else x
 
-        # Gate routing (cache for load balance loss computation by trainer)
+        # Gate routing
         top_k_weights, top_k_indices, gate_probs = self._gate_forward(h)
-        self.cached_gate_probs = gate_probs
-        self.cached_top_k_indices = top_k_indices
+        load_balance_loss = self._compute_load_balance_loss(gate_probs, top_k_indices)
 
         # Sparse expert computation: each expert processes only its routed samples
         selected_means = h.new_zeros(batch_size, self.top_k, self.action_dim)
@@ -214,17 +208,7 @@ class MoELatticePolicy(nn.Module):
         if return_value:
             value = self.value_head(self.value_net(x))
 
-        return mean, cov_factor, diag_std, value, latent_std
-
-    def compute_load_balance_loss(self) -> torch.Tensor:
-        """Compute LB loss from cached gate state )."""
-        N = self.num_experts
-        # f_i: fraction of tokens where expert i is in top-k
-        one_hot = F.one_hot(self.cached_top_k_indices, N).float()  # [batch, top_k, N]
-        f = one_hot.sum(dim=1).mean(dim=0)  # [N]
-        # P_i: mean gate probability
-        P = self.cached_gate_probs.mean(dim=0)  # [N]
-        return (N * (f * P).sum()).unsqueeze(0)
+        return mean, cov_factor, diag_std, value, latent_std, load_balance_loss
 
     def get_gate_stats(self, h: torch.Tensor) -> dict:
         """Gate diagnostics: per-expert routing fractions and probabilities."""
@@ -250,7 +234,7 @@ class MoELatticePolicy(nn.Module):
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        mean, cov_factor, diag_std, value, _ = self.forward(
+        mean, cov_factor, diag_std, value, _, _lb = self.forward(
             obs_timeseries, obs_signatures, action_signatures,
             expert_name=expert_name,
             return_std=return_std,
