@@ -134,11 +134,10 @@ class MoELatticePolicy(nn.Module):
         top_k_indices: torch.Tensor,
         gate_probs: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute LB loss from cached gate state )."""
+        """Compute LB loss from cached gate state."""
         N = self.num_experts
-        # f_i: fraction of tokens where expert i is in top-k
-        one_hot = F.one_hot(top_k_indices, N).float()  # [batch, top_k, N]
-        f = one_hot.sum(dim=1).mean(dim=0)  # [N]
+        flat_indices = top_k_indices.view(-1)
+        f = torch.bincount(flat_indices, minlength=N).float() / flat_indices.numel()
         # P_i: mean gate probability
         P = gate_probs.mean(dim=0)  # [N]
         return (N * (f * P).sum()).unsqueeze(0)
@@ -176,20 +175,28 @@ class MoELatticePolicy(nn.Module):
         top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
         load_balance_loss = self.compute_load_balance_loss(top_k_indices, gate_probs)
 
-        # Sparse expert computation: each expert processes only its routed samples
-        selected_means = h.new_zeros(batch_size, self.top_k, self.action_dim)
-        for k in range(self.top_k):
-            slot_indices = top_k_indices[:, k]  # [batch] — expert index for this slot
-            for i in range(self.num_experts):
-                mask = slot_indices == i
-                if not mask.any():
-                    continue
-                e_out = self.expert_nets[i](h[mask])
-                selected_means[mask, k] = self.expert_heads[i](e_out)
+        # Sparse expert computation
+        flat_indices = top_k_indices.view(-1)
+        flat_h = h.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, h.size(-1))
+        
+        flat_out = torch.zeros(
+            batch_size * self.top_k, self.action_dim,
+            dtype=h.dtype, device=h.device
+        )
 
-        # Weighted sum
-        w = top_k_weights.unsqueeze(-1)  # [batch, top_k, 1]
-        mean = (selected_means * w).sum(dim=1)  # [batch, action_dim]
+        for i in range(self.num_experts):
+            idx = (flat_indices == i).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+                
+            e_out = self.expert_nets[i](flat_h[idx])
+            expert_out = self.expert_heads[i](e_out)
+            flat_out.index_add_(0, idx, expert_out)
+
+        selected_means = flat_out.view(batch_size, self.top_k, self.action_dim)
+
+        w = top_k_weights.unsqueeze(-1)
+        mean = (selected_means * w).sum(dim=1)
 
         cov_factor = None
         diag_std = None
@@ -203,17 +210,17 @@ class MoELatticePolicy(nn.Module):
             all_W = torch.stack([head.weight for head in self.expert_heads])
 
             if self.lattice_mode == "weighted":
-                # Gather top-k W matrices and do weighted sum
-                # top_k_indices: [batch, top_k]
-                idx_W = top_k_indices.unsqueeze(-1).unsqueeze(-1).expand(
-                    -1, -1, self.action_dim, self.latent_dim,
-                )  # [batch, top_k, action_dim, latent_dim]
-                all_W_expanded = all_W.unsqueeze(0).expand(batch_size, -1, -1, -1)
-                selected_W = torch.gather(all_W_expanded, 1, idx_W)  # [batch, top_k, action_dim, latent_dim]
-                # Weighted sum: [batch, top_k, 1, 1] * [batch, top_k, action_dim, latent_dim]
+                # ОПТИМИЗАЦИЯ: Advanced Indexing вместо дикого gather и expand
+                # all_W имеет размер [N, action_dim, latent_dim]
+                # top_k_indices имеет размер [batch, top_k]
+                # PyTorch сам возвращает тензор [batch, top_k, action_dim, latent_dim] !!!
+                selected_W = all_W[top_k_indices] 
+                
+                # Взвешенная сумма с бродкастингом
+                # [batch, top_k, 1, 1] * [batch, top_k, action_dim, latent_dim] -> sum(dim=1)
                 W_combined = (selected_W * top_k_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
             else:
-                # max_score: W от top-1 эксперта
+                # max_score: W от top-1 эксперта (Тут Advanced Indexing тоже работает как часы)
                 top1_idx = top_k_indices[:, 0]  # [batch]
                 W_combined = all_W[top1_idx]  # [batch, action_dim, latent_dim]
 
