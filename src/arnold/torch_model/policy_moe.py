@@ -1,20 +1,31 @@
 """
-MoE-Lattice Policy — Mixture of Experts с low-rank ковариацией.
+MoE-Lattice Policy — Shared Expert + N Routed Experts, Low-Rank Covariance.
 
 Архитектура:
-  obs → normalizer → shared_trunk (configurable MLP layers)
-                          ↓
-        gate(h) → top-k softmax weights
-        expert_1(h) ──┐
-        expert_2(h) ──┼── weighted sum → action_mean
-        expert_N(h) ──┘
-                          ↓
-        Lattice(action_mean, W_lattice, log_std) → LowRankMultivariateNormal
+  obs → normalizer → shared_trunk(h)
+                         ↓
+        ┌────────────────┴─────────────────────────────────────────────────────────┐
+        │  Shared Expert (всегда активен)       │  Routing (top-k из N)            │
+        │  net(h) → latent [B, shared_latent]   │  gate(h) → weights               │
+        │  head(latent) → shared_mean [B, A]    │  expert_i(h) → route_mean [B, A] │
+        └────────────────┬─────────────────────────────────────────────────────────┘
+                         ↓
+          mean = α·shared_mean + (1-α)·routed_mean
+                         ↓
+          cov_factor = shared_head.weight * latent_std
+                       [A, shared_latent] — ОДИН тензор, без per-sample аггрегации
+                         ↓
+          LowRankMultivariateNormal(mean, cov_factor, diag_std²)
 
-Soft routing (top-k из N экспертов). Load balancing loss для предотвращения коллапса.
-Lattice weight aggregation: weighted (взвешенная сумма W) или max_score (W от top-1 эксперта).
-
-Single-expert only (как LatticePolicy). Multi-expert через Arnold trainer не поддерживается.
+Параметры:
+  shared_units        — слои shared_trunk (общий для обоих путей), по умолчанию (2048,1536,1024)
+  shared_expert_units — слои shared expert body, последний = shared_latent_dim (default (256,64))
+  num_experts         — размер пула routing-экспертов (default 5)
+  top_k               — сколько routing-экспертов активировать (default 1 → 1/5 пула)
+  expert_units        — слои каждого routing-эксперта, default (512,512)
+  gate_units          — слои gate network, default (512,256)
+  alpha               — вес shared expert в итоговом mean (default 0.3), routing = 1-alpha
+  load_balance_weight — вес Switch Transformer LB loss (default 0.01)
 """
 
 import torch
@@ -24,41 +35,58 @@ from torch.distributions import LowRankMultivariateNormal
 from typing import List, Tuple, Optional
 
 from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-
 from arnold.torch_model.mlp import MLP
 from arnold.torch_model.normalization import SignatureNormalizerModule
+from arnold.profiler import Profiler
 
+
+# ---------------------------------------------------------------------------
+#  MoELatticePolicy
+# ---------------------------------------------------------------------------
 
 class MoELatticePolicy(nn.Module):
+    """
+    Shared Expert + N Routed Experts MoE Policy с low-rank ковариацией.
+
+    Ковариация строится ТОЛЬКО из весов головы shared expert:
+        cov_factor = shared_expert_head.weight * latent_std
+        shape:       [action_dim, shared_latent_dim]  (expand→batch без per-sample аггрегации)
+
+    Профилирование:
+        self.profiler — Profiler (time + mem), настраивается через set_profiler()
+    """
 
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
-        num_experts: int = 5,
-        top_k: int = 2,
         shared_units: Tuple[int, ...] = (2048, 1536, 1024),
+        shared_expert_units: Tuple[int, ...] = (256, 64),  # последний = shared_latent_dim
+        num_experts: int = 5,
+        top_k: int = 1,
         expert_units: Tuple[int, ...] = (512, 512),
         gate_units: Tuple[int, ...] = (512, 256),
-        activation: str = "silu",
-        lattice_mode: str = "weighted",  # "weighted" | "max_score"
+        alpha: float = 0.3,                # вес shared expert в mean
         load_balance_weight: float = 0.01,
         fix_std: bool = False,
         log_std_init: float = 0.0,
         min_diag_std: float = 1e-4,
+        activation: str = "silu",
     ):
         super().__init__()
+
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.num_experts = num_experts
         self.top_k = top_k
-        self.lattice_mode = lattice_mode
+        self.alpha = alpha
         self.load_balance_weight = load_balance_weight
         self.min_diag_std = min_diag_std
 
+        # ── Normalizer ────────────────────────────────────────────────
         self.obs_normalizer = SignatureNormalizerModule()
 
-        # Shared trunk (может быть пустым если shared_units = ())
+        # ── Shared trunk ─────────────────────────────────────────────
         if shared_units:
             self.shared_trunk = MLP(state_dim, shared_units, activation)
             trunk_out_dim = shared_units[-1]
@@ -66,67 +94,85 @@ class MoELatticePolicy(nn.Module):
             self.shared_trunk = None
             trunk_out_dim = state_dim
 
-        # Expert networks: каждый expert = MLP → Linear(action_dim)
-        expert_out_dim = expert_units[-1] if expert_units else trunk_out_dim
-        self.latent_dim = expert_out_dim
+        # ── Shared expert ─────────────────────────────────────────────
+        if not shared_expert_units:
+            raise ValueError(
+                "shared_expert_units не может быть пустым "
+                "(нужен хотя бы один элемент)"
+            )
+
+        self.shared_latent_dim = shared_expert_units[-1]
+
+        self.shared_expert_net = MLP(trunk_out_dim, shared_expert_units, activation)
+        # Голова: [action_dim × shared_latent_dim] — её ВЕСА используются для ковариации
+        self.shared_expert_head = nn.Linear(self.shared_latent_dim, action_dim)
+        self.shared_expert_head.weight.data.mul_(0.1)
+        self.shared_expert_head.bias.data.zero_()
+
+        # ── Routing experts ───────────────────────────────────────────
+        if not expert_units:
+            raise ValueError("expert_units не может быть пустым")
+
+        expert_latent_dim = expert_units[-1]
 
         self.expert_nets = nn.ModuleList()
         self.expert_heads = nn.ModuleList()
         for _ in range(num_experts):
-            if expert_units:
-                net = MLP(trunk_out_dim, expert_units, activation)
-            else:
-                net = nn.Identity()
-            head = nn.Linear(expert_out_dim, action_dim)
+            net = MLP(trunk_out_dim, expert_units, activation)
+            head = nn.Linear(expert_latent_dim, action_dim)
             head.weight.data.mul_(0.1)
             head.bias.data.zero_()
             self.expert_nets.append(net)
             self.expert_heads.append(head)
 
-        # Gate network
+        # ── Gate network ─────────────────────────────────────────────
         self.gate = nn.Sequential(
             MLP(trunk_out_dim, gate_units, activation),
             nn.Linear(gate_units[-1], num_experts),
         )
 
-        # Lattice: log_std = [action_dim (diagonal) + latent_dim (low-rank)]
+        # ── Std parameters ────────────────────────────────────────────
+        # [action_dim (diagonal) + shared_latent_dim (low-rank cov)]
         self.log_std = nn.Parameter(
-            torch.ones(1, action_dim + self.latent_dim) * log_std_init,
+            torch.ones(1, action_dim + self.shared_latent_dim) * log_std_init,
             requires_grad=not fix_std,
         )
 
-        # Value network (отдельный от MoE)
+        # ── Value network (отдельный от MoE) ─────────────────────────
         value_units = shared_units + expert_units if shared_units else expert_units
         self.value_net = MLP(state_dim, value_units, activation)
         self.value_head = nn.Linear(value_units[-1], 1)
         self.value_head.weight.data.mul_(0.1)
         self.value_head.bias.data.zero_()
 
-        self.profiler = None
+        # ── Profiler ──────────────────────────────────────────────────
+        self.profiler = Profiler()
 
-    def enable_profiling(self, profiler) -> None:
+    # ------------------------------------------------------------------
+    #  Profiler management
+    # ------------------------------------------------------------------
+
+    def set_profiler(self, profiler: Profiler) -> None:
         self.profiler = profiler
 
-    def disable_profiling(self) -> None:
-        self.profiler = None
+    # ------------------------------------------------------------------
+    #  Gate
+    # ------------------------------------------------------------------
 
     def gate_forward(self, h: torch.Tensor):
         """
         Gate → top-k routing.
 
         Returns:
-            top_k_weights: [batch, top_k] — normalized weights for selected experts
-            top_k_indices: [batch, top_k] — indices of selected experts
-            gate_probs: [batch, num_experts] — full softmax (for load balancing)
+            top_k_weights : [batch, top_k] — нормированные веса выбранных экспертов
+            top_k_indices : [batch, top_k] — индексы выбранных экспертов
+            gate_probs    : [batch, num_experts] — полный softmax (для LB loss)
         """
         logits = self.gate(h)
         gate_probs = F.softmax(logits, dim=-1)
-
         top_k_vals, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
-        top_k_indices = top_k_indices.long()  # one_hot requires LongTensor (bfloat16 autocast)
-        # Renormalize top-k weights to sum to 1
+        top_k_indices = top_k_indices.long()
         top_k_weights = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
-
         return top_k_weights, top_k_indices, gate_probs
 
     def compute_load_balance_loss(
@@ -134,13 +180,16 @@ class MoELatticePolicy(nn.Module):
         top_k_indices: torch.Tensor,
         gate_probs: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute LB loss from cached gate state."""
+        """Switch Transformer LB loss."""
         N = self.num_experts
-        flat_indices = top_k_indices.view(-1)
-        f = torch.bincount(flat_indices, minlength=N).float() / flat_indices.numel()
-        # P_i: mean gate probability
-        P = gate_probs.mean(dim=0)  # [N]
+        flat = top_k_indices.view(-1)
+        f = torch.bincount(flat, minlength=N).float() / flat.numel()
+        P = gate_probs.mean(dim=0)
         return (N * (f * P).sum()).unsqueeze(0)
+
+    # ------------------------------------------------------------------
+    #  Forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -150,101 +199,124 @@ class MoELatticePolicy(nn.Module):
         expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,           # mean          [batch, action_dim]
+        Optional[torch.Tensor], # cov_factor    [batch, action_dim, shared_latent_dim]
+        Optional[torch.Tensor], # diag_std      [batch, action_dim]
+        Optional[torch.Tensor], # value         [batch, 1]
+        Optional[torch.Tensor], # latent_std    [shared_latent_dim]
+        torch.Tensor,           # load_balance_loss [1]
+    ]:
         """
         Returns:
-            mean, cov_factor, diag_std, value, latent_std — как у других policy
-            load_balance_loss: [1] — Switch Transformer LB loss (MoE-specific)
+            mean, cov_factor, diag_std, value, latent_std, load_balance_loss
         """
-        obs_norm = self.obs_normalizer(obs_signatures, obs_timeseries)
-        x = obs_norm[:, :, -1]  # [batch, state_dim] — последний timestep
-        batch_size = x.shape[0]
+        p = self.profiler
+
+        # ── Normalizer ───────────────────────────────────────────────
+        with p.section("normalizer"):
+            obs_norm = self.obs_normalizer(obs_signatures, obs_timeseries)
+            x = obs_norm[:, :, -1]    # [batch, state_dim] — последний timestep
+            batch_size = x.shape[0]
 
         if x.shape[1] != self.state_dim:
             raise RuntimeError(
                 f"MoE state_dim mismatch: policy expects {self.state_dim}, "
                 f"got obs with {x.shape[1]} elements "
-                f"(obs_timeseries shape={obs_timeseries.shape}, "
+                f"(obs_timeseries.shape={obs_timeseries.shape}, "
                 f"n_signatures={len(obs_signatures)})"
             )
 
-        # Shared trunk
-        h = self.shared_trunk(x) if self.shared_trunk is not None else x
+        # ── 1. Shared trunk ──────────────────────────────────────────
+        with p.section("shared_trunk"):
+            h = self.shared_trunk(x) if self.shared_trunk is not None else x
 
-        # Gate routing
-        top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
-        load_balance_loss = self.compute_load_balance_loss(top_k_indices, gate_probs)
+        # ── 2. Shared expert ─────────────────────────────────────────
+        with p.section("shared_expert"):
+            e_shared = self.shared_expert_net(h)            # [batch, shared_latent_dim]
+            shared_mean = self.shared_expert_head(e_shared) # [batch, action_dim]
 
-        # Sparse expert computation
+        # ── 3. Gate routing ──────────────────────────────────────────
+        with p.section("gate_forward"):
+            top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
+            load_balance_loss = self.compute_load_balance_loss(top_k_indices, gate_probs)
+
+        # ── 4. Routing experts (sparse) ──────────────────────────────
         flat_indices = top_k_indices.view(-1)
         flat_h = h.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, h.size(-1))
-        
-        flat_out = torch.zeros(
+        flat_route_out = torch.zeros(
             batch_size * self.top_k, self.action_dim,
-            dtype=h.dtype, device=h.device
+            dtype=h.dtype, device=h.device,
         )
 
-        for i in range(self.num_experts):
-            idx = (flat_indices == i).nonzero(as_tuple=True)[0]
-            if idx.numel() == 0:
-                continue
-                
-            e_out = self.expert_nets[i](flat_h[idx])
-            expert_out = self.expert_heads[i](e_out)
-            flat_out.index_add_(0, idx, expert_out)
+        with p.section("routing_experts"):
+            for i in range(self.num_experts):
+                idx = (flat_indices == i).nonzero(as_tuple=True)[0]
+                if idx.numel() == 0:
+                    continue
+                e_out = self.expert_nets[i](flat_h[idx])
+                flat_route_out.index_add_(0, idx, self.expert_heads[i](e_out))
 
-        selected_means = flat_out.view(batch_size, self.top_k, self.action_dim)
+        # ── 5. Combine shared + routed → mean ────────────────────────
+        with p.section("mean_combine"):
+            route_means = flat_route_out.view(batch_size, self.top_k, self.action_dim)
+            routed_mean = (route_means * top_k_weights.unsqueeze(-1)).sum(dim=1)
+            mean = self.alpha * shared_mean + (1.0 - self.alpha) * routed_mean
 
-        w = top_k_weights.unsqueeze(-1)
-        mean = (selected_means * w).sum(dim=1)
+        # Кеш норм для диагностики (detach, без влияния на граф)
+        with torch.no_grad():
+            s_norm = shared_mean.detach().norm(dim=-1).mean().item()
+            r_norm = routed_mean.detach().norm(dim=-1).mean().item()
+            s_contrib = self.alpha * s_norm
+            r_contrib = (1.0 - self.alpha) * r_norm
+            total = s_contrib + r_contrib + 1e-8
+            self._expert_mean_stats = {
+                "shared_norm": s_norm,
+                "routed_norm": r_norm,
+                "shared_frac": s_contrib / total,
+            }
 
+        # ── 6. Covariance from shared expert head weight ──────────────
         cov_factor = None
         diag_std = None
         latent_std = None
         if return_std:
-            std = F.softplus(self.log_std) + self.min_diag_std
-            diag_std = std[:, :self.action_dim].expand(batch_size, -1)
-            latent_std = std[:, self.action_dim:].squeeze(0)  # [latent_dim]
+            with p.section("cov_factor"):
+                std = F.softplus(self.log_std) + self.min_diag_std
+                diag_std = std[:, :self.action_dim].expand(batch_size, -1)
+                latent_std = std[:, self.action_dim:].squeeze(0)
+                W = self.shared_expert_head.weight
+                cov_factor = (W * latent_std.unsqueeze(0)).unsqueeze(0).expand(batch_size, -1, -1)
 
-            # Stack all expert W matrices: [num_experts, action_dim, latent_dim]
-            all_W = torch.stack([head.weight for head in self.expert_heads])
-
-            if self.lattice_mode == "weighted":
-                # ОПТИМИЗАЦИЯ: Advanced Indexing вместо дикого gather и expand
-                # all_W имеет размер [N, action_dim, latent_dim]
-                # top_k_indices имеет размер [batch, top_k]
-                # PyTorch сам возвращает тензор [batch, top_k, action_dim, latent_dim] !!!
-                selected_W = all_W[top_k_indices] 
-                
-                # Взвешенная сумма с бродкастингом
-                # [batch, top_k, 1, 1] * [batch, top_k, action_dim, latent_dim] -> sum(dim=1)
-                W_combined = (selected_W * top_k_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
-            else:
-                # max_score: W от top-1 эксперта (Тут Advanced Indexing тоже работает как часы)
-                top1_idx = top_k_indices[:, 0]  # [batch]
-                W_combined = all_W[top1_idx]  # [batch, action_dim, latent_dim]
-
-            cov_factor = W_combined * latent_std.unsqueeze(0).unsqueeze(0)
-
+        # ── 7. Value network ─────────────────────────────────────────
         value = None
         if return_value:
-            value = self.value_head(self.value_net(x))
+            with p.section("value_net"):
+                value = self.value_head(self.value_net(x))
 
         return mean, cov_factor, diag_std, value, latent_std, load_balance_loss
 
+    # ------------------------------------------------------------------
+    #  Gate diagnostics
+    # ------------------------------------------------------------------
+
     def get_gate_stats(self, h: torch.Tensor) -> dict:
-        """Gate diagnostics: per-expert routing fractions and probabilities."""
+        """Per-expert routing fractions, mean probabilities, gate entropy."""
         top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
         N = self.num_experts
         one_hot = F.one_hot(top_k_indices, N).float()
-        routing_fracs = one_hot.sum(dim=1).mean(dim=0)  # [N]
-        mean_probs = gate_probs.mean(dim=0)  # [N]
+        routing_fracs = one_hot.sum(dim=1).mean(dim=0)
+        mean_probs = gate_probs.mean(dim=0)
         gate_entropy = -(gate_probs * (gate_probs + 1e-8).log()).sum(dim=-1).mean()
         return {
             "routing_fracs": routing_fracs.detach(),
             "mean_probs": mean_probs.detach(),
             "gate_entropy": gate_entropy.item(),
         }
+
+    # ------------------------------------------------------------------
+    #  Action sampling
+    # ------------------------------------------------------------------
 
     def get_action(
         self,
@@ -256,6 +328,8 @@ class MoELatticePolicy(nn.Module):
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        p = self.profiler
+
         mean, cov_factor, diag_std, value, _, _lb = self.forward(
             obs_timeseries, obs_signatures, action_signatures,
             expert_name=expert_name,
@@ -269,49 +343,38 @@ class MoELatticePolicy(nn.Module):
         else:
             if cov_factor is None:
                 raise ValueError("return_std=False допустим только при deterministic=True")
-            dist = self._build_action_dist(mean, cov_factor, diag_std)
-            action = dist.rsample()
-            log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
+            with p.section("dist_build"):
+                dist = self.build_action_dist(mean, cov_factor, diag_std)
+            with p.section("dist_sample"):
+                action = dist.rsample()
+                log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
 
         return action, log_prob, value
 
-    def _build_action_dist(
+    # ------------------------------------------------------------------
+    #  Distribution helpers
+    # ------------------------------------------------------------------
+
+    def build_action_dist(
         self,
         mean: torch.Tensor,
         cov_factor: torch.Tensor,
         diag_std: torch.Tensor,
     ) -> LowRankMultivariateNormal:
+        p = self.profiler
         device = mean.device
         device_type = "cuda" if device.type == "cuda" else "cpu"
-        autocast = torch.autocast(device_type=device_type, enabled=False)
 
-        with autocast:
-            mean_f = mean.float()
-            cov_factor_f = cov_factor.float()
-            diag_std_f = diag_std.float()
-            cov_diag = diag_std_f.pow(2) + 1e-6
+        with torch.autocast(device_type=device_type, enabled=False):
+            with p.section("cast to float32"):
+                mean_f = mean.float()
+                cov_factor_f = cov_factor.float()
+                diag_std_f = diag_std.float()
+                cov_diag = diag_std_f.pow(2) + 1e-6
 
-            return LowRankMultivariateNormal(
-                loc=mean_f,
-                cov_factor=cov_factor_f,
-                cov_diag=cov_diag,
-            )
-
-    def _compute_entropy(
-        self,
-        mean: torch.Tensor,
-        cov_factor: torch.Tensor,
-        diag_std: torch.Tensor,
-    ) -> torch.Tensor:
-        dist = self._build_action_dist(mean, cov_factor, diag_std)
-        return dist.entropy().mean()
-
-    def _compute_log_prob(
-        self,
-        actions: torch.Tensor,
-        mean: torch.Tensor,
-        cov_factor: torch.Tensor,
-        diag_std: torch.Tensor,
-    ) -> torch.Tensor:
-        dist = self._build_action_dist(mean, cov_factor, diag_std)
-        return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)
+            with p.section("LowRankMultivariateNormal"):
+                return LowRankMultivariateNormal(
+                    loc=mean_f,
+                    cov_factor=cov_factor_f,
+                    cov_diag=cov_diag,
+                )

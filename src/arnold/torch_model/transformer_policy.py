@@ -29,14 +29,13 @@ from typing import Any, List, Dict, Optional, Tuple, Union
 import logging
 
 from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
 from arnold.torch_model.normalization import SignatureNormalizerModule
 from arnold.torch_model.body_tokenizer import BodyTokenizer
 from arnold.torch_model.action_tokenizer import ActionTokenizer, GroupMuscleMap
 from arnold.action_parser import MuscleGrouping
 from arnold.observation_parser import BodyGroup
-from arnold.profiler import SamplingProfiler
+from arnold.profiler import Profiler
 
 logger = logging.getLogger(__name__)
 
@@ -486,7 +485,8 @@ class TransformerPolicy(nn.Module):
         else:
             self.action_factor_head = None
 
-        self.profiler: Optional[SamplingProfiler] = None
+        # ── Profiler ──────────────────────────────────────────────────
+        self.profiler = Profiler()
 
         self._init_weights()
 
@@ -500,11 +500,12 @@ class TransformerPolicy(nn.Module):
                 nn.init.orthogonal_(head.weight, gain=0.1)
                 nn.init.zeros_(head.bias)
 
-    def enable_profiling(self, profiler: SamplingProfiler) -> None:
-        self.profiler = profiler
+    # ------------------------------------------------------------------
+    #  Profiler management
+    # ------------------------------------------------------------------
 
-    def disable_profiling(self) -> None:
-        self.profiler = None
+    def set_profiler(self, profiler: Profiler) -> None:
+        self.profiler = profiler
 
     def _init_weights(self):
         for module in self.modules():
@@ -525,118 +526,101 @@ class TransformerPolicy(nn.Module):
         p = self.profiler
         batch_size = obs_timeseries.shape[0]
 
-        if p: p.tick("  normalizer")
-        obs_timeseries = self.obs_normalizer(obs_signatures, obs_timeseries)
-        if p: p.tock("  normalizer")
+        # ── Normalizer ───────────────────────────────────────────────
+        with p.section("normalizer"):
+            obs_timeseries = self.obs_normalizer(obs_signatures, obs_timeseries)
 
-        if p: p.tick("  body_tokenizer")
-        sensory_emb = self.body_tokenizer.encode(obs_timeseries, expert_name=expert_name)
-        if p: p.tock("  body_tokenizer")
+        # ── Body tokenizer ───────────────────────────────────────────
+        with p.section("body_tokenizer"):
+            sensory_emb = self.body_tokenizer.encode(obs_timeseries, expert_name=expert_name)
 
-        if p: p.tick("  vocab_embed_obs")
-        group_sigs = self.body_tokenizer.get_group_signatures(expert_name)
-        role_emb = self.vocab.get_embedding_batch(group_sigs)
-        role_emb = role_emb.unsqueeze(0).expand(batch_size, -1, -1)
-        sensory_emb = sensory_emb + role_emb
-        if p: p.tock("  vocab_embed_obs")
+        # ── Vocab embed obs ──────────────────────────────────────────
+        with p.section("vocab_embed_obs"):
+            group_sigs = self.body_tokenizer.get_group_signatures(expert_name)
+            role_emb = self.vocab.get_embedding_batch(group_sigs)
+            role_emb = role_emb.unsqueeze(0).expand(batch_size, -1, -1)
+            sensory_emb = sensory_emb + role_emb
 
-        if p: p.tick("  transformer_encoder")
-        encoder_out = self.encoder(sensory_emb)
-        if p: p.tock("  transformer_encoder")
+        # ── Transformer encoder ──────────────────────────────────────
+        with p.section("transformer_encoder"):
+            encoder_out = self.encoder(sensory_emb)
 
+        # ── Action decoder ───────────────────────────────────────────
         if self.action_tokenizer is not None:
-            # Granulated path: G group queries instead of A muscle queries
-            if p: p.tick("  vocab_embed_act_groups")
-            act_group_sigs = self.action_tokenizer.get_group_signatures(expert_name)
-            group_query = self.vocab.get_embedding_batch(act_group_sigs)
-            group_query = group_query.unsqueeze(0).expand(batch_size, -1, -1)
-            if p: p.tock("  vocab_embed_act_groups")
+            with p.section("vocab_embed_act_groups"):
+                act_group_sigs = self.action_tokenizer.get_group_signatures(expert_name)
+                group_query = self.vocab.get_embedding_batch(act_group_sigs)
+                group_query = group_query.unsqueeze(0).expand(batch_size, -1, -1)
 
             if self.hierarchical_decoder is not None:
-                # Hierarchical path: configurable layer stack
                 muscle_query = None
                 if self.hierarchical_decoder.has_within_group:
-                    if p: p.tick("  vocab_embed_muscles")
-                    muscle_sigs = self.action_tokenizer.get_muscle_signatures(expert_name)
-                    muscle_query = self.vocab.get_embedding_batch(muscle_sigs)
-                    muscle_query = muscle_query.unsqueeze(0).expand(batch_size, -1, -1)
-                    if p: p.tock("  vocab_embed_muscles")
+                    with p.section("vocab_embed_muscles"):
+                        muscle_sigs = self.action_tokenizer.get_muscle_signatures(expert_name)
+                        muscle_query = self.vocab.get_embedding_batch(muscle_sigs)
+                        muscle_query = muscle_query.unsqueeze(0).expand(batch_size, -1, -1)
 
-                if p: p.tick("  action_decoder")
-                gm_map = self.action_tokenizer.get_group_muscle_map(expert_name)
-                group_out, muscle_out = self.hierarchical_decoder(
-                    group_query,
-                    encoder_out,
-                    muscle_query,
-                    gm_map,
-                )
-                if p: p.tock("  action_decoder")
+                with p.section("action_decoder"):
+                    gm_map = self.action_tokenizer.get_group_muscle_map(expert_name)
+                    group_out, muscle_out = self.hierarchical_decoder(
+                        group_query, encoder_out, muscle_query, gm_map,
+                    )
 
                 if muscle_out is not None:
-                    # within_group слои были — muscle_out в grouped order, reorder
-                    if p: p.tick("  action_tokenizer")
-                    reorder_idx = getattr(self.action_tokenizer, f"reorder_idx_{expert_name}")
-                    D = muscle_out.shape[-1]
-                    action_out = torch.gather(
-                        muscle_out, 1,
-                        reorder_idx.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, D),
-                    )
-                    mean = self.action_mean_head(action_out).squeeze(-1)
-                    if p: p.tock("  action_tokenizer")
+                    with p.section("action_tokenizer"):
+                        reorder_idx = getattr(self.action_tokenizer, f"reorder_idx_{expert_name}")
+                        D = muscle_out.shape[-1]
+                        action_out = torch.gather(
+                            muscle_out, 1,
+                            reorder_idx.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, D),
+                        )
+                        mean = self.action_mean_head(action_out).squeeze(-1)
                 else:
-                    # Только group_to_group слои — fallback на expand_heads
-                    if p: p.tick("  action_tokenizer")
-                    mean, action_out = self.action_tokenizer.decode(group_out, expert_name)
-                    if p: p.tock("  action_tokenizer")
+                    with p.section("action_tokenizer"):
+                        mean, action_out = self.action_tokenizer.decode(group_out, expert_name)
             else:
-                # Legacy path: uniform nn.TransformerDecoder
-                if p: p.tick("  action_decoder")
-                group_out = self.action_decoder(group_query, encoder_out)
-                if p: p.tock("  action_decoder")
-
-                if p: p.tick("  action_tokenizer")
-                mean, action_out = self.action_tokenizer.decode(group_out, expert_name)
-                if p: p.tock("  action_tokenizer")
+                with p.section("action_decoder"):
+                    group_out = self.action_decoder(group_query, encoder_out)
+                with p.section("action_tokenizer"):
+                    mean, action_out = self.action_tokenizer.decode(group_out, expert_name)
         else:
-            # Original path: per-muscle queries
-            if p: p.tick("  vocab_embed_act")
-            action_query = self.vocab.get_embedding_batch(action_signatures)
-            action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)
-            if p: p.tock("  vocab_embed_act")
+            with p.section("vocab_embed_act"):
+                action_query = self.vocab.get_embedding_batch(action_signatures)
+                action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)
+            with p.section("action_decoder"):
+                action_out = self.action_decoder(action_query, encoder_out)
+                mean = self.action_mean_head(action_out).squeeze(-1)
 
-            if p: p.tick("  action_decoder")
-            action_out = self.action_decoder(action_query, encoder_out)
-            mean = self.action_mean_head(action_out).squeeze(-1)
-            if p: p.tock("  action_decoder")
-
+        # ── Covariance ───────────────────────────────────────────────
         cov_factor = None
         diag_std = None
         latent_std = None
         if return_std:
-            num_actions = action_out.shape[1]
-            std = torch.nn.functional.softplus(self.log_std) + self.min_diag_std
-            diag_std = std[:, :num_actions].expand(batch_size, -1)
+            with p.section("cov_factor"):
+                num_actions = action_out.shape[1]
+                std = torch.nn.functional.softplus(self.log_std) + self.min_diag_std
+                diag_std = std[:, :num_actions].expand(batch_size, -1)
 
-            if self.latent_dim == 0:
-                cov_factor = torch.zeros(batch_size, num_actions, 1, device=mean.device, dtype=mean.dtype)
-            else:
-                latent_std = std[:, self.max_action_dim: self.max_action_dim + self.latent_dim].squeeze(0)
-
-                if self.cov_mode == "action_out":
-                    cov_factor = action_out * latent_std.unsqueeze(0).unsqueeze(0)
-                    cov_factor = cov_factor / (self.latent_dim ** 0.5)
+                if self.latent_dim == 0:
+                    cov_factor = torch.zeros(batch_size, num_actions, 1, device=mean.device, dtype=mean.dtype)
                 else:
-                    W = self.action_factor_head(action_out)
-                    cov_factor = W * latent_std.unsqueeze(0).unsqueeze(0)
+                    latent_std = std[:, self.max_action_dim: self.max_action_dim + self.latent_dim].squeeze(0)
 
+                    if self.cov_mode == "action_out":
+                        cov_factor = action_out * latent_std.unsqueeze(0).unsqueeze(0)
+                        cov_factor = cov_factor / (self.latent_dim ** 0.5)
+                    else:
+                        W = self.action_factor_head(action_out)
+                        cov_factor = W * latent_std.unsqueeze(0).unsqueeze(0)
+
+        # ── Value decoder ────────────────────────────────────────────
         value = None
         if return_value:
-            if p: p.tick("  value_decoder")
-            value_query = self.value_query.expand(batch_size, -1, -1)
-            value_encoder_out = encoder_out.detach() if self.detached_value_encoder else encoder_out
-            value_out = self.value_decoder(value_query, value_encoder_out)
-            value = self.value_head(value_out).squeeze(-1)
-            if p: p.tock("  value_decoder")
+            with p.section("value_decoder"):
+                value_query = self.value_query.expand(batch_size, -1, -1)
+                value_encoder_out = encoder_out.detach() if self.detached_value_encoder else encoder_out
+                value_out = self.value_decoder(value_query, value_encoder_out)
+                value = self.value_head(value_out).squeeze(-1)
 
         return mean, cov_factor, diag_std, value, latent_std
 
@@ -650,10 +634,10 @@ class TransformerPolicy(nn.Module):
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        p = self.profiler
+
         mean, cov_factor, diag_std, value, _ = self.forward(
-            obs_timeseries,
-            obs_signatures,
-            action_signatures,
+            obs_timeseries, obs_signatures, action_signatures,
             expert_name=expert_name,
             return_std=return_std,
             return_value=return_value,
@@ -665,66 +649,38 @@ class TransformerPolicy(nn.Module):
         else:
             if cov_factor is None:
                 raise ValueError("return_std=False допустим только при deterministic=True")
-            dist = self._build_action_dist(mean, cov_factor, diag_std)
-            action = dist.rsample()
-            log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
+            with p.section("dist_build"):
+                dist = self.build_action_dist(mean, cov_factor, diag_std)
+            with p.section("dist_sample"):
+                action = dist.rsample()
+                log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
 
         return action, log_prob, value
 
-    def get_log_prob(
-        self,
-        obs_timeseries: torch.Tensor,
-        obs_signatures: List[Tuple[str, ...]],
-        action_signatures: List[Tuple[str, ...]],
-        actions: torch.Tensor,
-        expert_name: Optional[str] = None,
-    ) -> torch.Tensor:
-        mean, cov_factor, diag_std, value, _ = self.forward(
-            obs_timeseries,
-            obs_signatures,
-            action_signatures,
-            expert_name=expert_name or "",
-        )
-        return self._compute_log_prob(actions, mean, cov_factor, diag_std)
+    # ------------------------------------------------------------------
+    #  Distribution helpers
+    # ------------------------------------------------------------------
 
-    def _build_action_dist(
+    def build_action_dist(
         self,
         mean: torch.Tensor,
         cov_factor: torch.Tensor,
         diag_std: torch.Tensor,
     ) -> LowRankMultivariateNormal:
-        """diag_std уже готовый: σ = softplus(log_std) + min."""
+        p = self.profiler
         device = mean.device
         device_type = "cuda" if device.type == "cuda" else "cpu"
-        autocast = torch.autocast(device_type=device_type, enabled=False)
 
-        with autocast:
-            mean_f = mean.float()
-            cov_factor_f = cov_factor.float()
-            diag_std_f = diag_std.float()
-            cov_diag = diag_std_f.pow(2) + 1e-6
+        with torch.autocast(device_type=device_type, enabled=False):
+            with p.section("cast to float32"):
+                mean_f = mean.float()
+                cov_factor_f = cov_factor.float()
+                diag_std_f = diag_std.float()
+                cov_diag = diag_std_f.pow(2) + 1e-6
 
-            return LowRankMultivariateNormal(
-                loc=mean_f,
-                cov_factor=cov_factor_f,
-                cov_diag=cov_diag,
-            )
-
-    def _compute_entropy(
-        self,
-        mean: torch.Tensor,
-        cov_factor: torch.Tensor,
-        diag_std: torch.Tensor,
-    ) -> torch.Tensor:
-        dist = self._build_action_dist(mean, cov_factor, diag_std)
-        return dist.entropy().mean()
-
-    def _compute_log_prob(
-        self,
-        actions: torch.Tensor,
-        mean: torch.Tensor,
-        cov_factor: torch.Tensor,
-        diag_std: torch.Tensor,
-    ) -> torch.Tensor:
-        dist = self._build_action_dist(mean, cov_factor, diag_std)
-        return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)
+            with p.section("LowRankMultivariateNormal"):
+                return LowRankMultivariateNormal(
+                    loc=mean_f,
+                    cov_factor=cov_factor_f,
+                    cov_diag=cov_diag,
+                )

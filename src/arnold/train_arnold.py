@@ -110,12 +110,8 @@ def main(cfg: DictConfig) -> None:
         mode_str = f"MULTI-EXPERT ({', '.join(expert_names)})"
     elif len(expert_names) == 1:
         entry = list(experts_cfg.values())[0]
-        ppo_w = entry.get("learning", {}).get("ppo_weight", cfg.learning.ppo_weight)
-        im_w = entry.get("learning", {}).get("imitation_weight", cfg.learning.imitation_weight)
-        if ppo_w is None:
-            ppo_w = cfg.learning.ppo_weight
-        if im_w is None:
-            im_w = cfg.learning.imitation_weight
+        ppo_w = entry.learning.ppo_weight
+        im_w = entry.learning.imitation_weight
         if im_w > 0 and ppo_w > 0:
             mode_str = "OBC-PPO"
         elif im_w > 0:

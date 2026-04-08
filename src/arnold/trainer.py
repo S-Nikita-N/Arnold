@@ -23,7 +23,6 @@ import math
 import time
 import random
 import logging
-import contextlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -45,7 +44,8 @@ from arnold.memory import OBCMemory, OBCBatch
 from arnold.logger import OBCLogger
 from arnold.wandb_logger import WandbLogger
 from arnold.learning_utils import to_test, to_cpu, optimizer_to
-from arnold.profiler import SamplingProfiler
+from arnold.profiler import Profiler
+from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
 
 warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
 
@@ -237,7 +237,10 @@ class ArnoldTrainer:
         self.mp_done = fork_ctx.Event()
 
         # Per-expert profiler reports (заполняется на epoch 0)
-        self.profiler_reports: Dict[str, SamplingProfiler] = {}
+        self.profiler_reports: Dict[str, Profiler] = {}
+
+        # Memory profiler report — собирается в update_params, печатается в log_train
+        self._mem_profile_report: Optional[str] = None
 
         # ==================== Setup ====================
         self.setup_experts()
@@ -462,7 +465,7 @@ class ArnoldTrainer:
         )
 
     def _setup_moe_policy(self) -> None:
-        """MoE-Lattice Policy — Mixture of Experts с low-rank covariance. Только single-expert."""
+        """MoE-Lattice Policy — Shared Expert + N Routed Experts, Low-Rank Covariance."""
         from arnold.torch_model.policy_moe import MoELatticePolicy
 
         if len(self.experts) > 1:
@@ -476,13 +479,21 @@ class ArnoldTrainer:
         state_dim = ctx.parser.n_obs_elements
         action_dim = ctx.wrapper.action_dim
 
-        logger.info(
-            f"MoE setup: state_dim={state_dim} (n_obs_elements from setup parser), "
-            f"obs_dim={ctx.wrapper.obs_dim} (raw env), action_dim={action_dim}"
-        )
+        moe_cfg = OmegaConf.to_container(self.cfg.learning.moe, resolve=True)
 
-        moe_cfg = OmegaConf.to_container(
-            self.cfg.learning.moe, resolve=True
+        shared_latent_dim = moe_cfg["shared_expert_units"][-1]
+        num_experts = moe_cfg["num_experts"]
+        top_k = moe_cfg["top_k"]
+        alpha = moe_cfg["alpha"]
+
+        logger.info(
+            f"MoE setup:\n"
+            f"  state_dim={state_dim}  action_dim={action_dim}\n"
+            f"  shared_latent_dim={shared_latent_dim}  "
+            f"alpha={alpha} (shared) / {1 - alpha:.2f} (routed)\n"
+            f"  routing: top_k={top_k}/{num_experts} experts  "
+            f"(~{top_k / num_experts:.0%} of pool per sample)\n"
+            f"  cov_factor: shared_head.weight [{action_dim}×{shared_latent_dim}] * latent_std"
         )
 
         self.policy = MoELatticePolicy(
@@ -532,8 +543,8 @@ class ArnoldTrainer:
 
         Результаты отправляются через queue. step_counter (shared) атомарно
         инкрементируется на каждом шаге — main process использует его для tqdm.
-        enable_profiler=True — worker создаёт SamplingProfiler и отправляет
-        его данные через queue (только один worker на эксперта, epoch 0).
+        enable_profiler=True — worker включает time profiling и отправляет
+        данные через queue (только один worker на эксперта, epoch 0).
         """
         self.seed_worker(pid)
 
@@ -545,9 +556,8 @@ class ArnoldTrainer:
         memory = OBCMemory()
         obc_logger = OBCLogger()
 
-        profiler = SamplingProfiler() if enable_profiler else None
-        if profiler is not None:
-            self.policy_module.enable_profiling(profiler)
+        if enable_profiler:
+            self.policy_module.profiler.time_enabled = True
 
         if not ctx.use_expert:
             zero_expert = torch.zeros(wrapper.action_dim, dtype=torch.float32)
@@ -557,46 +567,42 @@ class ArnoldTrainer:
                 obs, info = wrapper.reset()
                 worker_parser.reset(obs)
 
+                p = self.policy_module.profiler
                 for t in range(10000):
-                    if profiler: profiler.tick("parser.get_obs")
-                    obs_ts, obs_sigs = worker_parser.get_observation(torch.device("cpu"))
-                    act_sigs = worker_action_parser.action_signatures
-                    if profiler: profiler.tock("parser.get_obs")
+                    with p.section("parser.get_obs"):
+                        obs_ts, obs_sigs = worker_parser.get_observation(torch.device("cpu"))
+                        act_sigs = worker_action_parser.action_signatures
 
-                    if profiler: profiler.tick("policy.forward")
-                    with torch.no_grad():
-                        student_action, log_prob, value = self.policy_module.get_action(
-                            obs_ts, obs_sigs, act_sigs,
-                            expert_name=expert_name,
-                            deterministic=False,
-                        )
-                    if profiler: profiler.tock("policy.forward")
+                    with p.section("policy.forward"):
+                        with torch.no_grad():
+                            student_action, log_prob, value = self.policy_module.get_action(
+                                obs_ts, obs_sigs, act_sigs,
+                                expert_name=expert_name,
+                                deterministic=False,
+                            )
 
                     if ctx.use_expert:
-                        if profiler: profiler.tick("expert.get_action")
-                        expert_action = wrapper.get_expert_action(obs)
-                        expert_action_t = torch.from_numpy(expert_action).float()
-                        if profiler: profiler.tock("expert.get_action")
+                        with p.section("expert.get_action"):
+                            expert_action = wrapper.get_expert_action(obs)
+                            expert_action_t = torch.from_numpy(expert_action).float()
                     else:
                         expert_action_t = zero_expert
 
                     student_action_np = student_action.squeeze(0).cpu().numpy()
-                    if profiler: profiler.tick("env.step")
-                    next_obs, reward, terminated, truncated, info = wrapper.step(student_action_np)
-                    if profiler: profiler.tock("env.step")
+                    with p.section("env.step"):
+                        next_obs, reward, terminated, truncated, info = wrapper.step(student_action_np)
                     done = terminated or truncated
 
-                    if profiler: profiler.tick("memory.append")
-                    memory.states.append(obs_ts.squeeze(0).cpu())
-                    memory.obs_signatures.append(obs_sigs)
-                    memory.action_signatures.append(act_sigs)
-                    memory.student_actions.append(student_action.squeeze(0).cpu())
-                    memory.expert_actions.append(expert_action_t.cpu())
-                    memory.rewards.append(reward)
-                    memory.values.append(value.squeeze(0).cpu())
-                    memory.masks.append(0.0 if done else 1.0)
-                    memory.log_probs.append(log_prob.squeeze(0).cpu())
-                    if profiler: profiler.tock("memory.append")
+                    with p.section("memory.append"):
+                        memory.states.append(obs_ts.squeeze(0).cpu())
+                        memory.obs_signatures.append(obs_sigs)
+                        memory.action_signatures.append(act_sigs)
+                        memory.student_actions.append(student_action.squeeze(0).cpu())
+                        memory.expert_actions.append(expert_action_t.cpu())
+                        memory.rewards.append(reward)
+                        memory.values.append(value.squeeze(0).cpu())
+                        memory.masks.append(0.0 if done else 1.0)
+                        memory.log_probs.append(log_prob.squeeze(0).cpu())
 
                     obc_logger.step(
                         reward=reward,
@@ -610,9 +616,8 @@ class ArnoldTrainer:
                     if done:
                         break
 
-                    if profiler: profiler.tick("parser.update")
-                    worker_parser.update(next_obs)
-                    if profiler: profiler.tock("parser.update")
+                    with p.section("parser.update"):
+                        worker_parser.update(next_obs)
                     obs = next_obs
 
                 obc_logger.end_episode()
@@ -623,10 +628,9 @@ class ArnoldTrainer:
             traceback.print_exc()
 
         finally:
-            if profiler is not None:
-                self.policy_module.disable_profiling()
-
-            profiler_data = profiler.to_dict() if profiler is not None else None
+            p = self.policy_module.profiler
+            profiler_data = p.to_dict() if p.time_enabled else None
+            p.time_enabled = False
             queue.put([pid, expert_name, memory.to_transfer_dict(), obc_logger, profiler_data])
             mp_done.wait()
 
@@ -638,7 +642,7 @@ class ArnoldTrainer:
         эксперта). Main process только мониторит shared counters и обновляет
         N tqdm progress bars одновременно — без потери производительности.
 
-        На epoch 0 первый worker каждого эксперта включает SamplingProfiler
+        На epoch 0 первый worker каждого эксперта включает time profiling
         и передаёт результаты обратно — per-expert profiling.
 
         Returns:
@@ -733,7 +737,7 @@ class ArnoldTrainer:
                     per_expert_memories[w_expert].append(OBCMemory.from_transfer_dict(w_transfer))
                     per_expert_loggers[w_expert].append(w_logger)
                     if w_profiler_data is not None:
-                        self.profiler_reports[w_expert] = SamplingProfiler.from_dict(w_profiler_data)
+                        self.profiler_reports[w_expert] = Profiler.from_dict(w_profiler_data)
 
         self.mp_done.set()
         optimizer_to(self.optimizer, self.device)
@@ -764,12 +768,16 @@ class ArnoldTrainer:
     def update_params(
         self,
         expert_batches: Dict[str, OBCBatch],
+        debug_memory: bool = False,
     ) -> Dict[str, Dict[str, float]]:
         """
         Обновляет параметры policy.
 
         Mini-batches от разных экспертов interleaved в рамках каждого PPO epoch.
         Каждый mini-batch использует loss-веса своего эксперта.
+
+        debug_memory=True: профилирует потребление GPU-памяти первого mini-batch
+                           и печатает деревянный отчёт через logger.info.
 
         Returns:
             Dict[expert_name → diagnostics_dict]
@@ -812,6 +820,9 @@ class ArnoldTrainer:
 
         pbar = tqdm(total=total_updates, desc="Update", unit="batch")
 
+        # Memory profiling: включается на первый mini-batch, потом выключается
+        _mem_prof_done: bool = False
+
         for ppo_epoch in range(self.opt_num_epochs):
             # Строим interleaved расписание mini-batches
             schedule: List[Tuple[str, np.ndarray]] = []
@@ -833,6 +844,14 @@ class ArnoldTrainer:
                 ed = expert_data[expert_name]
                 ctx = ed["ctx"]
 
+                # Включаем memory profiling для первого mini-batch
+                _profile_this = debug_memory and not _mem_prof_done
+                prof = self.policy_module.profiler
+                if _profile_this:
+                    prof.device = self.device
+                    prof.mem_enabled = True
+                    prof.reset()
+
                 mini_states = ed["states"][batch_indices]
                 mini_actions = ed["actions"][batch_indices]
                 mini_returns = ed["returns"][batch_indices]
@@ -840,114 +859,130 @@ class ArnoldTrainer:
                 mini_fixed_lp = ed["fixed_log_probs"][batch_indices]
                 mini_old_values = ed["old_values"][batch_indices]
 
-                autocast_ctx = (
-                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                    if self.use_bfloat16 and self.device.type == "cuda"
-                    else contextlib.nullcontext()
-                )
+                use_autocast = self.use_bfloat16 and self.device.type == "cuda"
 
-                with autocast_ctx:
-                    policy_out = self.policy(
-                        mini_states,
-                        ed["obs_signatures"],
-                        ed["action_signatures"],
-                        expert_name=expert_name,
-                    )
-                    pred_mean, cov_factor, diag_std, values, latent_std = policy_out[:5]
-                    forward_lb_loss = policy_out[5] if len(policy_out) > 5 else None
-                    
-                    new_log_probs = self.policy_module._compute_log_prob(
-                        mini_actions, pred_mean, cov_factor, diag_std,
-                    )
+                with prof.section(f"mini_batch  expert={expert_name}"):
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_autocast):
+                        with prof.section("policy.forward"):
+                            if prof.mem_enabled and self.device_ids is not None:
+                                # DataParallel реплики не видят profiler →
+                                # при профилировании вызываем policy_module напрямую
+                                policy_out = self.policy_module.forward(
+                                    mini_states,
+                                    ed["obs_signatures"],
+                                    ed["action_signatures"],
+                                    expert_name=expert_name,
+                                )
+                            else:
+                                policy_out = self.policy(
+                                    mini_states,
+                                    ed["obs_signatures"],
+                                    ed["action_signatures"],
+                                    expert_name=expert_name,
+                                )
+                        pred_mean, cov_factor, diag_std, values, latent_std = policy_out[:5]
+                        forward_lb_loss = policy_out[5] if len(policy_out) > 5 else None
 
-                    loss = torch.tensor(0.0, device=self.device)
+                        with prof.section("build_dist"):
+                            dist = self.policy_module.build_action_dist(
+                                pred_mean, cov_factor, diag_std,
+                            )
 
-                    # --- PPO ---
-                    if ctx.ppo_weight > 0:
-                        log_ratio = new_log_probs - mini_fixed_lp
-                        ratio = torch.exp(log_ratio)
-                        surr1 = ratio * mini_advantages
-                        surr2 = torch.clamp(
-                            ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon,
-                        ) * mini_advantages
-                        ppo_loss = -torch.min(surr1, surr2).mean()
-                        loss = loss + ctx.ppo_weight * ppo_loss
-                        per_expert_losses[expert_name]["ppo"].append(ppo_loss.item())
+                        with prof.section("compute_log_prob"):
+                            new_log_probs = safe_lrmvn_log_prob(dist, mini_actions.float()).unsqueeze(-1)
 
-                        with torch.no_grad():
-                            approx_kl = ((ratio - 1) - log_ratio).mean().item()
-                            clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
-                            per_expert_diag[expert_name]["ratios"].append(ratio.mean().item())
-                            per_expert_diag[expert_name]["clip_fracs"].append(clip_frac)
-                            per_expert_diag[expert_name]["approx_kls"].append(approx_kl)
+                        loss = torch.tensor(0.0, device=self.device)
 
-                    # --- Imitation ---
-                    if ctx.use_expert and ctx.imitation_weight > 0:
-                        mini_expert = ed["expert_actions"][batch_indices]
-                        imitation_loss = nn.functional.mse_loss(pred_mean, mini_expert)
-                        loss = loss + ctx.imitation_weight * imitation_loss
-                        per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
+                        # --- PPO ---
+                        if ctx.ppo_weight > 0:
+                            with prof.section("ppo_loss"):
+                                log_ratio = new_log_probs - mini_fixed_lp
+                                ratio = torch.exp(log_ratio)
+                                surr1 = ratio * mini_advantages
+                                surr2 = torch.clamp(
+                                    ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon,
+                                ) * mini_advantages
+                                ppo_loss = -torch.min(surr1, surr2).mean()
+                            loss = loss + ctx.ppo_weight * ppo_loss
+                            per_expert_losses[expert_name]["ppo"].append(ppo_loss.item())
 
-                        # σ calibration: detached NLL trains covariance to match residuals
-                        # if cov_factor is not None and diag_std is not None:
-                        #     dist = self.policy_module._build_action_dist(
-                        #         pred_mean.detach(), cov_factor, diag_std,
-                        #     )
-                        #     sigma_loss = -dist.log_prob(mini_expert.float()).mean()
-                        #     loss = loss + 0.001 * sigma_loss
-                        #     per_expert_losses[expert_name]["sigma"].append(sigma_loss.item())
+                            with torch.no_grad():
+                                approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                                clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
+                                per_expert_diag[expert_name]["ratios"].append(ratio.mean().item())
+                                per_expert_diag[expert_name]["clip_fracs"].append(clip_frac)
+                                per_expert_diag[expert_name]["approx_kls"].append(approx_kl)
 
-                    # --- Value ---
-                    if ctx.value_weight > 0:
-                        vf_loss_unclipped = (values - mini_returns) ** 2
-                        v_clipped = mini_old_values + torch.clamp(
-                            values - mini_old_values,
-                            -self.clip_epsilon,
-                            self.clip_epsilon,
+                        # --- Imitation ---
+                        if ctx.use_expert and ctx.imitation_weight > 0:
+                            with prof.section("imitation_loss"):
+                                mini_expert = ed["expert_actions"][batch_indices]
+                                imitation_loss = nn.functional.mse_loss(pred_mean, mini_expert)
+                            loss = loss + ctx.imitation_weight * imitation_loss
+                            per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
+
+                        # --- Value ---
+                        if ctx.value_weight > 0:
+                            with prof.section("value_loss"):
+                                vf_loss_unclipped = (values - mini_returns) ** 2
+                                v_clipped = mini_old_values + torch.clamp(
+                                    values - mini_old_values,
+                                    -self.clip_epsilon,
+                                    self.clip_epsilon,
+                                )
+                                vf_loss_clipped = (v_clipped - mini_returns) ** 2
+                                value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
+                            loss = loss + ctx.value_weight * value_loss
+                            per_expert_losses[expert_name]["value"].append(value_loss.item())
+                            with torch.no_grad():
+                                value_clip_frac = (
+                                    (values - mini_old_values).abs() > self.clip_epsilon
+                                ).float().mean().item()
+                                per_expert_diag[expert_name]["value_clip_fracs"].append(value_clip_frac)
+
+                        # --- Entropy ---
+                        if ctx.entropy_weight > 0:
+                            with prof.section("entropy"):
+                                entropy = dist.entropy().mean()
+                            entropy_loss = -entropy
+                            loss = loss + ctx.entropy_weight * entropy_loss
+                            per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
+
+                        # --- MoE load balancing ---
+                        if ctx.load_balance_weight > 0 and forward_lb_loss is not None:
+                            lb_loss = forward_lb_loss.mean()
+                            loss = loss + ctx.load_balance_weight * lb_loss
+                            per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
+
+                        # Apply expert loss scale
+                        loss = loss * ctx.loss_scale
+
+                        self.optimizer.zero_grad()
+                        with prof.section("loss.backward"):
+                            loss.backward()
+
+                with prof.section("grad_clip + optimizer.step"):
+                    if self.grad_clip > 0:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.policy.parameters(), self.grad_clip,
                         )
-                        vf_loss_clipped = (v_clipped - mini_returns) ** 2
-                        value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
-                        loss = loss + ctx.value_weight * value_loss
-                        per_expert_losses[expert_name]["value"].append(value_loss.item())
-                        with torch.no_grad():
-                            value_clip_frac = (
-                                (values - mini_old_values).abs() > self.clip_epsilon
-                            ).float().mean().item()
-                            per_expert_diag[expert_name]["value_clip_fracs"].append(value_clip_frac)
+                        per_expert_diag[expert_name]["grad_norms"].append(grad_norm.item())
+                    else:
+                        total_norm = sum(
+                            param.grad.norm().item() ** 2
+                            for param in self.policy.parameters() if param.grad is not None
+                        ) ** 0.5
+                        per_expert_diag[expert_name]["grad_norms"].append(total_norm)
 
-                    # --- Entropy ---
-                    if ctx.entropy_weight > 0:
-                        entropy = self.policy_module._compute_entropy(pred_mean, cov_factor, diag_std)
-                        entropy_loss = -entropy
-                        loss = loss + ctx.entropy_weight * entropy_loss
-                        per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
+                    self.optimizer.step()
 
-                    # --- MoE load balancing ---
-                    if ctx.load_balance_weight > 0 and forward_lb_loss is not None:
-                        lb_loss = forward_lb_loss.mean()
-                        loss = loss + ctx.load_balance_weight * lb_loss
-                        per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
-
-                    # Apply expert loss scale
-                    loss = loss * ctx.loss_scale
-
-                    self.optimizer.zero_grad()
-                    loss.backward()
-
-                if self.grad_clip > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.policy.parameters(), self.grad_clip,
-                    )
-                    per_expert_diag[expert_name]["grad_norms"].append(grad_norm.item())
-                else:
-                    total_norm = sum(
-                        p.grad.norm().item() ** 2
-                        for p in self.policy.parameters() if p.grad is not None
-                    ) ** 0.5
-                    per_expert_diag[expert_name]["grad_norms"].append(total_norm)
-
-                self.optimizer.step()
                 pbar.update(1)
+
+                # Сохраняем отчёт — напечатается в log_train
+                if _profile_this:
+                    self._mem_profile_report = prof.report()
+                    prof.mem_enabled = False
+                    _mem_prof_done = True
 
         pbar.close()
 
@@ -1064,6 +1099,14 @@ class ArnoldTrainer:
                     d[f"gate_frac_{i}"] = f
                     d[f"gate_prob_{i}"] = p
 
+            # MoE shared vs routed expert contribution diagnostics
+            expert_mean_stats = getattr(self.policy_module, "_expert_mean_stats", None)
+            if expert_mean_stats is not None:
+                d = all_diagnostics[expert_name]
+                d["shared_norm"] = expert_mean_stats["shared_norm"]
+                d["routed_norm"] = expert_mean_stats["routed_norm"]
+                d["shared_frac"] = expert_mean_stats["shared_frac"]
+
         # Update normalizer stats ONCE with the full batch data.
         # Must happen before the PPO loop — stats are frozen during updates
         # to avoid drift between new_log_probs and fixed_log_probs.
@@ -1103,7 +1146,7 @@ class ArnoldTrainer:
 
             # Update
             t_update_start = time.time()
-            all_diagnostics = self.update_params(expert_batches)
+            all_diagnostics = self.update_params(expert_batches, debug_memory=(epoch == 0))
             t_update = time.time() - t_update_start
 
             # Apply timing and losses to loggers
@@ -1271,6 +1314,16 @@ class ArnoldTrainer:
                         f"probs=[{probs}]"
                     )
 
+                if "shared_frac" in d:
+                    alpha = getattr(self.policy_module, "alpha", 0.3)
+                    logger.info(
+                        f"  [{expert_name}] Experts: "
+                        f"shared_norm={d['shared_norm']:.4f}  "
+                        f"routed_norm={d['routed_norm']:.4f}  "
+                        f"shared_L2_frac={d['shared_frac']:.3f}  "
+                        f"(α·‖s‖ / (α·‖s‖+(1-α)·‖r‖),  α={alpha})"
+                    )
+
         # Per-expert sampling profiler — только эпоха 0
         if epoch == 0 and self.profiler_reports:
             for expert_name, profiler in self.profiler_reports.items():
@@ -1278,6 +1331,11 @@ class ArnoldTrainer:
                     f"Sampling Profile  |  {expert_name}"
                 ))
                 logger.info(profiler.report())
+
+        # GPU Memory Profile — собран в update_params epoch 0
+        if self._mem_profile_report is not None:
+            logger.info(self._mem_profile_report)
+            self._mem_profile_report = None
 
         if self.use_wandb:
             self.wandb_logger.log_train(

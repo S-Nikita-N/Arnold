@@ -1,33 +1,52 @@
 """
 Lattice Policy — MLP с low-rank ковариацией (латентные факторы).
 
-Адаптировано из Kinesis policy_lattice.py.
-Ковариация: Σ = W·diag(σ²_latent)·W^T + diag(σ²_action) = F·F^T + diag(σ²_action).
-Использует LowRankMultivariateNormal (как Transformer) — единый интерфейс.
+Архитектура:
+  obs → normalizer → net(x)
+                        ↓
+        action_mean(latent) → mean [B, A]
+                        ↓
+        cov_factor = action_mean.weight * latent_std
+                     [A, latent_dim] — expand → batch
+                        ↓
+        LowRankMultivariateNormal(mean, cov_factor, diag_std²)
+
+Параметры:
+  mlp_units      — слои основной MLP, последний = latent_dim
+  mlp_activation — функция активации (default silu)
+  fix_std        — заморозить log_std
+  log_std_init   — начальное значение log_std
+  min_diag_std   — минимальная диагональная σ
 
 Только single-expert (multi-expert не поддерживается).
-Интерфейс: forward → (mean, cov_factor, diag_std, value).
+Интерфейс: forward → (mean, cov_factor, diag_std, value, latent_std).
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import LowRankMultivariateNormal
 from typing import List, Tuple, Optional
 
 from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-
 from arnold.torch_model.mlp import MLP
 from arnold.torch_model.normalization import SignatureNormalizerModule
+from arnold.profiler import Profiler
 
+
+# ---------------------------------------------------------------------------
+#  LatticePolicy
+# ---------------------------------------------------------------------------
 
 class LatticePolicy(nn.Module):
     """
     Lattice Policy для Arnold. Только single-expert.
 
-    Как в Kinesis: использует только текущий state (последний timestep),
-    без истории. obs_timeseries [batch, n_obs, history_len] → берём [:, :, -1].
+    Использует только текущий state (последний timestep),
+    без истории. obs_timeseries [batch, n_obs, history_len] → [:, :, -1].
 
-    Интерфейс совместим с TransformerPolicy: (mean, cov_factor, diag_std, value).
+    Профилирование:
+        self.profiler — Profiler (time + mem), настраивается через set_profiler()
     """
 
     def __init__(
@@ -41,36 +60,49 @@ class LatticePolicy(nn.Module):
         min_diag_std: float = 1e-4,
     ):
         super().__init__()
+
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.latent_dim = mlp_units[-1]
         self.min_diag_std = min_diag_std
 
+        # ── Normalizer ────────────────────────────────────────────────
         self.obs_normalizer = SignatureNormalizerModule()
 
+        # ── Main MLP ─────────────────────────────────────────────────
         self.net = MLP(state_dim, mlp_units, mlp_activation)
 
+        # ── Action head ──────────────────────────────────────────────
         self.action_mean = nn.Linear(self.latent_dim, action_dim)
         self.action_mean.weight.data.mul_(0.1)
         self.action_mean.bias.data.zero_()
 
+        # ── Std parameters ───────────────────────────────────────────
+        # [action_dim (diagonal) + latent_dim (low-rank cov)]
         self.log_std = nn.Parameter(
             torch.ones(1, action_dim + self.latent_dim) * log_std_init,
             requires_grad=not fix_std,
         )
 
+        # ── Value network (отдельный) ────────────────────────────────
         self.value_net = MLP(state_dim, mlp_units, mlp_activation)
         self.value_head = nn.Linear(self.value_net.out_dim, 1)
         self.value_head.weight.data.mul_(0.1)
         self.value_head.bias.data.zero_()
 
-        self.profiler = None
+        # ── Profiler ──────────────────────────────────────────────────
+        self.profiler = Profiler()
 
-    def enable_profiling(self, profiler) -> None:
+    # ------------------------------------------------------------------
+    #  Profiler management
+    # ------------------------------------------------------------------
+
+    def set_profiler(self, profiler: Profiler) -> None:
         self.profiler = profiler
 
-    def disable_profiling(self) -> None:
-        self.profiler = None
+    # ------------------------------------------------------------------
+    #  Forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -80,37 +112,58 @@ class LatticePolicy(nn.Module):
         expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,           # mean       [batch, action_dim]
+        Optional[torch.Tensor], # cov_factor [batch, action_dim, latent_dim]
+        Optional[torch.Tensor], # diag_std   [batch, action_dim]
+        Optional[torch.Tensor], # value      [batch, 1]
+        Optional[torch.Tensor], # latent_std [latent_dim]
+    ]:
         """
         Returns:
-            mean: [batch, action_dim]
-            cov_factor: [batch, action_dim, latent_dim]
-            diag_std: [batch, action_dim] — σ = softplus(log_std) + min, уже готовый
-            value: [batch, 1] или None
+            mean, cov_factor, diag_std, value, latent_std
         """
-        obs_norm = self.obs_normalizer(obs_signatures, obs_timeseries)
-        x = obs_norm[:, :, -1]
+        p = self.profiler
 
-        action_mean = self.action_mean(self.net(x))
+        # ── Normalizer ───────────────────────────────────────────────
+        with p.section("normalizer"):
+            obs_norm = self.obs_normalizer(obs_signatures, obs_timeseries)
+            x = obs_norm[:, :, -1]
+            batch_size = x.shape[0]
 
+        # ── 1. Main MLP ─────────────────────────────────────────────
+        with p.section("lattice_net"):
+            latent = self.net(x)
+
+        # ── 2. Action head ───────────────────────────────────────────
+        with p.section("action_head"):
+            action_mean = self.action_mean(latent)
+
+        # ── 3. Covariance ────────────────────────────────────────────
         cov_factor = None
         diag_std = None
         latent_std = None
         if return_std:
-            std = torch.nn.functional.softplus(self.log_std) + self.min_diag_std
-            diag_std = std[:, : self.action_dim].expand(x.shape[0], -1)
-            latent_std = std[:, self.action_dim:].squeeze(0)
+            with p.section("cov_factor"):
+                std = F.softplus(self.log_std) + self.min_diag_std
+                diag_std = std[:, :self.action_dim].expand(batch_size, -1)
+                latent_std = std[:, self.action_dim:].squeeze(0)
+                W = self.action_mean.weight
+                cov_factor = (W * latent_std.unsqueeze(0)).unsqueeze(0).expand(
+                    batch_size, -1, -1,
+                )
 
-            W = self.action_mean.weight
-            cov_factor = (W * latent_std.unsqueeze(0)).unsqueeze(0).expand(
-                x.shape[0], -1, -1
-            )
-
+        # ── 4. Value network ─────────────────────────────────────────
         value = None
         if return_value:
-            value = self.value_head(self.value_net(x))
+            with p.section("value_net"):
+                value = self.value_head(self.value_net(x))
 
         return action_mean, cov_factor, diag_std, value, latent_std
+
+    # ------------------------------------------------------------------
+    #  Action sampling
+    # ------------------------------------------------------------------
 
     def get_action(
         self,
@@ -122,10 +175,10 @@ class LatticePolicy(nn.Module):
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        p = self.profiler
+
         mean, cov_factor, diag_std, value, latent_std = self.forward(
-            obs_timeseries,
-            obs_signatures,
-            action_signatures,
+            obs_timeseries, obs_signatures, action_signatures,
             expert_name=expert_name,
             return_std=return_std,
             return_value=return_value,
@@ -134,47 +187,52 @@ class LatticePolicy(nn.Module):
         if deterministic:
             action = mean
             log_prob = None if return_std else torch.zeros(mean.shape[0], 1, device=mean.device)
-            
         else:
             if cov_factor is None:
                 raise ValueError("return_std=False допустим только при deterministic=True")
-
-            dist = self._build_action_dist(mean, cov_factor, diag_std)
-            action = dist.rsample()
-            log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
+            with p.section("dist_build"):
+                dist = self.build_action_dist(mean, cov_factor, diag_std)
+            with p.section("dist_sample"):
+                action = dist.rsample()
+                log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
 
         return action, log_prob, value
 
-    def _build_action_dist(
+    # ------------------------------------------------------------------
+    #  Distribution helpers
+    # ------------------------------------------------------------------
+
+    def build_action_dist(
         self,
         mean: torch.Tensor,
         cov_factor: torch.Tensor,
         diag_std: torch.Tensor,
     ) -> LowRankMultivariateNormal:
-        """diag_std уже готовый: σ = softplus(log_std) + min."""
+        p = self.profiler
         device = mean.device
         device_type = "cuda" if device.type == "cuda" else "cpu"
-        autocast = torch.autocast(device_type=device_type, enabled=False)
 
-        with autocast:
-            mean_f = mean.float()
-            cov_factor_f = cov_factor.float()
-            diag_std_f = diag_std.float()
-            cov_diag = diag_std_f.pow(2) + 1e-6
+        with torch.autocast(device_type=device_type, enabled=False):
+            with p.section("cast to float32"):
+                mean_f = mean.float()
+                cov_factor_f = cov_factor.float()
+                diag_std_f = diag_std.float()
+                cov_diag = diag_std_f.pow(2) + 1e-6
 
-            return LowRankMultivariateNormal(
-                loc=mean_f,
-                cov_factor=cov_factor_f,
-                cov_diag=cov_diag,
-            )
+            with p.section("LowRankMultivariateNormal"):
+                return LowRankMultivariateNormal(
+                    loc=mean_f,
+                    cov_factor=cov_factor_f,
+                    cov_diag=cov_diag,
+                )
 
-    def _compute_entropy(
+    def compute_entropy(
         self,
         mean: torch.Tensor,
         cov_factor: torch.Tensor,
         diag_std: torch.Tensor,
     ) -> torch.Tensor:
-        dist = self._build_action_dist(mean, cov_factor, diag_std)
+        dist = self.build_action_dist(mean, cov_factor, diag_std)
         return dist.entropy().mean()
 
     def _compute_log_prob(
@@ -184,5 +242,5 @@ class LatticePolicy(nn.Module):
         cov_factor: torch.Tensor,
         diag_std: torch.Tensor,
     ) -> torch.Tensor:
-        dist = self._build_action_dist(mean, cov_factor, diag_std)
+        dist = self.build_action_dist(mean, cov_factor, diag_std)
         return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)
