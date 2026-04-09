@@ -255,7 +255,8 @@ class MoELatticePolicy(nn.Module):
                 if idx.numel() == 0:
                     continue
                 e_out = self.expert_nets[i](flat_h[idx])
-                flat_route_out.index_add_(0, idx, self.expert_heads[i](e_out))
+                head_out = self.expert_heads[i](e_out).to(flat_route_out.dtype)
+                flat_route_out.index_add_(0, idx, head_out)
 
         # ── 5. Combine shared + routed → mean ────────────────────────
         with p.section("mean_combine"):
