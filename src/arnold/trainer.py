@@ -232,6 +232,7 @@ class ArnoldTrainer:
         # Best model tracking
         self.best_eval_episode_avg_length: Dict[str, float] = {}
         self.best_eval_imitation_loss: Dict[str, float] = {}
+        self.best_eval_mpjpe: Dict[str, float] = {}
 
         # Multiprocessing Event
         self.mp_done = fork_ctx.Event()
@@ -354,6 +355,7 @@ class ArnoldTrainer:
 
             self.best_eval_episode_avg_length[name] = 0.0
             self.best_eval_imitation_loss[name] = float('inf')
+            self.best_eval_mpjpe[name] = float('inf')
 
     def setup_policy(self) -> None:
         """Создаёт policy: TransformerPolicy или LatticePolicy."""
@@ -1035,11 +1037,7 @@ class ArnoldTrainer:
                         ed["obs_signatures"], ed["states"][diag_idx],
                     )
                     x_diag = obs_norm[:, :, -1]
-                    if self.policy_module.shared_trunk is not None:
-                        h_diag = self.policy_module.shared_trunk(x_diag)
-                    else:
-                        h_diag = x_diag
-                    gate_stats = self.policy_module.get_gate_stats(h_diag)
+                    gate_stats = self.policy_module.get_gate_stats(x_diag)
 
                 adv = ed["advantages"]
                 ret = ed["returns"]
@@ -1220,6 +1218,11 @@ class ArnoldTrainer:
                 self.best_eval_episode_avg_length[expert_name] = ep_len
                 self.save_checkpoint(suffix=f"best_ep_length_{expert_name}")
 
+            mpjpe = metrics.get("eval/mpjpe", float('inf'))
+            if mpjpe < self.best_eval_mpjpe[expert_name]:
+                self.best_eval_mpjpe[expert_name] = mpjpe
+                self.save_checkpoint(suffix=f"best_mpjpe_{expert_name}")
+
         if self.use_wandb:
             merged = {}
             for expert_name, metrics in all_eval.items():
@@ -1379,6 +1382,9 @@ class ArnoldTrainer:
         episode_lengths = []
         episode_imitation_losses = []
         episode_value_losses = []
+        episode_mpjpes = []
+        episode_frame_coverages = []
+        episode_successes = []
 
         for motion_id in tqdm(
             valid_wrapper.forward_motions(),
@@ -1425,6 +1431,12 @@ class ArnoldTrainer:
                 obs = next_obs
 
                 if done:
+                    if "mpjpe" in info:
+                        episode_mpjpes.append(float(info["mpjpe"]))
+                    if "frame_coverage" in info:
+                        episode_frame_coverages.append(float(info["frame_coverage"]))
+                    if "success" in info:
+                        episode_successes.append(float(info["success"]))
                     break
 
             episode_rewards.append(episode_reward)
@@ -1451,6 +1463,20 @@ class ArnoldTrainer:
         }
         if episode_imitation_losses:
             metrics["eval/imitation_loss"] = float(np.mean(episode_imitation_losses))
+        if episode_mpjpes:
+            metrics["eval/mpjpe"] = float(np.mean(episode_mpjpes))
+        if episode_frame_coverages:
+            metrics["eval/frame_coverage"] = float(np.mean(episode_frame_coverages))
+        if episode_successes:
+            metrics["eval/success_rate"] = float(np.mean(episode_successes))
+
+        extra = ""
+        if "eval/mpjpe" in metrics:
+            extra += f", mpjpe={metrics['eval/mpjpe'] * 1000:.2f}mm"
+        if "eval/frame_coverage" in metrics:
+            extra += f", frame_cov={metrics['eval/frame_coverage']:.3f}"
+        if "eval/success_rate" in metrics:
+            extra += f", success={metrics['eval/success_rate']:.3f}"
 
         logger.info(
             f"Eval [{expert_name}]: "
@@ -1458,6 +1484,7 @@ class ArnoldTrainer:
             f"length={metrics['eval/mean_length']:.2f}±{metrics['eval/std_length']:.2f}"
             + (f", im_loss={metrics.get('eval/imitation_loss', 0):.4f}" if ctx.use_expert else "")
             + f", val_loss={metrics['eval/value_loss']:.4f}"
+            + extra
         )
 
         return metrics

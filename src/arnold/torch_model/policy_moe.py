@@ -4,11 +4,12 @@ MoE-Lattice Policy — Shared Expert + N Routed Experts, Low-Rank Covariance.
 Архитектура:
   obs → normalizer → shared_trunk(h)
                          ↓
-        ┌────────────────┴─────────────────────────────────────────────────────────┐
-        │  Shared Expert (всегда активен)       │  Routing (top-k из N)            │
-        │  net(h) → latent [B, shared_latent]   │  gate(h) → weights               │
-        │  head(latent) → shared_mean [B, A]    │  expert_i(h) → route_mean [B, A] │
-        └────────────────┬─────────────────────────────────────────────────────────┘
+        ┌────────────────┴────────────────────────────────────────────────────┐
+        │  Shared Expert (всегда активен)       │  Routing (top-k из N)       │
+        │  net(h) → e_shared [B, shared_latent] │  expert_i(h) → [B, A]       │
+        │  action_head(e_shared) → shared_mean  │  gate_head(e_shared) → gate │
+        │  [B, A]                               │  [B, num_experts]           │
+        └────────────────┬────────────────────────────────────────────────────┘
                          ↓
           mean = α·shared_mean + (1-α)·routed_mean
                          ↓
@@ -23,7 +24,7 @@ MoE-Lattice Policy — Shared Expert + N Routed Experts, Low-Rank Covariance.
   num_experts         — размер пула routing-экспертов (default 5)
   top_k               — сколько routing-экспертов активировать (default 1 → 1/5 пула)
   expert_units        — слои каждого routing-эксперта, default (512,512)
-  gate_units          — слои gate network, default (512,256)
+  value_units         — слои отдельной value MLP, default (2048,1536,1024,512,512)
   alpha               — вес shared expert в итоговом mean (default 0.3), routing = 1-alpha
   load_balance_weight — вес Switch Transformer LB loss (default 0.01)
 """
@@ -60,13 +61,13 @@ class MoELatticePolicy(nn.Module):
         self,
         state_dim: int,
         action_dim: int,
-        shared_units: Tuple[int, ...] = (2048, 1536, 1024),
-        shared_expert_units: Tuple[int, ...] = (256, 64),  # последний = shared_latent_dim
-        num_experts: int = 5,
-        top_k: int = 1,
-        expert_units: Tuple[int, ...] = (512, 512),
-        gate_units: Tuple[int, ...] = (512, 256),
-        alpha: float = 0.3,                # вес shared expert в mean
+        shared_units: Tuple[int, ...],
+        shared_expert_units: Tuple[int, ...],
+        num_experts: int,
+        top_k: int,
+        expert_units: Tuple[int, ...],
+        value_units: Tuple[int, ...],
+        alpha: float = 0.3,
         load_balance_weight: float = 0.01,
         fix_std: bool = False,
         log_std_init: float = 0.0,
@@ -104,10 +105,14 @@ class MoELatticePolicy(nn.Module):
         self.shared_latent_dim = shared_expert_units[-1]
 
         self.shared_expert_net = MLP(trunk_out_dim, shared_expert_units, activation)
-        # Голова: [action_dim × shared_latent_dim] — её ВЕСА используются для ковариации
+        # Action head: [action_dim × shared_latent_dim] — её ВЕСА используются для ковариации
         self.shared_expert_head = nn.Linear(self.shared_latent_dim, action_dim)
         self.shared_expert_head.weight.data.mul_(0.1)
         self.shared_expert_head.bias.data.zero_()
+        # Gate head: вторая голова после shared_expert_net (не отдельная сеть)
+        self.gate_head = nn.Linear(self.shared_latent_dim, num_experts)
+        self.gate_head.weight.data.mul_(0.1)
+        self.gate_head.bias.data.zero_()
 
         # ── Routing experts ───────────────────────────────────────────
         if not expert_units:
@@ -125,12 +130,6 @@ class MoELatticePolicy(nn.Module):
             self.expert_nets.append(net)
             self.expert_heads.append(head)
 
-        # ── Gate network ─────────────────────────────────────────────
-        self.gate = nn.Sequential(
-            MLP(trunk_out_dim, gate_units, activation),
-            nn.Linear(gate_units[-1], num_experts),
-        )
-
         # ── Std parameters ────────────────────────────────────────────
         # [action_dim (diagonal) + shared_latent_dim (low-rank cov)]
         self.log_std = nn.Parameter(
@@ -138,8 +137,10 @@ class MoELatticePolicy(nn.Module):
             requires_grad=not fix_std,
         )
 
-        # ── Value network (отдельный от MoE) ─────────────────────────
-        value_units = shared_units + expert_units if shared_units else expert_units
+        # ── Value network (отдельная MLP) ─────────────────────────────
+        if not value_units:
+            raise ValueError("value_units не может быть пустым")
+
         self.value_net = MLP(state_dim, value_units, activation)
         self.value_head = nn.Linear(value_units[-1], 1)
         self.value_head.weight.data.mul_(0.1)
@@ -159,16 +160,16 @@ class MoELatticePolicy(nn.Module):
     #  Gate
     # ------------------------------------------------------------------
 
-    def gate_forward(self, h: torch.Tensor):
+    def gate_forward(self, e_shared: torch.Tensor):
         """
-        Gate → top-k routing.
+        Gate (голова на e_shared) → top-k routing.
 
         Returns:
             top_k_weights : [batch, top_k] — нормированные веса выбранных экспертов
             top_k_indices : [batch, top_k] — индексы выбранных экспертов
             gate_probs    : [batch, num_experts] — полный softmax (для LB loss)
         """
-        logits = self.gate(h)
+        logits = self.gate_head(e_shared)
         gate_probs = F.softmax(logits, dim=-1)
         top_k_vals, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
         top_k_indices = top_k_indices.long()
@@ -236,9 +237,9 @@ class MoELatticePolicy(nn.Module):
             e_shared = self.shared_expert_net(h)            # [batch, shared_latent_dim]
             shared_mean = self.shared_expert_head(e_shared) # [batch, action_dim]
 
-        # ── 3. Gate routing ──────────────────────────────────────────
+        # ── 3. Gate routing (голова на e_shared) ─────────────────────
         with p.section("gate_forward"):
-            top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
+            top_k_weights, top_k_indices, gate_probs = self.gate_forward(e_shared)
             load_balance_loss = self.compute_load_balance_loss(top_k_indices, gate_probs)
 
         # ── 4. Routing experts (sparse) ──────────────────────────────
@@ -301,9 +302,11 @@ class MoELatticePolicy(nn.Module):
     #  Gate diagnostics
     # ------------------------------------------------------------------
 
-    def get_gate_stats(self, h: torch.Tensor) -> dict:
+    def get_gate_stats(self, x: torch.Tensor) -> dict:
         """Per-expert routing fractions, mean probabilities, gate entropy."""
-        top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
+        h = self.shared_trunk(x) if self.shared_trunk is not None else x
+        e_shared = self.shared_expert_net(h)
+        top_k_weights, top_k_indices, gate_probs = self.gate_forward(e_shared)
         N = self.num_experts
         one_hot = F.one_hot(top_k_indices, N).float()
         routing_fracs = one_hot.sum(dim=1).mean(dim=0)
