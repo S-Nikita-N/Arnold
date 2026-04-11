@@ -1090,6 +1090,7 @@ class ArnoldTrainer:
             if gate_stats is not None:
                 d = all_diagnostics[expert_name]
                 d["gate_entropy"] = gate_stats["gate_entropy"]
+                d["balance_entropy"] = gate_stats["balance_entropy"]
                 for i, (f, p) in enumerate(zip(
                     gate_stats["routing_fracs"].tolist(),
                     gate_stats["mean_probs"].tolist(),
@@ -1313,6 +1314,7 @@ class ArnoldTrainer:
                     logger.info(
                         f"  [{expert_name}] Gate: "
                         f"entropy={d['gate_entropy']:.3f}  "
+                        f"balance_H={d['balance_entropy']:.3f}  "
                         f"routing=[{fracs}]  "
                         f"probs=[{probs}]"
                     )

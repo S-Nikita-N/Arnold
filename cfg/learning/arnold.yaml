@@ -52,6 +52,7 @@ moe:
   num_experts: 5
   top_k: 2                              # 2/5 пула
   expert_units: [512, 512]
+  gate_units: [512, 256]                # отдельная gate MLP (вход = h)
   value_units: [2048, 1536, 1024, 512, 512]  # отдельная value MLP
   alpha: 0.3                            # вес shared expert
 
