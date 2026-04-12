@@ -896,6 +896,12 @@ class ArnoldTrainer:
         )
         prof.time_enabled = (self.epoch == 0)
 
+        # Подключаем общий профайлер к policy — секции внутри forward()
+        # (normalizer, shared_trunk, gate_forward, ...) попадут в тот же отчёт.
+        old_profiler = getattr(self.policy_module, 'profiler', None)
+        if hasattr(self.policy_module, 'set_profiler'):
+            self.policy_module.set_profiler(prof)
+
         result_queue = fork_ctx.Queue()
         stop_flag = fork_ctx.Value('i', 0)
 
@@ -1076,21 +1082,25 @@ class ArnoldTrainer:
                             )
 
                         with prof.section("gpu_forward"):
-                            with torch.autocast(
-                                device_type=device_type,
-                                dtype=torch.bfloat16,
-                                enabled=use_amp,
-                            ):
-                                actions, log_probs, values = \
-                                    self.policy_module.get_action(
-                                        batch_obs.to(device),
-                                        obs_sigs, act_sigs,
-                                        expert_name=expert_name,
-                                        deterministic=False,
-                                    )
-                            actions_cpu = actions.cpu()
-                            log_probs_cpu = log_probs.cpu()
-                            values_cpu = values.cpu()
+                            with prof.section("to_device"):
+                                batch_obs_dev = batch_obs.to(device)
+                            with prof.section("policy_forward"):
+                                with torch.autocast(
+                                    device_type=device_type,
+                                    dtype=torch.bfloat16,
+                                    enabled=use_amp,
+                                ):
+                                    actions, log_probs, values = \
+                                        self.policy_module.get_action(
+                                            batch_obs_dev,
+                                            obs_sigs, act_sigs,
+                                            expert_name=expert_name,
+                                            deterministic=False,
+                                        )
+                            with prof.section("to_cpu"):
+                                actions_cpu = actions.cpu()
+                                log_probs_cpu = log_probs.cpu()
+                                values_cpu = values.cpu()
 
                         with prof.section("scatter"):
                             zero_ea = torch.zeros(ctx.wrapper.action_dim)
@@ -1110,9 +1120,10 @@ class ArnoldTrainer:
                 has_prev = True
 
                 # Signal active workers → env.step → wait for next obs
-                for wh in all_workers:
-                    if wh.active:
-                        wh.action_ready.set()
+                with prof.section("signal_workers"):
+                    for wh in all_workers:
+                        if wh.active:
+                            wh.action_ready.set()
 
                 with prof.section("wait_env_step"):
                     _wait_obs_active()
@@ -1123,46 +1134,59 @@ class ArnoldTrainer:
             pbar.refresh()
             pbar.close()
 
-        stop_flag.value = 1
-        for wh in all_workers:
-            wh.action_ready.set()
+        with prof.section("cleanup"):
+            with prof.section("stop_workers"):
+                stop_flag.value = 1
+                for wh in all_workers:
+                    wh.action_ready.set()
 
-        per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
-        collected = 0
-        while collected < total_workers:
-            try:
-                msg = result_queue.get(timeout=10)
-                if msg[0] == "logger":
-                    per_expert_loggers[msg[1]].append(msg[2])
-                    collected += 1
-            except Exception:
-                break
+            with prof.section("collect_loggers"):
+                per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
+                collected = 0
+                while collected < total_workers:
+                    try:
+                        msg = result_queue.get(timeout=10)
+                        if msg[0] == "logger":
+                            per_expert_loggers[msg[1]].append(msg[2])
+                            collected += 1
+                    except Exception:
+                        break
 
-        for wh in all_workers:
-            wh.proc.join(timeout=5)
+            with prof.section("join_workers"):
+                for wh in all_workers:
+                    wh.proc.join(timeout=5)
 
-        if prof.time_enabled:
-            self.profiler_reports["vectorized_sampling"] = prof
+        # Восстанавливаем дефолтный профайлер policy (выключен)
+        if old_profiler is not None and hasattr(self.policy_module, 'set_profiler'):
+            self.policy_module.set_profiler(old_profiler)
 
         optimizer_to(self.optimizer, self.device)
 
         # ── Merge per expert ─────────────────────────────────────
-        expert_batches: Dict[str, OBCBatch] = {}
-        expert_loggers: Dict[str, OBCLogger] = {}
+        with prof.section("merge"):
+            expert_batches: Dict[str, OBCBatch] = {}
+            expert_loggers: Dict[str, OBCLogger] = {}
 
-        for expert_name, workers in workers_by_expert.items():
-            merged = OBCMemory()
-            for wh in workers:
-                mem = worker_mems[id(wh)]
-                if len(mem) > 0 and mem.masks[-1] != 0.0:
-                    mem.masks[-1] = 0.0
-                merged.extend(mem)
+            for expert_name, workers in workers_by_expert.items():
+                with prof.section("collect_memories"):
+                    merged = OBCMemory()
+                    for wh in workers:
+                        mem = worker_mems[id(wh)]
+                        if len(mem) > 0 and mem.masks[-1] != 0.0:
+                            mem.masks[-1] = 0.0
+                        merged.extend(mem)
 
-            batch = merged.to_batch(gamma=self.gamma, tau=self.tau, device=None)
-            expert_batches[expert_name] = batch
-            expert_loggers[expert_name] = OBCLogger.merge(
-                per_expert_loggers.get(expert_name, [])
-            )
+                with prof.section("to_batch_gae"):
+                    batch = merged.to_batch(gamma=self.gamma, tau=self.tau, device=None)
+                    expert_batches[expert_name] = batch
+
+                with prof.section("merge_loggers"):
+                    expert_loggers[expert_name] = OBCLogger.merge(
+                        per_expert_loggers.get(expert_name, [])
+                    )
+
+        if prof.time_enabled:
+            self.profiler_reports["vectorized_sampling"] = prof
 
         sample_time = time.time() - t_start
         for lg in expert_loggers.values():
