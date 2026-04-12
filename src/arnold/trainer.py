@@ -778,6 +778,7 @@ class ArnoldTrainer:
     def _vec_env_worker(
         self,
         expert_name: str,
+        worker_id: int,
         obs_buf: torch.Tensor,
         action_buf: torch.Tensor,
         expert_action_buf: torch.Tensor,
@@ -796,6 +797,7 @@ class ArnoldTrainer:
         Does only env.step + parser. Policy inference is done by main process.
         Communicates via shared-memory tensors + Events.
         """
+        self.seed_worker(worker_id)
         ctx = self.experts[expert_name]
         wrapper = ctx.wrapper
         parser = ObservationParser.from_env(wrapper.env, self.history_len)
@@ -930,10 +932,13 @@ class ArnoldTrainer:
                 wh.action_ready = fork_ctx.Event()
                 wh.active = True
 
+                global_wid = len(all_workers) + 1
+
                 wh.proc = fork_ctx.Process(
                     target=self._vec_env_worker,
                     args=(
                         expert_name,
+                        global_wid,
                         wh.obs_buf, wh.action_buf, wh.expert_action_buf,
                         wh.reward_val, wh.done_val,
                         wh.obs_ready, wh.action_ready,
