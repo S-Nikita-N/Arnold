@@ -1148,7 +1148,10 @@ class ArnoldTrainer:
         for expert_name, workers in workers_by_expert.items():
             merged = OBCMemory()
             for wh in workers:
-                merged.extend(worker_mems[id(wh)])
+                mem = worker_mems[id(wh)]
+                if len(mem) > 0 and mem.masks[-1] != 0.0:
+                    mem.masks[-1] = 0.0
+                merged.extend(mem)
 
             batch = merged.to_batch(gamma=self.gamma, tau=self.tau, device=None)
             expert_batches[expert_name] = batch
