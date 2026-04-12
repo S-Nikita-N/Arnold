@@ -1134,27 +1134,23 @@ class ArnoldTrainer:
             pbar.refresh()
             pbar.close()
 
-        with prof.section("cleanup"):
-            with prof.section("stop_workers"):
-                stop_flag.value = 1
-                for wh in all_workers:
-                    wh.action_ready.set()
+        stop_flag.value = 1
+        for wh in all_workers:
+            wh.action_ready.set()
 
-            with prof.section("collect_loggers"):
-                per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
-                collected = 0
-                while collected < total_workers:
-                    try:
-                        msg = result_queue.get(timeout=10)
-                        if msg[0] == "logger":
-                            per_expert_loggers[msg[1]].append(msg[2])
-                            collected += 1
-                    except Exception:
-                        break
+        per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
+        collected = 0
+        while collected < total_workers:
+            try:
+                msg = result_queue.get(timeout=10)
+                if msg[0] == "logger":
+                    per_expert_loggers[msg[1]].append(msg[2])
+                    collected += 1
+            except Exception:
+                break
 
-            with prof.section("join_workers"):
-                for wh in all_workers:
-                    wh.proc.join(timeout=5)
+        for wh in all_workers:
+            wh.proc.join(timeout=5)
 
         # Восстанавливаем дефолтный профайлер policy (выключен)
         if old_profiler is not None and hasattr(self.policy_module, 'set_profiler'):
@@ -1163,27 +1159,22 @@ class ArnoldTrainer:
         optimizer_to(self.optimizer, self.device)
 
         # ── Merge per expert ─────────────────────────────────────
-        with prof.section("merge"):
-            expert_batches: Dict[str, OBCBatch] = {}
-            expert_loggers: Dict[str, OBCLogger] = {}
+        expert_batches: Dict[str, OBCBatch] = {}
+        expert_loggers: Dict[str, OBCLogger] = {}
 
-            for expert_name, workers in workers_by_expert.items():
-                with prof.section("collect_memories"):
-                    merged = OBCMemory()
-                    for wh in workers:
-                        mem = worker_mems[id(wh)]
-                        if len(mem) > 0 and mem.masks[-1] != 0.0:
-                            mem.masks[-1] = 0.0
-                        merged.extend(mem)
+        for expert_name, workers in workers_by_expert.items():
+            merged = OBCMemory()
+            for wh in workers:
+                mem = worker_mems[id(wh)]
+                if len(mem) > 0 and mem.masks[-1] != 0.0:
+                    mem.masks[-1] = 0.0
+                merged.extend(mem)
 
-                with prof.section("to_batch_gae"):
-                    batch = merged.to_batch(gamma=self.gamma, tau=self.tau, device=None)
-                    expert_batches[expert_name] = batch
-
-                with prof.section("merge_loggers"):
-                    expert_loggers[expert_name] = OBCLogger.merge(
-                        per_expert_loggers.get(expert_name, [])
-                    )
+            batch = merged.to_batch(gamma=self.gamma, tau=self.tau, device=None)
+            expert_batches[expert_name] = batch
+            expert_loggers[expert_name] = OBCLogger.merge(
+                per_expert_loggers.get(expert_name, [])
+            )
 
         if prof.time_enabled:
             self.profiler_reports["vectorized_sampling"] = prof
