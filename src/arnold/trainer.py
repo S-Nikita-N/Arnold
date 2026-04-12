@@ -79,6 +79,7 @@ class ExpertContext:
     # Per-expert parallelism
     num_threads: int = 1
     min_batch_size: int = 10240
+    vec_batch_size: Optional[int] = None
 
     # Per-expert loss scale (multiplier applied to all losses)
     loss_scale: float = 1.0
@@ -212,6 +213,7 @@ class ArnoldTrainer:
         self.output_dir = cfg.run.output_dir
         self.eval_frequency = cfg.run.eval_frequency
         self.resampling_interval = cfg.run.resampling_interval
+        self.finish_episodes = cfg.run.finish_episodes
 
         # Logging
         self.use_wandb = cfg.use_wandb
@@ -297,6 +299,7 @@ class ArnoldTrainer:
             loss_scale = learning_cfg.get("loss_scale", 1)
             mbs = learning_cfg.get("min_batch_size")
             n_threads = entry.get("num_threads", 1)
+            vbs = entry.get("vec_batch_size", None)
 
             # Action granulation
             muscle_grouping = None
@@ -324,6 +327,7 @@ class ArnoldTrainer:
                 load_balance_weight=lb_w,
                 num_threads=n_threads,
                 min_batch_size=mbs,
+                vec_batch_size=vbs,
                 loss_scale=loss_scale,
                 muscle_grouping=muscle_grouping,
             )
@@ -651,6 +655,10 @@ class ArnoldTrainer:
             expert_batches: Dict[expert_name -> OBCBatch]
             expert_loggers: Dict[expert_name -> OBCLogger]
         """
+        # Vectorized: env workers on CPU, batched inference on GPU/MPS
+        if self.device.type in ('cuda', 'mps'):
+            return self._sample_vectorized()
+
         t_start = time.time()
         self.mp_done.clear()
         to_test(self.policy)
@@ -756,6 +764,397 @@ class ArnoldTrainer:
             batch = merged_memory.to_batch(gamma=self.gamma, tau=self.tau, device=None)
             expert_batches[expert_name] = batch
             expert_loggers[expert_name] = OBCLogger.merge(per_expert_loggers[expert_name])
+
+        sample_time = time.time() - t_start
+        for lg in expert_loggers.values():
+            lg.sample_time = sample_time
+
+        return expert_batches, expert_loggers
+
+    # ------------------------------------------------------------------
+    #  Vectorized Sampling
+    # ------------------------------------------------------------------
+
+    def _vec_env_worker(
+        self,
+        expert_name: str,
+        obs_buf: torch.Tensor,
+        action_buf: torch.Tensor,
+        expert_action_buf: torch.Tensor,
+        reward_val,
+        done_val,
+        obs_ready,
+        action_ready,
+        stop_flag,
+        result_queue,
+        step_counter,
+        send_sigs: bool,
+    ) -> None:
+        """
+        Env worker for vectorized sampling.
+
+        Does only env.step + parser. Policy inference is done by main process.
+        Communicates via shared-memory tensors + Events.
+        """
+        ctx = self.experts[expert_name]
+        wrapper = ctx.wrapper
+        parser = ObservationParser.from_env(wrapper.env, self.history_len)
+        action_parser = ActionParser.from_env(wrapper.env)
+        obc_logger = OBCLogger()
+
+        obs, info = wrapper.reset()
+        parser.reset(obs)
+        obs_ts, obs_sigs = parser.get_observation(torch.device("cpu"))
+        act_sigs = action_parser.action_signatures
+
+        if send_sigs:
+            result_queue.put(("sigs", expert_name, obs_sigs, act_sigs))
+
+        obs_buf.copy_(obs_ts.squeeze(0))
+        if ctx.use_expert:
+            ea = wrapper.get_expert_action(obs)
+            expert_action_buf.copy_(torch.from_numpy(ea).float())
+
+        done_val.value = 0
+        reward_val.value = 0.0
+        obs_ready.set()
+
+        try:
+            while True:
+                action_ready.wait()
+                action_ready.clear()
+
+                if stop_flag.value:
+                    break
+
+                action_np = action_buf.numpy().copy()
+                next_obs, reward, terminated, truncated, info = wrapper.step(action_np)
+                done = terminated or truncated
+
+                reward_val.value = float(reward)
+                done_val.value = 1 if done else 0
+
+                obc_logger.step(
+                    reward=reward,
+                    info=info if isinstance(info, dict) else None,
+                )
+                with step_counter.get_lock():
+                    step_counter.value += 1
+
+                if done:
+                    obc_logger.end_episode()
+                    obs, info = wrapper.reset()
+                    parser.reset(obs)
+                else:
+                    parser.update(next_obs)
+                    obs = next_obs
+
+                obs_ts, _ = parser.get_observation(torch.device("cpu"))
+                obs_buf.copy_(obs_ts.squeeze(0))
+                if ctx.use_expert:
+                    ea = wrapper.get_expert_action(obs)
+                    expert_action_buf.copy_(torch.from_numpy(ea).float())
+
+                obs_ready.set()
+
+        except Exception as e:
+            import traceback
+            print(f"VecWorker [{expert_name}] failed: {e}")
+            traceback.print_exc()
+
+        finally:
+            result_queue.put(("logger", expert_name, obc_logger))
+
+    def _sample_vectorized(self) -> Tuple[Dict[str, OBCBatch], Dict[str, OBCLogger]]:
+        """
+        Vectorized sampling: env workers step on CPU, main process does
+        batched policy inference on GPU/MPS.
+
+        Workers communicate via shared-memory tensors + Events (lockstep).
+        Policy stays on device the entire time.
+
+        Config knobs:
+            vec_batch_size (per-expert): number of parallel envs / GPU batch.
+                Falls back to num_threads if not set.
+            finish_episodes (global, run config): when True, after reaching
+                min_batch_size the loop keeps stepping workers whose episodes
+                haven't ended yet (drain phase).  Workers that reach done/truncated
+                are deactivated.  When all workers are done, sampling completes.
+                When False (default), sampling stops immediately.
+
+        bfloat16 autocast is applied to GPU inference when use_bfloat16=True.
+        """
+        t_start = time.time()
+        self.policy.eval()
+
+        optimizer_to(self.optimizer, torch.device('cpu'))
+
+        prof = Profiler(
+            device=str(self.device) if self.device.type == 'cuda' else None,
+        )
+        prof.time_enabled = (self.epoch == 0)
+
+        result_queue = fork_ctx.Queue()
+        stop_flag = fork_ctx.Value('i', 0)
+
+        # ── Spawn workers ────────────────────────────────────────
+        class _WH:
+            """Worker handle."""
+            __slots__ = (
+                'expert_name', 'obs_buf', 'action_buf', 'expert_action_buf',
+                'reward_val', 'done_val', 'obs_ready', 'action_ready', 'proc',
+                'active',
+            )
+
+        workers_by_expert: Dict[str, List] = {n: [] for n in self.experts}
+        all_workers: List = []
+        step_counters: Dict[str, Any] = {}
+
+        for expert_name, ctx in self.experts.items():
+            obs_shape = (ctx.parser.n_obs_elements, self.history_len)
+            action_dim = ctx.wrapper.action_dim
+            step_counter = fork_ctx.Value('i', 0)
+            step_counters[expert_name] = step_counter
+
+            n_workers = ctx.vec_batch_size or ctx.num_threads
+
+            for w_idx in range(n_workers):
+                wh = _WH()
+                wh.expert_name = expert_name
+                wh.obs_buf = torch.zeros(obs_shape, dtype=torch.float32).share_memory_()
+                wh.action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
+                wh.expert_action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
+                wh.reward_val = fork_ctx.Value('d', 0.0)
+                wh.done_val = fork_ctx.Value('i', 0)
+                wh.obs_ready = fork_ctx.Event()
+                wh.action_ready = fork_ctx.Event()
+                wh.active = True
+
+                wh.proc = fork_ctx.Process(
+                    target=self._vec_env_worker,
+                    args=(
+                        expert_name,
+                        wh.obs_buf, wh.action_buf, wh.expert_action_buf,
+                        wh.reward_val, wh.done_val,
+                        wh.obs_ready, wh.action_ready,
+                        stop_flag, result_queue, step_counter,
+                        w_idx == 0,
+                    ),
+                    daemon=True,
+                )
+                workers_by_expert[expert_name].append(wh)
+                all_workers.append(wh)
+
+        for wh in all_workers:
+            wh.proc.start()
+
+        total_workers = len(all_workers)
+        workers_per_expert = {
+            n: len(ws) for n, ws in workers_by_expert.items()
+        }
+        logger.info(
+            f"Vectorized sampling: {total_workers} env workers "
+            f"({workers_per_expert}), inference on {self.device}, "
+            f"finish_episodes={self.finish_episodes}"
+        )
+
+        # ── Collect signatures (one per expert) ──────────────────
+        sigs_by_expert: Dict[str, Tuple] = {}
+        while len(sigs_by_expert) < len(self.experts):
+            msg = result_queue.get(timeout=30)
+            if msg[0] == "sigs":
+                sigs_by_expert[msg[1]] = (msg[2], msg[3])
+
+        # ── Wait for obs from active workers ─────────────────────
+        def _wait_obs_active():
+            for wh in all_workers:
+                if not wh.active:
+                    continue
+                while not wh.obs_ready.wait(timeout=2.0):
+                    if not wh.proc.is_alive():
+                        raise RuntimeError(
+                            f"VecWorker [{wh.expert_name}] died "
+                            f"(exit code {wh.proc.exitcode})"
+                        )
+                wh.obs_ready.clear()
+
+        _wait_obs_active()
+
+        # ── Per-worker memory tracking ───────────────────────────
+        worker_mems: Dict[int, OBCMemory] = {id(w): OBCMemory() for w in all_workers}
+        worker_prev: Dict[int, Optional[dict]] = {id(w): None for w in all_workers}
+
+        per_expert_steps: Dict[str, int] = {n: 0 for n in self.experts}
+        target_steps = {n: ctx.min_batch_size for n, ctx in self.experts.items()}
+
+        pbars = {
+            n: tqdm(total=t, desc=f"  Sampling [{n}]", unit="step")
+            for n, t in target_steps.items()
+        }
+
+        device = self.device
+        device_type = "cuda" if device.type == "cuda" else "cpu"
+        use_amp = self.use_bfloat16 and device.type == "cuda"
+        has_prev = False
+        draining = False
+
+        # ── Main inference loop ──────────────────────────────────
+        with torch.no_grad():
+            while True:
+                # ── Store memory from previous step ──────────────
+                if has_prev:
+                    with prof.section("store_memory"):
+                        for expert_name, workers in workers_by_expert.items():
+                            obs_sigs, act_sigs = sigs_by_expert[expert_name]
+
+                            for wh in workers:
+                                if not wh.active:
+                                    continue
+                                wid = id(wh)
+                                prev = worker_prev[wid]
+                                if prev is None:
+                                    continue
+                                mem = worker_mems[wid]
+
+                                mem.states.append(prev["obs"])
+                                mem.obs_signatures.append(obs_sigs)
+                                mem.action_signatures.append(act_sigs)
+                                mem.student_actions.append(prev["action"])
+                                mem.expert_actions.append(prev["expert_action"])
+                                mem.rewards.append(wh.reward_val.value)
+                                mem.values.append(prev["value"])
+                                mem.masks.append(0.0 if wh.done_val.value else 1.0)
+                                mem.log_probs.append(prev["log_prob"])
+                                per_expert_steps[expert_name] += 1
+
+                    for n, pbar in pbars.items():
+                        pbar.n = min(per_expert_steps[n], pbar.total)
+                        pbar.refresh()
+
+                    # ── Drain phase: deactivate workers whose episode ended ──
+                    if draining:
+                        for wh in all_workers:
+                            if wh.active and wh.done_val.value:
+                                wh.active = False
+                        if not any(wh.active for wh in all_workers):
+                            break
+
+                    # ── Check if target reached ──────────────────
+                    target_reached = all(
+                        per_expert_steps[n] >= target_steps[n]
+                        for n in self.experts
+                    )
+                    if target_reached:
+                        if not self.finish_episodes:
+                            break
+                        if not draining:
+                            draining = True
+                            for wh in all_workers:
+                                if wh.done_val.value:
+                                    wh.active = False
+                            if not any(wh.active for wh in all_workers):
+                                break
+
+                # ── Batched inference per expert (active only) ───
+                with prof.section("inference"):
+                    for expert_name, workers in workers_by_expert.items():
+                        obs_sigs, act_sigs = sigs_by_expert[expert_name]
+                        ctx = self.experts[expert_name]
+
+                        active_workers = [wh for wh in workers if wh.active]
+                        if not active_workers:
+                            continue
+
+                        with prof.section("stack_obs"):
+                            batch_obs = torch.stack(
+                                [wh.obs_buf.clone() for wh in active_workers]
+                            )
+
+                        with prof.section("gpu_forward"):
+                            with torch.autocast(
+                                device_type=device_type,
+                                dtype=torch.bfloat16,
+                                enabled=use_amp,
+                            ):
+                                actions, log_probs, values = \
+                                    self.policy_module.get_action(
+                                        batch_obs.to(device),
+                                        obs_sigs, act_sigs,
+                                        expert_name=expert_name,
+                                        deterministic=False,
+                                    )
+                            actions_cpu = actions.cpu()
+                            log_probs_cpu = log_probs.cpu()
+                            values_cpu = values.cpu()
+
+                        with prof.section("scatter"):
+                            zero_ea = torch.zeros(ctx.wrapper.action_dim)
+                            for i, wh in enumerate(active_workers):
+                                worker_prev[id(wh)] = {
+                                    "obs": wh.obs_buf.clone(),
+                                    "action": actions_cpu[i],
+                                    "log_prob": log_probs_cpu[i],
+                                    "value": values_cpu[i],
+                                    "expert_action": (
+                                        wh.expert_action_buf.clone()
+                                        if ctx.use_expert else zero_ea
+                                    ),
+                                }
+                                wh.action_buf.copy_(actions_cpu[i])
+
+                has_prev = True
+
+                # Signal active workers → env.step → wait for next obs
+                for wh in all_workers:
+                    if wh.active:
+                        wh.action_ready.set()
+
+                with prof.section("wait_env_step"):
+                    _wait_obs_active()
+
+        # ── Cleanup ──────────────────────────────────────────────
+        for pbar in pbars.values():
+            pbar.n = pbar.total
+            pbar.refresh()
+            pbar.close()
+
+        stop_flag.value = 1
+        for wh in all_workers:
+            wh.action_ready.set()
+
+        per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
+        collected = 0
+        while collected < total_workers:
+            try:
+                msg = result_queue.get(timeout=10)
+                if msg[0] == "logger":
+                    per_expert_loggers[msg[1]].append(msg[2])
+                    collected += 1
+            except Exception:
+                break
+
+        for wh in all_workers:
+            wh.proc.join(timeout=5)
+
+        if prof.time_enabled:
+            self.profiler_reports["vectorized_sampling"] = prof
+
+        optimizer_to(self.optimizer, self.device)
+
+        # ── Merge per expert ─────────────────────────────────────
+        expert_batches: Dict[str, OBCBatch] = {}
+        expert_loggers: Dict[str, OBCLogger] = {}
+
+        for expert_name, workers in workers_by_expert.items():
+            merged = OBCMemory()
+            for wh in workers:
+                merged.extend(worker_mems[id(wh)])
+
+            batch = merged.to_batch(gamma=self.gamma, tau=self.tau, device=None)
+            expert_batches[expert_name] = batch
+            expert_loggers[expert_name] = OBCLogger.merge(
+                per_expert_loggers.get(expert_name, [])
+            )
 
         sample_time = time.time() - t_start
         for lg in expert_loggers.values():

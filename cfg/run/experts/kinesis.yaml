@@ -6,6 +6,7 @@ overrides: []     # Hydra overrides для Kinesis конфига, e.g. ["run.nu
 
 # Per-expert parallelism (null = use global run.num_threads / learning.min_batch_size)
 num_threads: null
+vec_batch_size: null
 
 # Per-expert loss weights (null = use global cfg.learning.*)
 learning:

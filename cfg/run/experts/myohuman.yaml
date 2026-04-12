@@ -5,6 +5,8 @@ simple: false
 
 # Per-expert parallelism (null = use global run.num_threads / learning.min_batch_size)
 num_threads: null
+# vec_batch_size: number of parallel envs for vectorized GPU sampling (null = num_threads)
+vec_batch_size: null
 
 # Per-expert loss weights (null = use global cfg.learning.*)
 learning:

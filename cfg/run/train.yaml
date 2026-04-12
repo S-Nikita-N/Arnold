@@ -10,6 +10,12 @@ log_frequency: 1
 num_threads: 1
 headless: true
 
+# ==================== Vectorized Sampling ====================
+# finish_episodes: true  = after reaching min_batch_size, keep stepping active workers
+#                          until all current episodes end (done/truncated)
+# finish_episodes: false = stop sampling immediately when min_batch_size is reached
+finish_episodes: false
+
 # ==================== Paths ====================
 output_dir: data/trained_models/${exp_name}
 
