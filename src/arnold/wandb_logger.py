@@ -110,10 +110,12 @@ class WandbLogger:
             # Steps
             log_dict[f"{expert_name}/progress/batch_steps"] = obc_logger.num_steps
 
-            # Reward components
+            # Reward components & eval metrics from sampling rollouts
+            eval_keys = {"mpjpe", "frame_coverage", "success"}
             for k, v in obc_logger.info_dict.items():
                 if v:
-                    log_dict[f"{expert_name}/reward_component/{k}"] = np.mean(v)
+                    prefix = "train_rollout" if k in eval_keys else "reward_component"
+                    log_dict[f"{expert_name}/{prefix}/{k}"] = np.mean(v)
 
             # PPO diagnostics
             diag = all_diagnostics.get(expert_name, {})
