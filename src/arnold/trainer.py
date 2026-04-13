@@ -1947,7 +1947,7 @@ class ArnoldTrainer:
         """
         self.seed_worker(worker_id)
         ctx = self.experts[expert_name]
-        wrapper = ctx.wrapper
+        wrapper = self.valid_experts[expert_name]
         env = wrapper.env
         parser = ObservationParser.from_env(env, self.history_len)
         action_parser = ActionParser.from_env(env)
