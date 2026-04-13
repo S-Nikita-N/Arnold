@@ -36,13 +36,15 @@ class WandbLogger:
     def _init_wandb(self) -> None:
         config_dict = OmegaConf.to_container(self.cfg, resolve=True)
 
+        run_id = self.cfg.get("wandb_run_id")
         wandb.init(
             project=self.cfg.wandb_project,
             name=self.cfg.exp_name,
             notes=self.cfg.notes,
             config=config_dict,
             dir=self.cfg.run.output_dir,
-            resume="allow",
+            id=run_id,
+            resume="must" if run_id else "allow",
         )
         logger.info(f"WandB initialized: {wandb.run.name} ({wandb.run.id})")
 

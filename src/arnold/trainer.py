@@ -214,6 +214,9 @@ class ArnoldTrainer:
         self.eval_frequency = cfg.run.eval_frequency
         self.resampling_interval = cfg.run.resampling_interval
         self.finish_episodes = cfg.run.finish_episodes
+        self.vectorized_eval = cfg.run.get("vectorized_eval", True)
+        if not cfg.run.headless:
+            self.vectorized_eval = False
 
         # Logging
         self.use_wandb = cfg.use_wandb
@@ -1787,7 +1790,14 @@ class ArnoldTrainer:
                 all_eval[expert_name] = {}
                 continue
 
-            all_eval[expert_name] = self.evaluate_expert(expert_name, ctx, valid_wrapper)
+            if self.vectorized_eval and self.device.type in ('cuda', 'mps'):
+                all_eval[expert_name] = self._evaluate_expert_vectorized(
+                    expert_name, ctx, valid_wrapper,
+                )
+            else:
+                all_eval[expert_name] = self.evaluate_expert(
+                    expert_name, ctx, valid_wrapper,
+                )
 
         return all_eval
 
@@ -1908,6 +1918,326 @@ class ArnoldTrainer:
             f"length={metrics['eval/mean_length']:.2f}±{metrics['eval/std_length']:.2f}"
             + (f", im_loss={metrics.get('eval/imitation_loss', 0):.4f}" if ctx.use_expert else "")
             + f", val_loss={metrics['eval/value_loss']:.4f}"
+            + extra
+        )
+
+        return metrics
+
+    # ------------------------------------------------------------------
+    #  Vectorized Evaluation
+    # ------------------------------------------------------------------
+
+    def _eval_env_worker(
+        self,
+        expert_name: str,
+        worker_id: int,
+        obs_buf: torch.Tensor,
+        action_buf: torch.Tensor,
+        expert_action_buf: torch.Tensor,
+        obs_ready,
+        action_ready,
+        stop_flag,
+        motion_queue,
+        result_queue,
+        send_sigs: bool,
+    ) -> None:
+        """
+        Eval env worker. Pulls motion_ids from motion_queue, runs episodes,
+        reports per-episode metrics via result_queue.
+        """
+        self.seed_worker(worker_id)
+        ctx = self.experts[expert_name]
+        wrapper = ctx.wrapper
+        env = wrapper.env
+        parser = ObservationParser.from_env(env, self.history_len)
+        action_parser = ActionParser.from_env(env)
+
+        env.start_eval(im_eval=True)
+
+        def _load_next_motion() -> bool:
+            """Pull next motion from queue, reset env. Returns False if no more."""
+            try:
+                motion_id = motion_queue.get_nowait()
+            except Exception:
+                return False
+            env._current_eval_motion_id = int(motion_id)
+            env._active_motion_ids = np.array([motion_id])
+            return True
+
+        def _reset_and_fill_obs():
+            """Reset env, fill shared obs buffer."""
+            nonlocal obs, send_sigs
+            obs, info = wrapper.reset()
+            parser.reset(obs)
+            obs_ts, obs_sigs = parser.get_observation(torch.device("cpu"))
+            act_sigs = action_parser.action_signatures
+            if send_sigs:
+                result_queue.put(("sigs", expert_name, obs_sigs, act_sigs))
+                send_sigs = False
+            obs_buf.copy_(obs_ts.squeeze(0))
+            if ctx.use_expert:
+                ea = wrapper.get_expert_action(obs)
+                expert_action_buf.copy_(torch.from_numpy(ea).float())
+
+        obs = None
+
+        try:
+            # Load first motion
+            if not _load_next_motion():
+                return
+            _reset_and_fill_obs()
+            obs_ready.set()
+
+            ep_reward = 0.0
+            ep_length = 0
+            ep_im_losses = []
+
+            while True:
+                action_ready.wait()
+                action_ready.clear()
+
+                if stop_flag.value:
+                    env.end_eval()
+                    return
+
+                action_np = action_buf.numpy().copy()
+
+                if ctx.use_expert:
+                    ea_np = expert_action_buf.numpy().copy()
+                    ep_im_losses.append(float(((action_np - ea_np) ** 2).mean()))
+
+                next_obs, reward, terminated, truncated, info = wrapper.step(action_np)
+                done = terminated or truncated
+                ep_reward += reward
+                ep_length += 1
+
+                if done:
+                    result_queue.put(("episode", expert_name, {
+                        "reward": ep_reward,
+                        "length": ep_length,
+                        "im_loss": float(np.mean(ep_im_losses)) if ep_im_losses else None,
+                        "mpjpe": info.get("mpjpe"),
+                        "frame_coverage": info.get("frame_coverage"),
+                        "success": info.get("success"),
+                    }))
+
+                    # Try next motion
+                    if not _load_next_motion():
+                        break
+                    _reset_and_fill_obs()
+                    ep_reward = 0.0
+                    ep_length = 0
+                    ep_im_losses = []
+                    obs_ready.set()
+                    continue
+
+                parser.update(next_obs)
+                obs = next_obs
+                obs_ts, _ = parser.get_observation(torch.device("cpu"))
+                obs_buf.copy_(obs_ts.squeeze(0))
+                if ctx.use_expert:
+                    ea = wrapper.get_expert_action(obs)
+                    expert_action_buf.copy_(torch.from_numpy(ea).float())
+                obs_ready.set()
+
+        except Exception as e:
+            import traceback
+            print(f"EvalWorker {worker_id} [{expert_name}] failed: {e}")
+            traceback.print_exc()
+
+        finally:
+            env.end_eval()
+            result_queue.put(("done", expert_name, worker_id))
+
+    def _evaluate_expert_vectorized(
+        self,
+        expert_name: str,
+        ctx: ExpertContext,
+        valid_wrapper,
+    ) -> Dict[str, float]:
+        """
+        Vectorized evaluation: N env workers step on CPU,
+        main process does batched inference on GPU/MPS.
+        """
+        self.policy.eval()
+
+        n_workers = ctx.vec_batch_size or ctx.num_threads
+        total_motions = valid_wrapper.num_motions
+        # Don't spawn more workers than motions
+        n_workers = min(n_workers, total_motions)
+
+        # Fill motion queue
+        motion_queue = fork_ctx.Queue()
+        for motion_id in valid_wrapper.env._all_motion_ids:
+            motion_queue.put(int(motion_id))
+
+        result_queue = fork_ctx.Queue()
+        stop_flag = fork_ctx.Value('i', 0)
+
+        # Spawn workers
+        obs_shape = (ctx.parser.n_obs_elements, self.history_len)
+        action_dim = ctx.wrapper.action_dim
+        device = self.device
+        device_type = "cuda" if device.type == "cuda" else "cpu"
+        use_amp = self.use_bfloat16 and device.type == "cuda"
+
+        class _WH:
+            __slots__ = (
+                'obs_buf', 'action_buf', 'expert_action_buf',
+                'obs_ready', 'action_ready', 'proc', 'active',
+            )
+
+        workers: List[_WH] = []
+        for w_idx in range(n_workers):
+            wh = _WH()
+            wh.obs_buf = torch.zeros(obs_shape, dtype=torch.float32).share_memory_()
+            wh.action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
+            wh.expert_action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
+            wh.obs_ready = fork_ctx.Event()
+            wh.action_ready = fork_ctx.Event()
+            wh.active = True
+            wh.proc = fork_ctx.Process(
+                target=self._eval_env_worker,
+                args=(
+                    expert_name, w_idx + 1,
+                    wh.obs_buf, wh.action_buf, wh.expert_action_buf,
+                    wh.obs_ready, wh.action_ready,
+                    stop_flag, motion_queue, result_queue,
+                    w_idx == 0,  # send_sigs
+                ),
+                daemon=True,
+            )
+            workers.append(wh)
+
+        for wh in workers:
+            wh.proc.start()
+
+        # Collect sigs
+        obs_sigs, act_sigs = None, None
+        msg = result_queue.get(timeout=30)
+        if msg[0] == "sigs":
+            obs_sigs, act_sigs = msg[2], msg[3]
+
+        # Episode results
+        episode_rewards = []
+        episode_lengths = []
+        episode_imitation_losses = []
+        episode_mpjpes = []
+        episode_frame_coverages = []
+        episode_successes = []
+
+        pbar = tqdm(total=total_motions, desc=f"Eval [{expert_name}]", unit="ep")
+        workers_done = 0
+
+        # Main inference loop
+        with torch.no_grad():
+            while workers_done < n_workers:
+                # Drain result_queue for completed episodes / done workers
+                while True:
+                    try:
+                        msg = result_queue.get_nowait()
+                        if msg[0] == "episode":
+                            m = msg[2]
+                            episode_rewards.append(m["reward"])
+                            episode_lengths.append(m["length"])
+                            if m["im_loss"] is not None:
+                                episode_imitation_losses.append(m["im_loss"])
+                            if m["mpjpe"] is not None:
+                                episode_mpjpes.append(float(m["mpjpe"]))
+                            if m["frame_coverage"] is not None:
+                                episode_frame_coverages.append(float(m["frame_coverage"]))
+                            if m["success"] is not None:
+                                episode_successes.append(float(m["success"]))
+                            pbar.update(1)
+                        elif msg[0] == "done":
+                            workers_done += 1
+                        elif msg[0] == "sigs":
+                            obs_sigs, act_sigs = msg[2], msg[3]
+                    except Exception:
+                        break
+
+                if workers_done >= n_workers:
+                    break
+
+                # Wait for active workers' obs
+                active_workers = []
+                for wh in workers:
+                    if not wh.active:
+                        continue
+                    got_obs = wh.obs_ready.wait(timeout=0.5)
+                    if got_obs:
+                        wh.obs_ready.clear()
+                        active_workers.append(wh)
+                    elif not wh.proc.is_alive():
+                        wh.active = False
+
+                if not active_workers:
+                    continue
+
+                # Batched GPU inference
+                batch_obs = torch.stack([wh.obs_buf.clone() for wh in active_workers])
+
+                with torch.autocast(
+                    device_type=device_type,
+                    dtype=torch.bfloat16,
+                    enabled=use_amp,
+                ):
+                    actions, _, _ = self.policy_module.get_action(
+                        batch_obs.to(device),
+                        obs_sigs, act_sigs,
+                        expert_name=expert_name,
+                        deterministic=True,
+                        return_std=False,
+                        return_value=False,
+                    )
+                actions_cpu = actions.cpu()
+
+                for i, wh in enumerate(active_workers):
+                    wh.action_buf.copy_(actions_cpu[i])
+                    if ctx.use_expert:
+                        # expert_action already in buf from worker
+                        pass
+                    wh.action_ready.set()
+
+        pbar.close()
+
+        # Cleanup
+        stop_flag.value = 1
+        for wh in workers:
+            wh.action_ready.set()
+        for wh in workers:
+            wh.proc.join(timeout=5)
+
+        # Build metrics dict (same format as evaluate_expert)
+        metrics = {
+            "eval/mean_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
+            "eval/std_reward": float(np.std(episode_rewards)) if episode_rewards else 0.0,
+            "eval/mean_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
+            "eval/std_length": float(np.std(episode_lengths)) if episode_lengths else 0.0,
+            "eval/value_loss": 0.0,  # not computed in vectorized mode
+        }
+        if episode_imitation_losses:
+            metrics["eval/imitation_loss"] = float(np.mean(episode_imitation_losses))
+        if episode_mpjpes:
+            metrics["eval/mpjpe"] = float(np.mean(episode_mpjpes))
+        if episode_frame_coverages:
+            metrics["eval/frame_coverage"] = float(np.mean(episode_frame_coverages))
+        if episode_successes:
+            metrics["eval/success_rate"] = float(np.mean(episode_successes))
+
+        extra = ""
+        if "eval/mpjpe" in metrics:
+            extra += f", mpjpe={metrics['eval/mpjpe'] * 1000:.2f}mm"
+        if "eval/frame_coverage" in metrics:
+            extra += f", frame_cov={metrics['eval/frame_coverage']:.3f}"
+        if "eval/success_rate" in metrics:
+            extra += f", success={metrics['eval/success_rate']:.3f}"
+
+        logger.info(
+            f"Eval [{expert_name}] (vectorized, {n_workers} workers): "
+            f"reward={metrics['eval/mean_reward']:.4f}±{metrics['eval/std_reward']:.4f}, "
+            f"length={metrics['eval/mean_length']:.2f}±{metrics['eval/std_length']:.2f}"
+            + (f", im_loss={metrics.get('eval/imitation_loss', 0):.4f}" if ctx.use_expert else "")
             + extra
         )
 

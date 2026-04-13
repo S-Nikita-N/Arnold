@@ -16,6 +16,7 @@ seed: 42
 # ==================== Logging ====================
 use_wandb: true
 wandb_project: arnold
+wandb_run_id: null  # ID существующего рана для продолжения логирования
 no_log: false
 
 # ==================== Resume ====================
