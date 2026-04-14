@@ -7,27 +7,27 @@ MoE-Lattice Policy — Shared Expert + N Routed Experts, Low-Rank Covariance.
         ┌────────────────┴────────────────────────────────────────────────────┐
         │  Shared Expert         │  Routing (top-k из N)  │  Gate (отдельная) │
         │  net(h) → e_shared     │  expert_i(h) → [B, A]  │  gate_net(h)      │
-        │  [B, shared_latent]    │                        │  → gate_head      │
-        │  action_head(e_shared) │                        │  → [B, num_exp]   │
+        │  [B, latent_dim]       │  expert_heads → [B, A]  │  → [B, num_exp]   │
+        │  action_head(e_shared) │  head.weight → W_i      │                   │
         │  → shared_mean [B, A]  │                        │                   │
         └────────────────┬────────────────────────────────────────────────────┘
                          ↓
-          mean = α·shared_mean + (1-α)·routed_mean
-                         ↓
-          cov_factor = shared_head.weight * latent_std
-                       [A, shared_latent] — ОДИН тензор, без per-sample аггрегации
+          mean       = α·shared_mean + (1-α)·routed_mean
+          cov_factor = α·W_shared   + (1-α)·Σ(w_i·W_i)   (всё * latent_std)
                          ↓
           LowRankMultivariateNormal(mean, cov_factor, diag_std²)
 
+  Требуется: shared_expert_units[-1] == expert_units[-1] (общий latent_dim).
+
 Параметры:
   shared_units        — слои shared_trunk (общий для всех путей), по умолчанию (2048,1536,1024)
-  shared_expert_units — слои shared expert body, последний = shared_latent_dim (default (256,64))
+  shared_expert_units — слои shared expert body, последний = latent_dim (default (256,64))
   num_experts         — размер пула routing-экспертов (default 5)
   top_k               — сколько routing-экспертов активировать (default 1 → 1/5 пула)
-  expert_units        — слои каждого routing-эксперта, default (512,512)
+  expert_units        — слои каждого routing-эксперта, последний = latent_dim (default (512,512))
   gate_units          — слои отдельной gate MLP (input = h), default (512, 256)
   value_units         — слои отдельной value MLP, default (2048,1536,1024,512,512)
-  alpha               — вес shared expert в итоговом mean (default 0.3), routing = 1-alpha
+  alpha               — вес shared expert (default 0.3), routing = 1-alpha
   load_balance_weight — вес Switch Transformer LB loss (default 0.01)
 """
 
@@ -51,12 +51,11 @@ class MoELatticePolicy(nn.Module):
     """
     Shared Expert + N Routed Experts MoE Policy с low-rank ковариацией.
 
-    Ковариация строится ТОЛЬКО из весов головы shared expert:
-        cov_factor = shared_expert_head.weight * latent_std
-        shape:       [action_dim, shared_latent_dim]  (expand→batch без per-sample аггрегации)
+    Ковариация строится из ВСЕХ экспертов (shared + routed), взвешивается gate:
+        cov_factor = α·W_shared + (1-α)·Σ(w_i·W_i), всё умножено на latent_std
+        shape:       [batch, action_dim, latent_dim]  — per-sample через gate weights
 
-    Профилирование:
-        self.profiler — Profiler (time + mem), настраивается через set_profiler()
+    Требование: shared_expert_units[-1] == expert_units[-1] (единый latent_dim).
     """
 
     def __init__(
@@ -100,21 +99,24 @@ class MoELatticePolicy(nn.Module):
 
         # ── Shared expert ─────────────────────────────────────────────
         if not shared_expert_units:
+            raise ValueError("shared_expert_units не может быть пустым")
+        if not expert_units:
+            raise ValueError("expert_units не может быть пустым")
+        if shared_expert_units[-1] != expert_units[-1]:
             raise ValueError(
-                "shared_expert_units не может быть пустым "
-                "(нужен хотя бы один элемент)"
+                f"shared_expert_units[-1] ({shared_expert_units[-1]}) != "
+                f"expert_units[-1] ({expert_units[-1]}): "
+                f"latent_dim должен совпадать для cov_factor aggregation"
             )
 
-        self.shared_latent_dim = shared_expert_units[-1]
+        self.latent_dim = shared_expert_units[-1]
 
         self.shared_expert_net = MLP(trunk_out_dim, shared_expert_units, activation)
-        # Action head: [action_dim × shared_latent_dim] — её ВЕСА используются для ковариации
-        self.shared_expert_head = nn.Linear(self.shared_latent_dim, action_dim)
+        self.shared_expert_head = nn.Linear(self.latent_dim, action_dim)
         self.shared_expert_head.weight.data.mul_(0.1)
         self.shared_expert_head.bias.data.zero_()
 
         # ── Gate network ──────────────────────────────────────────────
-        # Отдельная gate MLP. Вход = h (выход shared_trunk если есть, иначе raw obs).
         if not gate_units:
             raise ValueError("gate_units не может быть пустым")
 
@@ -124,25 +126,20 @@ class MoELatticePolicy(nn.Module):
         )
 
         # ── Routing experts ───────────────────────────────────────────
-        if not expert_units:
-            raise ValueError("expert_units не может быть пустым")
-
-        expert_latent_dim = expert_units[-1]
-
         self.expert_nets = nn.ModuleList()
         self.expert_heads = nn.ModuleList()
         for _ in range(num_experts):
             net = MLP(trunk_out_dim, expert_units, activation)
-            head = nn.Linear(expert_latent_dim, action_dim)
+            head = nn.Linear(self.latent_dim, action_dim)
             head.weight.data.mul_(0.1)
             head.bias.data.zero_()
             self.expert_nets.append(net)
             self.expert_heads.append(head)
 
         # ── Std parameters ────────────────────────────────────────────
-        # [action_dim (diagonal) + shared_latent_dim (low-rank cov)]
+        # [action_dim (diagonal) + latent_dim (low-rank cov)]
         self.log_std = nn.Parameter(
-            torch.ones(1, action_dim + self.shared_latent_dim) * log_std_init,
+            torch.ones(1, action_dim + self.latent_dim) * log_std_init,
             requires_grad=not fix_std,
         )
 
@@ -205,10 +202,10 @@ class MoELatticePolicy(nn.Module):
         return_value: bool = True,
     ) -> Tuple[
         torch.Tensor,           # mean          [batch, action_dim]
-        Optional[torch.Tensor], # cov_factor    [batch, action_dim, shared_latent_dim]
+        Optional[torch.Tensor], # cov_factor    [batch, action_dim, latent_dim]
         Optional[torch.Tensor], # diag_std      [batch, action_dim]
         Optional[torch.Tensor], # value         [batch, 1]
-        Optional[torch.Tensor], # latent_std    [shared_latent_dim]
+        Optional[torch.Tensor], # latent_std    [latent_dim]
         torch.Tensor,           # load_balance_loss [1]
     ]:
         """
@@ -237,7 +234,7 @@ class MoELatticePolicy(nn.Module):
 
         # ── 2. Shared expert ─────────────────────────────────────────
         with p.section("shared_expert"):
-            e_shared = self.shared_expert_net(h)            # [batch, shared_latent_dim]
+            e_shared = self.shared_expert_net(h)            # [batch, latent_dim]
             shared_mean = self.shared_expert_head(e_shared) # [batch, action_dim]
 
         # ── 3. Gate routing (отдельная MLP на h) ─────────────────────
@@ -268,20 +265,7 @@ class MoELatticePolicy(nn.Module):
             routed_mean = (route_means * top_k_weights.unsqueeze(-1)).sum(dim=1)
             mean = self.alpha * shared_mean + (1.0 - self.alpha) * routed_mean
 
-        # Кеш норм для диагностики (detach, без влияния на граф)
-        with torch.no_grad():
-            s_norm = shared_mean.detach().norm(dim=-1).mean().item()
-            r_norm = routed_mean.detach().norm(dim=-1).mean().item()
-            s_contrib = self.alpha * s_norm
-            r_contrib = (1.0 - self.alpha) * r_norm
-            total = s_contrib + r_contrib + 1e-8
-            self._expert_mean_stats = {
-                "shared_norm": s_norm,
-                "routed_norm": r_norm,
-                "shared_frac": s_contrib / total,
-            }
-
-        # ── 6. Covariance from shared expert head weight ──────────────
+        # ── 6. Covariance from ALL experts (shared + routed) ──────────
         cov_factor = None
         diag_std = None
         latent_std = None
@@ -289,9 +273,46 @@ class MoELatticePolicy(nn.Module):
             with p.section("cov_factor"):
                 std = F.softplus(self.log_std) + self.min_diag_std
                 diag_std = std[:, :self.action_dim].expand(batch_size, -1)
-                latent_std = std[:, self.action_dim:].squeeze(0)
-                W = self.shared_expert_head.weight
-                cov_factor = (W * latent_std.unsqueeze(0)).unsqueeze(0).expand(batch_size, -1, -1)
+                latent_std = std[:, self.action_dim:].squeeze(0)  # [latent_dim]
+
+                # Shared expert: W_shared [action_dim, latent_dim]
+                W_shared = self.shared_expert_head.weight
+
+                # Routing experts: gather top-k head weights, weight by gate
+                # [num_experts, action_dim, latent_dim]
+                all_W = torch.stack([h.weight for h in self.expert_heads])
+                # [batch*top_k, action_dim, latent_dim] → [batch, top_k, action_dim, latent_dim]
+                selected_W = all_W[top_k_indices.reshape(-1)].view(
+                    batch_size, self.top_k, self.action_dim, self.latent_dim,
+                )
+                # Weighted sum → [batch, action_dim, latent_dim]
+                routed_W = (selected_W * top_k_weights[:, :, None, None]).sum(dim=1)
+
+                # Combine: α·W_shared + (1-α)·routed_W → [batch, action_dim, latent_dim]
+                cov_W = self.alpha * W_shared.unsqueeze(0) + (1.0 - self.alpha) * routed_W
+                cov_factor = cov_W * latent_std[None, None, :]
+
+        # Кеш норм для диагностики (detach, без влияния на граф)
+        with torch.no_grad():
+            s_norm = shared_mean.detach().norm(dim=-1).mean().item()
+            r_norm = routed_mean.detach().norm(dim=-1).mean().item()
+            s_contrib = self.alpha * s_norm
+            r_contrib = (1.0 - self.alpha) * r_norm
+            total = s_contrib + r_contrib + 1e-8
+            self._expert_stats = {
+                "shared_mean_norm": s_norm,
+                "routed_mean_norm": r_norm,
+                "shared_mean_frac": s_contrib / total,
+            }
+            if cov_factor is not None:
+                s_cov_norm = W_shared.detach().norm().item()
+                r_cov_norm = routed_W.detach().norm(dim=(-2, -1)).mean().item()
+                sc = self.alpha * s_cov_norm
+                rc = (1.0 - self.alpha) * r_cov_norm
+                ct = sc + rc + 1e-8
+                self._expert_stats["shared_cov_norm"] = s_cov_norm
+                self._expert_stats["routed_cov_norm"] = r_cov_norm
+                self._expert_stats["shared_cov_frac"] = sc / ct
 
         # ── 7. Value network ─────────────────────────────────────────
         value = None

@@ -48,7 +48,7 @@ use_bfloat16: false
 # ==================== MoE-Lattice (только при policy: moe) ====================
 moe:
   shared_units: [2048, 1536, 1024]      # shared trunk
-  shared_expert_units: [256, 64]        # последний = shared_latent_dim
+  shared_expert_units: [256, 64]        # последний = latent_dim (должен совпадать с expert_units[-1])
   num_experts: 5
   top_k: 2                              # 2/5 пула
   expert_units: [512, 512]

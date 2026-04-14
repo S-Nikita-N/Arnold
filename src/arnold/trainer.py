@@ -490,19 +490,19 @@ class ArnoldTrainer:
 
         moe_cfg = OmegaConf.to_container(self.cfg.learning.moe, resolve=True)
 
-        shared_latent_dim = moe_cfg["shared_expert_units"][-1]
+        latent_dim = moe_cfg["shared_expert_units"][-1]
         num_experts = moe_cfg["num_experts"]
         top_k = moe_cfg["top_k"]
         alpha = moe_cfg["alpha"]
 
         logger.info(
             f"MoE setup:\n"
-            f"  state_dim={state_dim}  action_dim={action_dim}\n"
-            f"  shared_latent_dim={shared_latent_dim}  "
-            f"alpha={alpha} (shared) / {1 - alpha:.2f} (routed)\n"
+            f"  state_dim={state_dim}  action_dim={action_dim}  latent_dim={latent_dim}\n"
+            f"  alpha={alpha} (shared) / {1 - alpha:.2f} (routed)\n"
             f"  routing: top_k={top_k}/{num_experts} experts  "
             f"(~{top_k / num_experts:.0%} of pool per sample)\n"
-            f"  cov_factor: shared_head.weight [{action_dim}×{shared_latent_dim}] * latent_std"
+            f"  cov_factor: α·W_shared + (1-α)·Σ(w_i·W_i) * latent_std  "
+            f"[{action_dim}×{latent_dim}]"
         )
 
         self.policy = MoELatticePolicy(
@@ -1524,12 +1524,11 @@ class ArnoldTrainer:
                     d[f"gate_prob_{i}"] = p
 
             # MoE shared vs routed expert contribution diagnostics
-            expert_mean_stats = getattr(self.policy_module, "_expert_mean_stats", None)
-            if expert_mean_stats is not None:
+            expert_stats = getattr(self.policy_module, "_expert_stats", None)
+            if expert_stats is not None:
                 d = all_diagnostics[expert_name]
-                d["shared_norm"] = expert_mean_stats["shared_norm"]
-                d["routed_norm"] = expert_mean_stats["routed_norm"]
-                d["shared_frac"] = expert_mean_stats["shared_frac"]
+                for k, v in expert_stats.items():
+                    d[k] = v
 
         # Update normalizer stats ONCE with the full batch data.
         # Must happen before the PPO loop — stats are frozen during updates
@@ -1744,15 +1743,23 @@ class ArnoldTrainer:
                         f"probs=[{probs}]"
                     )
 
-                if "shared_frac" in d:
+                if "shared_mean_frac" in d:
                     alpha = getattr(self.policy_module, "alpha", 0.3)
-                    logger.info(
-                        f"  [{expert_name}] Experts: "
-                        f"shared_norm={d['shared_norm']:.4f}  "
-                        f"routed_norm={d['routed_norm']:.4f}  "
-                        f"shared_L2_frac={d['shared_frac']:.3f}  "
-                        f"(α·‖s‖ / (α·‖s‖+(1-α)·‖r‖),  α={alpha})"
-                    )
+                    parts = [
+                        f"  [{expert_name}] Mean: "
+                        f"shared={d['shared_mean_norm']:.4f}  "
+                        f"routed={d['routed_mean_norm']:.4f}  "
+                        f"shared_frac={d['shared_mean_frac']:.3f}"
+                    ]
+                    if "shared_cov_frac" in d:
+                        parts.append(
+                            f"  [{expert_name}] Cov:  "
+                            f"shared={d['shared_cov_norm']:.4f}  "
+                            f"routed={d['routed_cov_norm']:.4f}  "
+                            f"shared_frac={d['shared_cov_frac']:.3f}"
+                        )
+                    parts.append(f"  (α={alpha})")
+                    logger.info("\n".join(parts))
 
         # Per-expert sampling profiler — только эпоха 0
         if epoch == 0 and self.profiler_reports:
