@@ -117,7 +117,7 @@ class MoELatticePolicy(nn.Module):
         # Отдельная gate MLP. Вход = h (выход shared_trunk если есть, иначе raw obs).
         if not gate_units:
             raise ValueError("gate_units не может быть пустым")
-            
+
         self.gate = nn.Sequential(
             MLP(trunk_out_dim, gate_units, activation),
             nn.Linear(gate_units[-1], num_experts),
@@ -170,17 +170,11 @@ class MoELatticePolicy(nn.Module):
     # ------------------------------------------------------------------
 
     def gate_forward(self, h: torch.Tensor):
-        """
-        Gate (отдельная MLP на h = выход shared_trunk либо raw obs) → top-k routing.
-
-        Returns:
-            top_k_weights : [batch, top_k] — нормированные веса выбранных экспертов
-            top_k_indices : [batch, top_k] — индексы выбранных экспертов
-            gate_probs    : [batch, num_experts] — полный softmax (для LB loss)
-        """
         logits = self.gate(h)
         gate_probs = F.softmax(logits, dim=-1)
-        top_k_vals, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+        tie_breaker = torch.rand_like(gate_probs) * 1e-7
+        _, top_k_indices = torch.topk(gate_probs + tie_breaker, self.top_k, dim=-1)
+        top_k_vals = gate_probs.gather(1, top_k_indices)
         top_k_indices = top_k_indices.long()
         top_k_weights = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
         return top_k_weights, top_k_indices, gate_probs
