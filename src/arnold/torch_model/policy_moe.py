@@ -278,28 +278,46 @@ class MoELatticePolicy(nn.Module):
                 # Shared expert: W_shared [action_dim, latent_dim]
                 W_shared = self.shared_expert_head.weight
 
-                # Routing experts: build dense per-sample gate weights [B, num_experts]
-                # (ненулевые только в позициях top-k), затем один matmul с [E, A*L].
-                # Это избегает промежуточного [B, top_k, A, L] ~ gather-based реализации.
-                dense_weights = torch.zeros(
-                    batch_size, self.num_experts,
+                # ── Fused cov_factor: single matmul ─────────────────
+                # Ключевая оптимизация: слить [shared, routed, latent_std scaling]
+                # в ОДИН matmul, избегая промежуточных [B, A, L] тензоров.
+                #
+                # Идея: трактуем shared как "expert 0" с фиксированным весом α.
+                # mix[b] = [α, (1-α)·gate_0[b], ..., (1-α)·gate_{E-1}[b]]  → [B, E+1]
+                # W_all = stack([W_shared, W_0, ..., W_{E-1}]) * latent_std  → [E+1, A, L]
+                # cov_factor[b] = Σ_j mix[b,j] · W_all[j]  = mix @ W_all_flat
+                #
+                # Это математически тот же результат, но только один [B, A, L]
+                # тензор аллоцируется (финальный cov_factor), вместо 3-4х.
+
+                # [B, E+1] — mix weights
+                mix = torch.zeros(
+                    batch_size, self.num_experts + 1,
                     dtype=h.dtype, device=h.device,
                 )
-                dense_weights.scatter_(1, top_k_indices, top_k_weights.to(h.dtype))
-
-                # [E, A, L] → [E, A*L]
-                all_W_flat = torch.stack(
-                    [eh.weight for eh in self.expert_heads]
-                ).view(self.num_experts, -1)
-
-                # [B, E] @ [E, A*L] = [B, A*L] → reshape → [B, A, L]
-                routed_W = (dense_weights @ all_W_flat).view(
-                    batch_size, self.action_dim, self.latent_dim,
+                mix[:, 0] = self.alpha
+                mix[:, 1:].scatter_(
+                    1, top_k_indices,
+                    ((1.0 - self.alpha) * top_k_weights).to(h.dtype),
                 )
 
-                # Combine: α·W_shared + (1-α)·routed_W → [batch, action_dim, latent_dim]
-                cov_W = self.alpha * W_shared.unsqueeze(0) + (1.0 - self.alpha) * routed_W
-                cov_factor = cov_W * latent_std[None, None, :]
+                # [E+1, A, L] — stack shared + all routing experts
+                W_all = torch.cat(
+                    [
+                        W_shared.unsqueeze(0),
+                        torch.stack([eh.weight for eh in self.expert_heads]),
+                    ],
+                    dim=0,
+                )
+                # Pre-scale by latent_std → [E+1, A, L], then flatten → [E+1, A*L]
+                W_all_flat = (W_all * latent_std[None, None, :]).view(
+                    self.num_experts + 1, -1,
+                )
+
+                # Single matmul: [B, E+1] @ [E+1, A*L] → [B, A*L] → [B, A, L]
+                cov_factor = (mix @ W_all_flat).view(
+                    batch_size, self.action_dim, self.latent_dim,
+                )
 
         # Кеш норм для диагностики (detach, без влияния на граф)
         with torch.no_grad():
@@ -314,8 +332,15 @@ class MoELatticePolicy(nn.Module):
                 "shared_mean_frac": s_contrib / total,
             }
             if cov_factor is not None:
+                # Norm approximation: avoid materializing [B, A, L] routed_W
+                # by using per-expert weight norms + mean gate usage.
+                # E[||routed_W[b]||] ≈ Σ_i mean_probs[i] · ||W_i||
                 s_cov_norm = W_shared.detach().norm().item()
-                r_cov_norm = routed_W.detach().norm(dim=(-2, -1)).mean().item()
+                W_exp_norms = torch.stack(
+                    [eh.weight.detach().norm() for eh in self.expert_heads]
+                )
+                mean_probs = gate_probs.detach().mean(dim=0)
+                r_cov_norm = (mean_probs * W_exp_norms).sum().item()
                 sc = self.alpha * s_cov_norm
                 rc = (1.0 - self.alpha) * r_cov_norm
                 ct = sc + rc + 1e-8
