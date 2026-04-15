@@ -35,6 +35,7 @@ weight_decay: 0.0
 gamma: 0.99
 tau: 0.95  # GAE lambda
 clip_epsilon: 0.2
+value_clip: true
 opt_num_epochs: 10
 grad_clip: 0.5
 

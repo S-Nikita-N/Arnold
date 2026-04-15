@@ -195,6 +195,7 @@ class ArnoldTrainer:
         self.gamma = cfg.learning.gamma
         self.tau = cfg.learning.tau
         self.clip_epsilon = cfg.learning.clip_epsilon
+        self.value_clip = cfg.learning.value_clip
         self.opt_num_epochs = cfg.learning.opt_num_epochs
         self.grad_clip = cfg.learning.grad_clip
         self.max_epochs = cfg.learning.max_epochs
@@ -1352,20 +1353,24 @@ class ArnoldTrainer:
                         if ctx.value_weight > 0:
                             with prof.section("value_loss"):
                                 vf_loss_unclipped = (values - mini_returns) ** 2
-                                v_clipped = mini_old_values + torch.clamp(
-                                    values - mini_old_values,
-                                    -self.clip_epsilon,
-                                    self.clip_epsilon,
-                                )
-                                vf_loss_clipped = (v_clipped - mini_returns) ** 2
-                                value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
+                                if self.value_clip:
+                                    v_clipped = mini_old_values + torch.clamp(
+                                        values - mini_old_values,
+                                        -self.clip_epsilon,
+                                        self.clip_epsilon,
+                                    )
+                                    vf_loss_clipped = (v_clipped - mini_returns) ** 2
+                                    value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
+                                else:
+                                    value_loss = 0.5 * vf_loss_unclipped.mean()
                             loss = loss + ctx.value_weight * value_loss
                             per_expert_losses[expert_name]["value"].append(value_loss.item())
-                            with torch.no_grad():
-                                value_clip_frac = (
-                                    (values - mini_old_values).abs() > self.clip_epsilon
-                                ).float().mean().item()
-                                per_expert_diag[expert_name]["value_clip_fracs"].append(value_clip_frac)
+                            if self.value_clip:
+                                with torch.no_grad():
+                                    value_clip_frac = (
+                                        (values - mini_old_values).abs() > self.clip_epsilon
+                                    ).float().mean().item()
+                                    per_expert_diag[expert_name]["value_clip_fracs"].append(value_clip_frac)
 
                         # --- Entropy ---
                         if ctx.entropy_weight > 0:
