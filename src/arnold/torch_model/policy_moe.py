@@ -278,15 +278,24 @@ class MoELatticePolicy(nn.Module):
                 # Shared expert: W_shared [action_dim, latent_dim]
                 W_shared = self.shared_expert_head.weight
 
-                # Routing experts: gather top-k head weights, weight by gate
-                # [num_experts, action_dim, latent_dim]
-                all_W = torch.stack([h.weight for h in self.expert_heads])
-                # [batch*top_k, action_dim, latent_dim] → [batch, top_k, action_dim, latent_dim]
-                selected_W = all_W[top_k_indices.reshape(-1)].view(
-                    batch_size, self.top_k, self.action_dim, self.latent_dim,
+                # Routing experts: build dense per-sample gate weights [B, num_experts]
+                # (ненулевые только в позициях top-k), затем один matmul с [E, A*L].
+                # Это избегает промежуточного [B, top_k, A, L] ~ gather-based реализации.
+                dense_weights = torch.zeros(
+                    batch_size, self.num_experts,
+                    dtype=h.dtype, device=h.device,
                 )
-                # Weighted sum → [batch, action_dim, latent_dim]
-                routed_W = (selected_W * top_k_weights[:, :, None, None]).sum(dim=1)
+                dense_weights.scatter_(1, top_k_indices, top_k_weights.to(h.dtype))
+
+                # [E, A, L] → [E, A*L]
+                all_W_flat = torch.stack(
+                    [eh.weight for eh in self.expert_heads]
+                ).view(self.num_experts, -1)
+
+                # [B, E] @ [E, A*L] = [B, A*L] → reshape → [B, A, L]
+                routed_W = (dense_weights @ all_W_flat).view(
+                    batch_size, self.action_dim, self.latent_dim,
+                )
 
                 # Combine: α·W_shared + (1-α)·routed_W → [batch, action_dim, latent_dim]
                 cov_W = self.alpha * W_shared.unsqueeze(0) + (1.0 - self.alpha) * routed_W
