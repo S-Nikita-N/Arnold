@@ -56,7 +56,7 @@ moe:
   gate_units: [512, 256]                # отдельная gate MLP (вход = h)
   value_units: [2048, 1536, 1024, 512, 512]  # отдельная value MLP
   alpha: 0.3                            # вес shared expert
-  grad_checkpoint_cov: false            # gradient checkpointing на cov_factor (экономит ~5GB на L=256)
+  cov_from_experts: false               # true = per-sample cov из всех экспертов, false = shared-only (memory-efficient)
 
 # ==================== Lattice (только при policy_type: lattice) ====================
 lattice:

@@ -75,7 +75,7 @@ class MoELatticePolicy(nn.Module):
         log_std_init: float = 0.0,
         min_diag_std: float = 1e-4,
         activation: str = "silu",
-        grad_checkpoint_cov: bool = False,
+        cov_from_experts: bool = False,
     ):
         super().__init__()
 
@@ -86,7 +86,7 @@ class MoELatticePolicy(nn.Module):
         self.alpha = alpha
         self.load_balance_weight = load_balance_weight
         self.min_diag_std = min_diag_std
-        self.grad_checkpoint_cov = grad_checkpoint_cov
+        self.cov_from_experts = cov_from_experts
 
         # ── Normalizer ────────────────────────────────────────────────
         self.obs_normalizer = SignatureNormalizerModule()
@@ -203,16 +203,16 @@ class MoELatticePolicy(nn.Module):
         Fused cov_factor computation в fp32.
 
         Возвращает (cov_factor, diag_std, latent_std):
-            cov_factor  [B, A, L]
-            diag_std    [B, A]
+            diag_std    [1, A]  — не expand'им, LRMVN сам broadcast'нёт против
+                                  cov_factor; downstream trainer делает только
+                                  scalar reductions (log/pow/mean).
             latent_std  [L]
-
-        Трактует shared как "expert 0" с фиксированным весом α,
-        всё считается одним matmul [B, E+1] @ [E+1, A*L].
-
-        Выделено в отдельный метод ради torch.utils.checkpoint.checkpoint:
-        при grad_checkpoint_cov=True forward activations не хранятся,
-        backward вызывает этот метод заново.
+            cov_factor:
+                - если cov_from_experts=True:  [B, A, L] — per-sample,
+                  смесь из всех экспертов по gate весам
+                - если cov_from_experts=False: [A, L] — только shared expert,
+                  LRMVN сама broadcast'нёт. Сильно экономит память:
+                  capacitance_tril остаётся [1, L, L] вместо [B, L, L].
         """
         batch_size = top_k_indices.shape[0]
         device = self.log_std.device
@@ -220,10 +220,21 @@ class MoELatticePolicy(nn.Module):
 
         with torch.autocast(device_type=device_type, enabled=False):
             std = F.softplus(self.log_std.float()) + self.min_diag_std
-            diag_std = std[:, :self.action_dim].expand(batch_size, -1)
-            latent_std = std[:, self.action_dim:].squeeze(0)
+            diag_std = std[:, :self.action_dim]             # [1, A]
+            latent_std = std[:, self.action_dim:].squeeze(0) # [L]
 
             W_shared = self.shared_expert_head.weight
+
+            if not self.cov_from_experts:
+                # ── Shared-only cov_factor [A, L] ───────────────────
+                # Единый cov для всех сэмплов батча → LRMVN broadcast'нёт
+                # сама, экономя [B, A, L] аллокацию и [B, L, L] в capacitance.
+                cov_factor = W_shared * latent_std[None, :]
+                return cov_factor, diag_std, latent_std
+
+            # ── Per-sample cov from ALL experts [B, A, L] ───────────
+            # Трактуем shared как "expert 0" с фиксированным весом α,
+            # одним matmul [B, E+1] @ [E+1, A*L] → [B, A, L].
 
             mix = torch.zeros(
                 batch_size, self.num_experts + 1,
@@ -335,20 +346,9 @@ class MoELatticePolicy(nn.Module):
         latent_std = None
         if return_std:
             with p.section("cov_factor"):
-                # При grad_checkpoint_cov: не храним forward activations этого
-                # блока — пересчитываем в backward. Экономит ~5GB на L=256
-                # ценой +30% compute на backward. В no_grad контекстах
-                # (sampling/eval) checkpoint сам делает прямой вызов.
-                if self.grad_checkpoint_cov:
-                    cov_factor, diag_std, latent_std = torch.utils.checkpoint.checkpoint(
-                        self._compute_cov_factor,
-                        top_k_indices, top_k_weights,
-                        use_reentrant=False,
-                    )
-                else:
-                    cov_factor, diag_std, latent_std = self._compute_cov_factor(
-                        top_k_indices, top_k_weights,
-                    )
+                cov_factor, diag_std, latent_std = self._compute_cov_factor(
+                    top_k_indices, top_k_weights,
+                )
 
         # Кеш норм для диагностики (detach, без влияния на граф)
         with torch.no_grad():
