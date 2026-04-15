@@ -75,6 +75,7 @@ class MoELatticePolicy(nn.Module):
         log_std_init: float = 0.0,
         min_diag_std: float = 1e-4,
         activation: str = "silu",
+        grad_checkpoint_cov: bool = False,
     ):
         super().__init__()
 
@@ -85,6 +86,7 @@ class MoELatticePolicy(nn.Module):
         self.alpha = alpha
         self.load_balance_weight = load_balance_weight
         self.min_diag_std = min_diag_std
+        self.grad_checkpoint_cov = grad_checkpoint_cov
 
         # ── Normalizer ────────────────────────────────────────────────
         self.obs_normalizer = SignatureNormalizerModule()
@@ -189,6 +191,68 @@ class MoELatticePolicy(nn.Module):
         return (N * (f * P).sum()).unsqueeze(0)
 
     # ------------------------------------------------------------------
+    #  Covariance factor (выделено для gradient checkpointing)
+    # ------------------------------------------------------------------
+
+    def _compute_cov_factor(
+        self,
+        top_k_indices: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Fused cov_factor computation в fp32.
+
+        Возвращает (cov_factor, diag_std, latent_std):
+            cov_factor  [B, A, L]
+            diag_std    [B, A]
+            latent_std  [L]
+
+        Трактует shared как "expert 0" с фиксированным весом α,
+        всё считается одним matmul [B, E+1] @ [E+1, A*L].
+
+        Выделено в отдельный метод ради torch.utils.checkpoint.checkpoint:
+        при grad_checkpoint_cov=True forward activations не хранятся,
+        backward вызывает этот метод заново.
+        """
+        batch_size = top_k_indices.shape[0]
+        device = self.log_std.device
+        device_type = "cuda" if device.type == "cuda" else "cpu"
+
+        with torch.autocast(device_type=device_type, enabled=False):
+            std = F.softplus(self.log_std.float()) + self.min_diag_std
+            diag_std = std[:, :self.action_dim].expand(batch_size, -1)
+            latent_std = std[:, self.action_dim:].squeeze(0)
+
+            W_shared = self.shared_expert_head.weight
+
+            mix = torch.zeros(
+                batch_size, self.num_experts + 1,
+                dtype=torch.float32, device=device,
+            )
+            mix[:, 0] = self.alpha
+            mix[:, 1:].scatter_(
+                1, top_k_indices,
+                ((1.0 - self.alpha) * top_k_weights).float(),
+            )
+
+            W_all = torch.cat(
+                [
+                    W_shared.unsqueeze(0),
+                    torch.stack([eh.weight for eh in self.expert_heads]),
+                ],
+                dim=0,
+            )
+            W_all_flat = (W_all * latent_std[None, None, :]).view(
+                self.num_experts + 1, -1,
+            )
+
+            cov_factor = (mix @ W_all_flat).view(
+                batch_size, self.action_dim, self.latent_dim,
+            )
+
+        return cov_factor, diag_std, latent_std
+
+    # ------------------------------------------------------------------
     #  Forward
     # ------------------------------------------------------------------
 
@@ -271,52 +335,18 @@ class MoELatticePolicy(nn.Module):
         latent_std = None
         if return_std:
             with p.section("cov_factor"):
-                # Считаем в fp32 напрямую — LRMVN требует fp32 для численной
-                # стабильности Cholesky, и если cov_factor приходит туда fp32,
-                # то .float() cast становится no-op (экономим ~1.7 GB).
-                device_type = "cuda" if h.device.type == "cuda" else "cpu"
-                with torch.autocast(device_type=device_type, enabled=False):
-                    std = F.softplus(self.log_std.float()) + self.min_diag_std
-                    diag_std = std[:, :self.action_dim].expand(batch_size, -1)
-                    latent_std = std[:, self.action_dim:].squeeze(0)  # [latent_dim]
-
-                    # Shared expert: W_shared [action_dim, latent_dim] (fp32 param)
-                    W_shared = self.shared_expert_head.weight
-
-                    # ── Fused cov_factor: single matmul ─────────────────
-                    # Трактуем shared как "expert 0" с фиксированным весом α.
-                    # mix[b] = [α, (1-α)·g_0[b], ..., (1-α)·g_{E-1}[b]] → [B, E+1]
-                    # W_all = stack([W_shared, W_0, ..., W_{E-1}]) * latent_std
-                    # cov_factor[b] = mix[b] @ W_all_flat
-                    #
-                    # Выход сразу fp32 → в build_action_dist cast = no-op.
-
-                    mix = torch.zeros(
-                        batch_size, self.num_experts + 1,
-                        dtype=torch.float32, device=h.device,
+                # При grad_checkpoint_cov: не храним forward activations этого
+                # блока — пересчитываем в backward. Экономит ~5GB на L=256
+                # ценой +30% compute на backward.
+                if self.grad_checkpoint_cov and self.training:
+                    cov_factor, diag_std, latent_std = torch.utils.checkpoint.checkpoint(
+                        self._compute_cov_factor,
+                        top_k_indices, top_k_weights,
+                        use_reentrant=False,
                     )
-                    mix[:, 0] = self.alpha
-                    mix[:, 1:].scatter_(
-                        1, top_k_indices,
-                        ((1.0 - self.alpha) * top_k_weights).float(),
-                    )
-
-                    # [E+1, A, L] — stack shared + all routing experts (fp32 params)
-                    W_all = torch.cat(
-                        [
-                            W_shared.unsqueeze(0),
-                            torch.stack([eh.weight for eh in self.expert_heads]),
-                        ],
-                        dim=0,
-                    )
-                    # Pre-scale by latent_std → [E+1, A, L], flatten → [E+1, A*L]
-                    W_all_flat = (W_all * latent_std[None, None, :]).view(
-                        self.num_experts + 1, -1,
-                    )
-
-                    # Single matmul: [B, E+1] @ [E+1, A*L] → [B, A*L] → [B, A, L]
-                    cov_factor = (mix @ W_all_flat).view(
-                        batch_size, self.action_dim, self.latent_dim,
+                else:
+                    cov_factor, diag_std, latent_std = self._compute_cov_factor(
+                        top_k_indices, top_k_weights,
                     )
 
         # Кеш норм для диагностики (detach, без влияния на граф)
@@ -335,7 +365,7 @@ class MoELatticePolicy(nn.Module):
                 # Norm approximation: avoid materializing [B, A, L] routed_W
                 # by using per-expert weight norms + mean gate usage.
                 # E[||routed_W[b]||] ≈ Σ_i mean_probs[i] · ||W_i||
-                s_cov_norm = W_shared.detach().norm().item()
+                s_cov_norm = self.shared_expert_head.weight.detach().norm().item()
                 W_exp_norms = torch.stack(
                     [eh.weight.detach().norm() for eh in self.expert_heads]
                 )

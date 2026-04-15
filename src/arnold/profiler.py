@@ -29,7 +29,7 @@ Profiler — единый профайлер времени и GPU-памяти 
 import contextlib
 import time
 import torch
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 
 class Profiler:
@@ -78,7 +78,6 @@ class Profiler:
         depth = len(self._stack)
         self._stack.append(name)
 
-        idx = len(self._records)
         rec: Dict[str, Any] = {
             "depth": depth,
             "name": name,
@@ -240,9 +239,6 @@ class Profiler:
         if not records_raw:
             return "  [profiler] no data"
 
-        has_time = any(r["time"] is not None for r in records_raw)
-        has_mem = any(r["mem_delta"] is not None for r in records_raw)
-
         agg = self._aggregate_by_path(records_raw)
         has_time_agg = any(r["avg_ms"] is not None for r in agg)
         has_mem_agg = any(r["avg_mem_delta"] is not None for r in agg)
@@ -296,7 +292,7 @@ class Profiler:
         lines.append("┌" + "─" * (total_w - 2) + "┐")
         lines.append("│" + title.ljust(total_w - 2) + "│")
         lines.append("└" + "─" * (total_w - 2) + "┘")
-        lines.append(f"  section")
+        lines.append("  section")
         lines.append(sep)
 
         for i, rec in enumerate(time_recs):
