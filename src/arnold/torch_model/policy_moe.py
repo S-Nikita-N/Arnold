@@ -337,8 +337,9 @@ class MoELatticePolicy(nn.Module):
             with p.section("cov_factor"):
                 # При grad_checkpoint_cov: не храним forward activations этого
                 # блока — пересчитываем в backward. Экономит ~5GB на L=256
-                # ценой +30% compute на backward.
-                if self.grad_checkpoint_cov and self.training:
+                # ценой +30% compute на backward. В no_grad контекстах
+                # (sampling/eval) checkpoint сам делает прямой вызов.
+                if self.grad_checkpoint_cov:
                     cov_factor, diag_std, latent_std = torch.utils.checkpoint.checkpoint(
                         self._compute_cov_factor,
                         top_k_indices, top_k_weights,
