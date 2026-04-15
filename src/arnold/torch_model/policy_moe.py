@@ -271,53 +271,53 @@ class MoELatticePolicy(nn.Module):
         latent_std = None
         if return_std:
             with p.section("cov_factor"):
-                std = F.softplus(self.log_std) + self.min_diag_std
-                diag_std = std[:, :self.action_dim].expand(batch_size, -1)
-                latent_std = std[:, self.action_dim:].squeeze(0)  # [latent_dim]
+                # Считаем в fp32 напрямую — LRMVN требует fp32 для численной
+                # стабильности Cholesky, и если cov_factor приходит туда fp32,
+                # то .float() cast становится no-op (экономим ~1.7 GB).
+                device_type = "cuda" if h.device.type == "cuda" else "cpu"
+                with torch.autocast(device_type=device_type, enabled=False):
+                    std = F.softplus(self.log_std.float()) + self.min_diag_std
+                    diag_std = std[:, :self.action_dim].expand(batch_size, -1)
+                    latent_std = std[:, self.action_dim:].squeeze(0)  # [latent_dim]
 
-                # Shared expert: W_shared [action_dim, latent_dim]
-                W_shared = self.shared_expert_head.weight
+                    # Shared expert: W_shared [action_dim, latent_dim] (fp32 param)
+                    W_shared = self.shared_expert_head.weight
 
-                # ── Fused cov_factor: single matmul ─────────────────
-                # Ключевая оптимизация: слить [shared, routed, latent_std scaling]
-                # в ОДИН matmul, избегая промежуточных [B, A, L] тензоров.
-                #
-                # Идея: трактуем shared как "expert 0" с фиксированным весом α.
-                # mix[b] = [α, (1-α)·gate_0[b], ..., (1-α)·gate_{E-1}[b]]  → [B, E+1]
-                # W_all = stack([W_shared, W_0, ..., W_{E-1}]) * latent_std  → [E+1, A, L]
-                # cov_factor[b] = Σ_j mix[b,j] · W_all[j]  = mix @ W_all_flat
-                #
-                # Это математически тот же результат, но только один [B, A, L]
-                # тензор аллоцируется (финальный cov_factor), вместо 3-4х.
+                    # ── Fused cov_factor: single matmul ─────────────────
+                    # Трактуем shared как "expert 0" с фиксированным весом α.
+                    # mix[b] = [α, (1-α)·g_0[b], ..., (1-α)·g_{E-1}[b]] → [B, E+1]
+                    # W_all = stack([W_shared, W_0, ..., W_{E-1}]) * latent_std
+                    # cov_factor[b] = mix[b] @ W_all_flat
+                    #
+                    # Выход сразу fp32 → в build_action_dist cast = no-op.
 
-                # [B, E+1] — mix weights
-                mix = torch.zeros(
-                    batch_size, self.num_experts + 1,
-                    dtype=h.dtype, device=h.device,
-                )
-                mix[:, 0] = self.alpha
-                mix[:, 1:].scatter_(
-                    1, top_k_indices,
-                    ((1.0 - self.alpha) * top_k_weights).to(h.dtype),
-                )
+                    mix = torch.zeros(
+                        batch_size, self.num_experts + 1,
+                        dtype=torch.float32, device=h.device,
+                    )
+                    mix[:, 0] = self.alpha
+                    mix[:, 1:].scatter_(
+                        1, top_k_indices,
+                        ((1.0 - self.alpha) * top_k_weights).float(),
+                    )
 
-                # [E+1, A, L] — stack shared + all routing experts
-                W_all = torch.cat(
-                    [
-                        W_shared.unsqueeze(0),
-                        torch.stack([eh.weight for eh in self.expert_heads]),
-                    ],
-                    dim=0,
-                )
-                # Pre-scale by latent_std → [E+1, A, L], then flatten → [E+1, A*L]
-                W_all_flat = (W_all * latent_std[None, None, :]).view(
-                    self.num_experts + 1, -1,
-                )
+                    # [E+1, A, L] — stack shared + all routing experts (fp32 params)
+                    W_all = torch.cat(
+                        [
+                            W_shared.unsqueeze(0),
+                            torch.stack([eh.weight for eh in self.expert_heads]),
+                        ],
+                        dim=0,
+                    )
+                    # Pre-scale by latent_std → [E+1, A, L], flatten → [E+1, A*L]
+                    W_all_flat = (W_all * latent_std[None, None, :]).view(
+                        self.num_experts + 1, -1,
+                    )
 
-                # Single matmul: [B, E+1] @ [E+1, A*L] → [B, A*L] → [B, A, L]
-                cov_factor = (mix @ W_all_flat).view(
-                    batch_size, self.action_dim, self.latent_dim,
-                )
+                    # Single matmul: [B, E+1] @ [E+1, A*L] → [B, A*L] → [B, A, L]
+                    cov_factor = (mix @ W_all_flat).view(
+                        batch_size, self.action_dim, self.latent_dim,
+                    )
 
         # Кеш норм для диагностики (detach, без влияния на граф)
         with torch.no_grad():
