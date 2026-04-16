@@ -72,7 +72,6 @@ class ExpertContext:
     # Per-expert loss weights
     ppo_weight: float = 0.0
     imitation_weight: float = 0.0
-    value_weight: float = 0.0
     entropy_weight: float = 0.0
     load_balance_weight: float = 0.0
 
@@ -191,6 +190,7 @@ class ArnoldTrainer:
         # Training (global defaults, per-expert overrides possible)
         self.batch_size = cfg.learning.batch_size
         self.learning_rate = cfg.learning.learning_rate
+        self.value_learning_rate = cfg.learning.value_learning_rate
         self.weight_decay = cfg.learning.weight_decay
         self.gamma = cfg.learning.gamma
         self.tau = cfg.learning.tau
@@ -198,6 +198,7 @@ class ArnoldTrainer:
         self.value_clip = cfg.learning.value_clip
         self.opt_num_epochs = cfg.learning.opt_num_epochs
         self.grad_clip = cfg.learning.grad_clip
+        self.value_grad_clip = cfg.learning.value_grad_clip
         self.max_epochs = cfg.learning.max_epochs
         self.use_scheduler = cfg.learning.use_scheduler
         self.use_compile = cfg.learning.use_compile
@@ -297,7 +298,6 @@ class ArnoldTrainer:
             learning_cfg = entry.get("learning", {})
             ppo_w = learning_cfg.get("ppo_weight")
             im_w = learning_cfg.get("imitation_weight")
-            val_w = learning_cfg.get("value_weight")
             ent_w = learning_cfg.get("entropy_weight")
             lb_w = learning_cfg.get("load_balance_weight", 0.0)
             loss_scale = learning_cfg.get("loss_scale", 1)
@@ -326,7 +326,6 @@ class ArnoldTrainer:
                 groups=groups,
                 ppo_weight=ppo_w,
                 imitation_weight=im_w,
-                value_weight=val_w,
                 entropy_weight=ent_w,
                 load_balance_weight=lb_w,
                 num_threads=n_threads,
@@ -348,7 +347,7 @@ class ArnoldTrainer:
             )
             logger.info(
                 f"  threads={n_threads}  min_batch={mbs}  "
-                f"ppo={ppo_w}  im={im_w}  val={val_w}  ent={ent_w}  lb={lb_w}  scale={loss_scale}"
+                f"ppo={ppo_w}  im={im_w}  ent={ent_w}  lb={lb_w}  scale={loss_scale}"
             )
             logger.info(
                 f"  parser: {parser.n_obs_elements} obs elements, "
@@ -496,11 +495,12 @@ class ArnoldTrainer:
         top_k = moe_cfg["top_k"]
         alpha = moe_cfg["alpha"]
 
+        routing_mode = "soft (all experts)" if top_k == num_experts else f"sparse top_k={top_k}"
         logger.info(
             f"MoE setup:\n"
             f"  state_dim={state_dim}  action_dim={action_dim}  latent_dim={latent_dim}\n"
             f"  alpha={alpha} (shared) / {1 - alpha:.2f} (routed)\n"
-            f"  routing: top_k={top_k}/{num_experts} experts  "
+            f"  routing: {routing_mode} / {num_experts} experts  "
             f"(~{top_k / num_experts:.0%} of pool per sample)\n"
             f"  cov_factor: α·W_shared + (1-α)·Σ(w_i·W_i) * latent_std  "
             f"[{action_dim}×{latent_dim}]"
@@ -513,19 +513,30 @@ class ArnoldTrainer:
         )
 
     def setup_optimizer(self) -> None:
-        self.optimizer = torch.optim.AdamW(
-            self.policy.parameters(),
+        self.policy_optimizer = torch.optim.AdamW(
+            self.policy_module.policy_parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
+        self.value_optimizer = torch.optim.AdamW(
+            self.policy_module.value_parameters(),
+            lr=self.value_learning_rate,
+            weight_decay=self.weight_decay,
+        )
         if self.use_scheduler:
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
+            self.policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.policy_optimizer,
                 T_max=self.max_epochs,
                 eta_min=self.learning_rate * 0.1,
             )
+            self.value_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.value_optimizer,
+                T_max=self.max_epochs,
+                eta_min=self.value_learning_rate * 0.1,
+            )
         else:
-            self.scheduler = None
+            self.policy_scheduler = None
+            self.value_scheduler = None
 
     # ------------------------------------------------------------------
     #  Sampling
@@ -667,7 +678,8 @@ class ArnoldTrainer:
         self.mp_done.clear()
         to_test(self.policy)
 
-        optimizer_to(self.optimizer, torch.device('cpu'))
+        optimizer_to(self.policy_optimizer, torch.device('cpu'))
+        optimizer_to(self.value_optimizer, torch.device('cpu'))
         with to_cpu(self.policy):
             with torch.no_grad():
                 queue = fork_ctx.Queue()
@@ -754,7 +766,8 @@ class ArnoldTrainer:
                         self.profiler_reports[w_expert] = Profiler.from_dict(w_profiler_data)
 
         self.mp_done.set()
-        optimizer_to(self.optimizer, self.device)
+        optimizer_to(self.policy_optimizer, self.device)
+        optimizer_to(self.value_optimizer, self.device)
 
         # Merge per expert
         expert_batches: Dict[str, OBCBatch] = {}
@@ -893,7 +906,8 @@ class ArnoldTrainer:
         t_start = time.time()
         self.policy.eval()
 
-        optimizer_to(self.optimizer, torch.device('cpu'))
+        optimizer_to(self.policy_optimizer, torch.device('cpu'))
+        optimizer_to(self.value_optimizer, torch.device('cpu'))
 
         prof = Profiler(
             device=str(self.device) if self.device.type == 'cuda' else None,
@@ -1160,7 +1174,8 @@ class ArnoldTrainer:
         if old_profiler is not None and hasattr(self.policy_module, 'set_profiler'):
             self.policy_module.set_profiler(old_profiler)
 
-        optimizer_to(self.optimizer, self.device)
+        optimizer_to(self.policy_optimizer, self.device)
+        optimizer_to(self.value_optimizer, self.device)
 
         # ── Merge per expert ─────────────────────────────────────
         expert_batches: Dict[str, OBCBatch] = {}
@@ -1236,7 +1251,7 @@ class ArnoldTrainer:
             for n in self.experts
         }
         per_expert_diag: Dict[str, Dict[str, list]] = {
-            n: {"ratios": [], "clip_fracs": [], "value_clip_fracs": [], "approx_kls": [], "grad_norms": []}
+            n: {"ratios": [], "clip_fracs": [], "value_clip_fracs": [], "approx_kls": [], "grad_norms": [], "value_grad_norms": []}
             for n in self.experts
         }
 
@@ -1319,7 +1334,8 @@ class ArnoldTrainer:
                         with prof.section("compute_log_prob"):
                             new_log_probs = safe_lrmvn_log_prob(dist, mini_actions.float()).unsqueeze(-1)
 
-                        loss = torch.tensor(0.0, device=self.device)
+                        policy_loss = torch.tensor(0.0, device=self.device)
+                        value_loss_total = torch.tensor(0.0, device=self.device)
 
                         # --- PPO ---
                         if ctx.ppo_weight > 0:
@@ -1331,7 +1347,7 @@ class ArnoldTrainer:
                                     ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon,
                                 ) * mini_advantages
                                 ppo_loss = -torch.min(surr1, surr2).mean()
-                            loss = loss + ctx.ppo_weight * ppo_loss
+                            policy_loss = policy_loss + ctx.ppo_weight * ppo_loss
                             per_expert_losses[expert_name]["ppo"].append(ppo_loss.item())
 
                             with torch.no_grad():
@@ -1346,67 +1362,75 @@ class ArnoldTrainer:
                             with prof.section("imitation_loss"):
                                 mini_expert = ed["expert_actions"][batch_indices]
                                 imitation_loss = nn.functional.mse_loss(pred_mean, mini_expert)
-                            loss = loss + ctx.imitation_weight * imitation_loss
+                            policy_loss = policy_loss + ctx.imitation_weight * imitation_loss
                             per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
 
                         # --- Value ---
-                        if ctx.value_weight > 0:
-                            with prof.section("value_loss"):
-                                vf_loss_unclipped = (values - mini_returns) ** 2
-                                if self.value_clip:
-                                    v_clipped = mini_old_values + torch.clamp(
-                                        values - mini_old_values,
-                                        -self.clip_epsilon,
-                                        self.clip_epsilon,
-                                    )
-                                    vf_loss_clipped = (v_clipped - mini_returns) ** 2
-                                    value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
-                                else:
-                                    value_loss = 0.5 * vf_loss_unclipped.mean()
-                            loss = loss + ctx.value_weight * value_loss
-                            per_expert_losses[expert_name]["value"].append(value_loss.item())
+                        with prof.section("value_loss"):
+                            vf_loss_unclipped = (values - mini_returns) ** 2
                             if self.value_clip:
-                                with torch.no_grad():
-                                    value_clip_frac = (
-                                        (values - mini_old_values).abs() > self.clip_epsilon
-                                    ).float().mean().item()
-                                    per_expert_diag[expert_name]["value_clip_fracs"].append(value_clip_frac)
+                                v_clipped = mini_old_values + torch.clamp(
+                                    values - mini_old_values,
+                                    -self.clip_epsilon,
+                                    self.clip_epsilon,
+                                )
+                                vf_loss_clipped = (v_clipped - mini_returns) ** 2
+                                value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
+                            else:
+                                value_loss = 0.5 * vf_loss_unclipped.mean()
+                        value_loss_total = value_loss_total + value_loss
+                        per_expert_losses[expert_name]["value"].append(value_loss.item())
+                        if self.value_clip:
+                            with torch.no_grad():
+                                value_clip_frac = (
+                                    (values - mini_old_values).abs() > self.clip_epsilon
+                                ).float().mean().item()
+                                per_expert_diag[expert_name]["value_clip_fracs"].append(value_clip_frac)
 
                         # --- Entropy ---
                         if ctx.entropy_weight > 0:
                             with prof.section("entropy"):
                                 entropy = dist.entropy().mean()
                             entropy_loss = -entropy
-                            loss = loss + ctx.entropy_weight * entropy_loss
+                            policy_loss = policy_loss + ctx.entropy_weight * entropy_loss
                             per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
 
                         # --- MoE load balancing ---
                         if ctx.load_balance_weight > 0 and forward_lb_loss is not None:
                             lb_loss = forward_lb_loss.mean()
-                            loss = loss + ctx.load_balance_weight * lb_loss
+                            policy_loss = policy_loss + ctx.load_balance_weight * lb_loss
                             per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
 
                         # Apply expert loss scale
-                        loss = loss * ctx.loss_scale
+                        policy_loss = policy_loss * ctx.loss_scale
+                        value_loss_total = value_loss_total * ctx.loss_scale
 
-                        self.optimizer.zero_grad()
+                        self.policy_optimizer.zero_grad()
+                        self.value_optimizer.zero_grad()
                         with prof.section("loss.backward"):
-                            loss.backward()
+                            (policy_loss + value_loss_total).backward()
 
                 with prof.section("grad_clip + optimizer.step"):
                     if self.grad_clip > 0:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.policy.parameters(), self.grad_clip,
+                        policy_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.policy_module.policy_parameters(), self.grad_clip,
                         )
-                        per_expert_diag[expert_name]["grad_norms"].append(grad_norm.item())
+                        per_expert_diag[expert_name]["grad_norms"].append(policy_grad_norm.item())
                     else:
                         total_norm = sum(
-                            param.grad.norm().item() ** 2
-                            for param in self.policy.parameters() if param.grad is not None
+                            p.grad.norm().item() ** 2
+                            for p in self.policy_module.policy_parameters() if p.grad is not None
                         ) ** 0.5
                         per_expert_diag[expert_name]["grad_norms"].append(total_norm)
 
-                    self.optimizer.step()
+                    if self.value_grad_clip > 0:
+                        value_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.policy_module.value_parameters(), self.value_grad_clip,
+                        )
+                        per_expert_diag[expert_name]["value_grad_norms"].append(value_grad_norm.item())
+
+                    self.policy_optimizer.step()
+                    self.value_optimizer.step()
 
                 pbar.update(1)
 
@@ -1493,6 +1517,7 @@ class ArnoldTrainer:
                 "value_clip_frac": float(np.mean(diag["value_clip_fracs"])) if diag["value_clip_fracs"] else 0.0,
                 "ratio_mean": float(np.mean(diag["ratios"])) if diag["ratios"] else 1.0,
                 "grad_norm": float(np.mean(diag["grad_norms"])) if diag["grad_norms"] else 0.0,
+                "value_grad_norm": float(np.mean(diag["value_grad_norms"])) if diag["value_grad_norms"] else 0.0,
                 "explained_var": explained_var,
                 "adv_mean": adv_mean,
                 "adv_std": adv_std,
@@ -1594,8 +1619,10 @@ class ArnoldTrainer:
 
             self.num_steps += total_steps_epoch
 
-            if self.scheduler is not None:
-                self.scheduler.step()
+            if self.policy_scheduler is not None:
+                self.policy_scheduler.step()
+            if self.value_scheduler is not None:
+                self.value_scheduler.step()
 
             # Logging
             if epoch % self.log_frequency == 0:
@@ -1682,7 +1709,7 @@ class ArnoldTrainer:
             logger.info(
                 f"  {expert_name}: mode={ctx.training_mode.upper()}  "
                 f"ppo={ctx.ppo_weight}  im={ctx.imitation_weight}  "
-                f"val={ctx.value_weight}  ent={ctx.entropy_weight}  "
+                f"ent={ctx.entropy_weight}  "
                 f"scale={ctx.loss_scale}"
             )
 
@@ -1713,6 +1740,7 @@ class ArnoldTrainer:
                     f"val_clip_frac={d.get('value_clip_frac', 0):.3f}  "
                     f"ratio={d.get('ratio_mean', 1):.4f}  "
                     f"grad_norm={d.get('grad_norm', 0):.3f}  "
+                    f"val_grad_norm={d.get('value_grad_norm', 0):.3f}  "
                     f"σ_global={d.get('sigma_global', 0):.4f}  "
                     f"expl_var={d.get('explained_var', 0):.3f}  "
                     f"adv={d.get('adv_mean', 0):.4f}±{d.get('adv_std', 0):.4f}  "
@@ -1762,6 +1790,15 @@ class ArnoldTrainer:
                             f"shared={d['shared_cov_norm']:.4f}  "
                             f"routed={d['routed_cov_norm']:.4f}  "
                             f"shared_frac={d['shared_cov_frac']:.3f}"
+                        )
+                    if "lb_ind_entropy" in d:
+                        parts.append(
+                            f"  [{expert_name}] LB:   "
+                            f"H_ind={d['lb_ind_entropy']:.4f}  "
+                            f"H_batch={d['lb_batch_entropy']:.4f}  "
+                            f"l_ind={d['lb_l_ind']:.4f}  "
+                            f"l_batch={d['lb_l_batch']:.4f}  "
+                            f"total={d['lb_total']:.4f}"
                         )
                     parts.append(f"  (α={alpha})")
                     logger.info("\n".join(parts))
@@ -2265,12 +2302,15 @@ class ArnoldTrainer:
             "epoch": self.epoch,
             "num_steps": self.num_steps,
             "policy": self.policy_module.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
+            "policy_optimizer": self.policy_optimizer.state_dict(),
+            "value_optimizer": self.value_optimizer.state_dict(),
             "expert_names": list(self.experts.keys()),
             "expert_modes": expert_modes,
         }
-        if self.scheduler is not None:
-            checkpoint["scheduler"] = self.scheduler.state_dict()
+        if self.policy_scheduler is not None:
+            checkpoint["policy_scheduler"] = self.policy_scheduler.state_dict()
+        if self.value_scheduler is not None:
+            checkpoint["value_scheduler"] = self.value_scheduler.state_dict()
 
         path = os.path.join(self.output_dir, f"model_{suffix}.pth")
         torch.save(checkpoint, path)
@@ -2333,10 +2373,17 @@ class ArnoldTrainer:
         if resume_training:
             self.epoch = checkpoint["epoch"] + 1
             self.num_steps = checkpoint["num_steps"]
-            if "optimizer" in checkpoint:
-                self.optimizer.load_state_dict(checkpoint["optimizer"])
-            if self.scheduler is not None and "scheduler" in checkpoint:
-                self.scheduler.load_state_dict(checkpoint["scheduler"])
+            if "policy_optimizer" in checkpoint:
+                self.policy_optimizer.load_state_dict(checkpoint["policy_optimizer"])
+            elif "optimizer" in checkpoint:
+                logger.warning("Loading legacy single-optimizer checkpoint into policy_optimizer")
+                self.policy_optimizer.load_state_dict(checkpoint["optimizer"])
+            if "value_optimizer" in checkpoint:
+                self.value_optimizer.load_state_dict(checkpoint["value_optimizer"])
+            if self.policy_scheduler is not None and "policy_scheduler" in checkpoint:
+                self.policy_scheduler.load_state_dict(checkpoint["policy_scheduler"])
+            if self.value_scheduler is not None and "value_scheduler" in checkpoint:
+                self.value_scheduler.load_state_dict(checkpoint["value_scheduler"])
         else:
             self.epoch = 0
             self.num_steps = 0

@@ -97,6 +97,16 @@ class LatticePolicy(nn.Module):
     #  Profiler management
     # ------------------------------------------------------------------
 
+    def value_parameters(self):
+        yield from self.value_net.parameters()
+        yield from self.value_head.parameters()
+
+    def policy_parameters(self):
+        value_ids = {id(p) for p in self.value_parameters()}
+        for p in self.parameters():
+            if id(p) not in value_ids:
+                yield p
+
     def set_profiler(self, profiler: Profiler) -> None:
         self.profiler = profiler
 

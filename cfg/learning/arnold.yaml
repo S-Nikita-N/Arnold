@@ -31,6 +31,7 @@ transformer:
 # ==================== PPO ====================
 batch_size: 128
 learning_rate: 1.e-4
+value_learning_rate: 1.e-3
 weight_decay: 0.0
 gamma: 0.99
 tau: 0.95  # GAE lambda
@@ -38,6 +39,7 @@ clip_epsilon: 0.2
 value_clip: true
 opt_num_epochs: 10
 grad_clip: 0.5
+value_grad_clip: 0.5
 
 # ==================== Training ====================
 max_epochs: 100000
@@ -57,6 +59,9 @@ moe:
   value_units: [2048, 1536, 1024, 512, 512]  # отдельная value MLP
   alpha: 0.3                            # вес shared expert
   cov_from_experts: false               # true = per-sample cov из всех экспертов, false = shared-only (memory-efficient)
+  soft_target_entropy: 0.5              # таргет H_ind per sample (soft routing, top_k=N)
+  soft_ind_weight: 0.05                 # вес MSE(H_ind - target) внутри soft balance loss
+  soft_batch_weight: 1.0                # вес (max_H - H_batch) внутри soft balance loss
 
 # ==================== Lattice (только при policy_type: lattice) ====================
 lattice:

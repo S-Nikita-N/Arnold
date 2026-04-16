@@ -19,7 +19,6 @@ Per-expert режим определяется по loss-весам каждог
         run.experts.myo.learning.ppo_weight=1.0 \
         run.experts.myo.learning.imitation_weight=0 \
         run.experts.myo.learning.entropy_weight=0.0001 \
-        run.experts.myo.learning.value_weight=0.5 \
         run.num_threads=15 \
         exp_name=ppo_myohuman
 
@@ -41,14 +40,12 @@ Per-expert режим определяется по loss-весам каждог
         run.experts.myo.learning.ppo_weight=1.0 \
         run.experts.myo.learning.imitation_weight=0 \
         run.experts.myo.learning.entropy_weight=0.0001 \
-        run.experts.myo.learning.value_weight=0.5 \
         \
         run.experts.kin.num_threads=5 \
         run.experts.kin.min_batch_size=10240 \
         run.experts.kin.learning.ppo_weight=0.0 \
         run.experts.kin.learning.imitation_weight=1.0 \
         run.experts.kin.learning.entropy_weight=0.0 \
-        run.experts.kin.learning.value_weight=0.0 \
         \
         learning.batch_size=256 \
         learning.learning_rate=1e-4 \

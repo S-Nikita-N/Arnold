@@ -31,11 +31,13 @@ MoE-Lattice Policy — Shared Expert + N Routed Experts, Low-Rank Covariance.
   load_balance_weight — вес Switch Transformer LB loss (default 0.01)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import LowRankMultivariateNormal
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
 from arnold.torch_model.mlp import MLP
@@ -76,6 +78,9 @@ class MoELatticePolicy(nn.Module):
         min_diag_std: float = 1e-4,
         activation: str = "silu",
         cov_from_experts: bool = False,
+        soft_target_entropy: float = 0.5,
+        soft_ind_weight: float = 0.05,
+        soft_batch_weight: float = 1.0,
     ):
         super().__init__()
 
@@ -87,6 +92,10 @@ class MoELatticePolicy(nn.Module):
         self.load_balance_weight = load_balance_weight
         self.min_diag_std = min_diag_std
         self.cov_from_experts = cov_from_experts
+        self.soft_routing = (top_k == num_experts)
+        self.soft_target_entropy = soft_target_entropy
+        self.soft_ind_weight = soft_ind_weight
+        self.soft_batch_weight = soft_batch_weight
 
         # ── Normalizer ────────────────────────────────────────────────
         self.obs_normalizer = SignatureNormalizerModule()
@@ -161,6 +170,16 @@ class MoELatticePolicy(nn.Module):
     #  Profiler management
     # ------------------------------------------------------------------
 
+    def value_parameters(self):
+        yield from self.value_net.parameters()
+        yield from self.value_head.parameters()
+
+    def policy_parameters(self):
+        value_ids = {id(p) for p in self.value_parameters()}
+        for p in self.parameters():
+            if id(p) not in value_ids:
+                yield p
+
     def set_profiler(self, profiler: Profiler) -> None:
         self.profiler = profiler
 
@@ -178,17 +197,45 @@ class MoELatticePolicy(nn.Module):
         top_k_weights = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
         return top_k_weights, top_k_indices, gate_probs
 
-    def compute_load_balance_loss(
+    def compute_sparse_balance_loss(
         self,
         top_k_indices: torch.Tensor,
         gate_probs: torch.Tensor,
-    ) -> torch.Tensor:
-        """Switch Transformer LB loss."""
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Switch Transformer LB loss for sparse routing (top_k < N)."""
         N = self.num_experts
         flat = top_k_indices.view(-1)
         f = torch.bincount(flat, minlength=N).float() / flat.numel()
         P = gate_probs.mean(dim=0)
-        return (N * (f * P).sum()).unsqueeze(0)
+        loss = (N * (f * P).sum()).unsqueeze(0)
+        return loss, {"lb_total": loss.item()}
+
+    def compute_soft_balance_loss(
+        self,
+        gate_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Targeted InfoMax for soft routing (top_k == N).
+        H_ind → target_entropy per sample, H_batch → max entropy over batch."""
+        eps = 1e-8
+        log_probs = torch.log(gate_probs.clamp_min(eps))
+
+        ind_entropy = -(gate_probs * log_probs).sum(dim=-1)
+        l_ind = ((ind_entropy - self.soft_target_entropy) ** 2).mean()
+
+        mean_probs = gate_probs.mean(dim=0)
+        batch_entropy = -(mean_probs * torch.log(mean_probs.clamp_min(eps))).sum()
+        max_batch_entropy = math.log(self.num_experts)
+        l_batch = max_batch_entropy - batch_entropy
+
+        loss = self.soft_ind_weight * l_ind + self.soft_batch_weight * l_batch
+        stats = {
+            "lb_total": loss.item(),
+            "lb_ind_entropy": ind_entropy.mean().item(),
+            "lb_batch_entropy": batch_entropy.item(),
+            "lb_l_ind": l_ind.item(),
+            "lb_l_batch": l_batch.item(),
+        }
+        return loss.unsqueeze(0), stats
 
     # ------------------------------------------------------------------
     #  Covariance factor (выделено для gradient checkpointing)
@@ -315,7 +362,12 @@ class MoELatticePolicy(nn.Module):
         # ── 3. Gate routing (отдельная MLP на h) ─────────────────────
         with p.section("gate_forward"):
             top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
-            load_balance_loss = self.compute_load_balance_loss(top_k_indices, gate_probs)
+            if self.soft_routing:
+                load_balance_loss, lb_stats = self.compute_soft_balance_loss(gate_probs)
+            else:
+                load_balance_loss, lb_stats = self.compute_sparse_balance_loss(
+                    top_k_indices, gate_probs,
+                )
 
         # ── 4. Routing experts (sparse) ──────────────────────────────
         flat_indices = top_k_indices.view(-1)
@@ -361,8 +413,9 @@ class MoELatticePolicy(nn.Module):
                 "shared_mean_norm": s_norm,
                 "routed_mean_norm": r_norm,
                 "shared_mean_frac": s_contrib / total,
+                **lb_stats,
             }
-            if cov_factor is not None:
+            if cov_factor is not None and self.cov_from_experts:
                 # Norm approximation: avoid materializing [B, A, L] routed_W
                 # by using per-expert weight norms + mean gate usage.
                 # E[||routed_W[b]||] ≈ Σ_i mean_probs[i] · ||W_i||

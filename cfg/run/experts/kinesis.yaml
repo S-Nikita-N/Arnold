@@ -15,4 +15,3 @@ learning:
   ppo_weight: null
   imitation_weight: null
   entropy_weight: null
-  value_weight: null
