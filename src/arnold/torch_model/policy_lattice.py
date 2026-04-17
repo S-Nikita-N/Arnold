@@ -156,12 +156,10 @@ class LatticePolicy(nn.Module):
         if return_std:
             with p.section("cov_factor"):
                 std = F.softplus(self.log_std) + self.min_diag_std
-                diag_std = std[:, :self.action_dim].expand(batch_size, -1)
-                latent_std = std[:, self.action_dim:].squeeze(0)
-                W = self.action_mean.weight
-                cov_factor = (W * latent_std.unsqueeze(0)).unsqueeze(0).expand(
-                    batch_size, -1, -1,
-                )
+                diag_std = std[:, :self.action_dim]       # [1, A]
+                latent_std = std[:, self.action_dim:].squeeze(0)  # [L]
+                W = self.action_mean.weight               # [A, L]
+                cov_factor = W * latent_std.unsqueeze(0)  # [A, L]
 
         # ── 4. Value network ─────────────────────────────────────────
         value = None
