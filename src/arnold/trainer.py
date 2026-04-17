@@ -1396,7 +1396,7 @@ class ArnoldTrainer:
                             per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
 
                         # --- MoE load balancing ---
-                        if ctx.load_balance_weight > 0 and forward_lb_loss is not None:
+                        if (ctx.load_balance_weight or 0) > 0 and forward_lb_loss is not None:
                             lb_loss = forward_lb_loss.mean()
                             policy_loss = policy_loss + ctx.load_balance_weight * lb_loss
                             per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
