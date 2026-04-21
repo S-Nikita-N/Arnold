@@ -121,12 +121,16 @@ def create_expert_wrapper(
     expert_cfg_path = expert_entry.get("config_path", None)
     checkpoint_epoch = expert_entry.get("checkpoint_epoch", -1)
 
+    # Merge overrides: shared + per-mode (train_overrides / valid_overrides)
+    mode_key = f"{mode}_overrides"
+    expert_overrides = list(expert_entry.get("overrides", []))
+    expert_overrides.extend(list(expert_entry.get(mode_key, [])))
+    if overrides:
+        expert_overrides.extend(overrides)
+
     if expert_type == "kinesis":
         from arnold.experts.kinesis_wrapper import KinesisWrapper
         model_type = expert_entry.get("model_type", "legs")
-        expert_overrides = list(expert_entry.get("overrides", []))
-        if overrides:
-            expert_overrides.extend(overrides)
         return KinesisWrapper(
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
@@ -139,9 +143,6 @@ def create_expert_wrapper(
     elif expert_type == "myohuman":
         from arnold.experts.myohuman_wrapper import MyoHumanWrapper
         simple = expert_entry.get("simple", False)
-        expert_overrides = list(expert_entry.get("overrides", []))
-        if overrides:
-            expert_overrides.extend(overrides)
         return MyoHumanWrapper(
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,

@@ -2,7 +2,9 @@ type: myohuman
 config_path: null
 checkpoint_epoch: 0
 simple: false
-overrides: []  # Hydra overrides for MyoHuman env, e.g. ["run.motion_ids_file=/path/to/negatives.json"]
+overrides: []       # Hydra overrides for both train and valid envs
+train_overrides: [] # Hydra overrides for train env only, e.g. ["run.motion_ids_file=/path/to/negatives.txt"]
+valid_overrides: [] # Hydra overrides for valid env only
 
 # Per-expert parallelism (null = use global run.num_threads / learning.min_batch_size)
 num_threads: null

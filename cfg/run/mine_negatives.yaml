@@ -7,13 +7,13 @@ mine_test: true      # mine on test/validation set
 # ==================== Criteria (OR — any triggers negative) ====================
 # Per-split thresholds. Train is stricter (model already saw these motions).
 train:
-  mean_mpjpe: 0.05    # meters, null = disabled
-  max_mpjpe: null
+  mean_mpjpe: 0.08    # meters, null = disabled
+  max_mpjpe: 0.15
   not_success: true
 
 test:
   mean_mpjpe: 0.08
-  max_mpjpe: null
+  max_mpjpe: 0.15
   not_success: true
 
 # ==================== Output ====================
@@ -37,5 +37,6 @@ experts: {}
 
 # ==================== Evaluation ====================
 eval_frequency: 1
+train_eval_frequency: 1
 finish_episodes: false
 headless: true
