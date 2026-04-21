@@ -5,9 +5,16 @@ mine_train: true     # mine on training set
 mine_test: true      # mine on test/validation set
 
 # ==================== Criteria (OR — any triggers negative) ====================
-mean_mpjpe: 0.05     # mean MPJPE > threshold (meters), null = disabled
-max_mpjpe: null       # max per-frame MPJPE > threshold, null = disabled
-not_success: true     # terminated early = negative
+# Per-split thresholds. Train is stricter (model already saw these motions).
+train:
+  mean_mpjpe: 0.05    # meters, null = disabled
+  max_mpjpe: null
+  not_success: true
+
+test:
+  mean_mpjpe: 0.08
+  max_mpjpe: null
+  not_success: true
 
 # ==================== Output ====================
 output_name: negatives  # base name: {output_dir}/{output_name}_{split}.txt + .json meta

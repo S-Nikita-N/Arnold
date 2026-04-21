@@ -217,6 +217,7 @@ class ArnoldTrainer:
         self.log_frequency = cfg.run.log_frequency
         self.output_dir = cfg.run.output_dir
         self.eval_frequency = cfg.run.eval_frequency
+        self.train_eval_frequency = cfg.run.train_eval_frequency
         self.resampling_interval = cfg.run.resampling_interval
         self.finish_episodes = cfg.run.finish_episodes
         self.vectorized_eval = cfg.run.get("vectorized_eval", True)
@@ -1631,10 +1632,20 @@ class ArnoldTrainer:
             if epoch % self.log_frequency == 0:
                 self.log_train(epoch, expert_loggers, all_diagnostics)
 
-            # Evaluation
+            # Evaluation (valid)
             if self.eval_frequency > 0 and epoch > 0 and epoch % self.eval_frequency == 0:
                 all_eval = self.evaluate()
                 self.eval_checkpoint(epoch, all_eval)
+
+            # Evaluation (train) — deterministic eval on training data
+            if self.train_eval_frequency > 0 and epoch > 0 and epoch % self.train_eval_frequency == 0:
+                train_eval = self.evaluate_train()
+                if self.use_wandb:
+                    merged = {}
+                    for expert_name, metrics in train_eval.items():
+                        for k, v in metrics.items():
+                            merged[f"{expert_name}/{k}"] = v
+                    self.wandb_logger.log_eval(epoch, merged)
 
             # Save current checkpoint
             if epoch > 0 and epoch % self.save_curr_frequency == 0:
@@ -1850,6 +1861,43 @@ class ArnoldTrainer:
                 all_eval[expert_name] = self.evaluate_expert(
                     expert_name, ctx, valid_wrapper,
                 )
+
+        return all_eval
+
+    def evaluate_train(self) -> Dict[str, Dict[str, float]]:
+        """
+        Deterministic eval на train выборке (без exploration noise).
+        Логирует с prefix train_eval/ для сравнения с eval/.
+        """
+        logger.info(self._section_header("Train Evaluation"))
+
+        # Temporarily swap valid_experts to train wrappers
+        saved_valid = self.valid_experts
+        self.valid_experts = {n: ctx.wrapper for n, ctx in self.experts.items()}
+        for ctx in self.experts.values():
+            ctx.wrapper.env.start_eval(im_eval=True)
+
+        all_eval: Dict[str, Dict[str, float]] = {}
+        try:
+            for expert_name, ctx in self.experts.items():
+                wrapper = ctx.wrapper
+                if self.vectorized_eval and self.device.type in ('cuda', 'mps'):
+                    metrics = self._evaluate_expert_vectorized(
+                        expert_name, ctx, wrapper,
+                    )
+                else:
+                    metrics = self.evaluate_expert(
+                        expert_name, ctx, wrapper,
+                    )
+                # Rename eval/ → train_eval/
+                all_eval[expert_name] = {
+                    k.replace("eval/", "train_eval/"): v
+                    for k, v in metrics.items()
+                }
+        finally:
+            for ctx in self.experts.values():
+                ctx.wrapper.env.end_eval()
+            self.valid_experts = saved_valid
 
         return all_eval
 

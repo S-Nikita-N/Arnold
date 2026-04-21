@@ -32,5 +32,6 @@ experts: {}
 
 # ==================== Evaluation ====================
 eval_frequency: 100  # Частота валидации (каждые N эпох), 0 = отключить
+train_eval_frequency: 500  # Eval на train выборке (каждые N эпох), 0 = отключить
 vectorized_eval: true  # true = параллельная валидация (GPU inference + CPU env workers)
                        # автоматически false при headless=false (нужен рендер)
