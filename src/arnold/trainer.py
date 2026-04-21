@@ -139,11 +139,14 @@ def create_expert_wrapper(
     elif expert_type == "myohuman":
         from arnold.experts.myohuman_wrapper import MyoHumanWrapper
         simple = expert_entry.get("simple", False)
+        expert_overrides = list(expert_entry.get("overrides", []))
+        if overrides:
+            expert_overrides.extend(overrides)
         return MyoHumanWrapper(
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
             device="cpu",
-            overrides=overrides or [],
+            overrides=expert_overrides,
             mode=mode,
             simple=simple,
         )
@@ -296,13 +299,13 @@ class ArnoldTrainer:
             groups = parser.get_body_groups(self.tokenizer_granularity)
 
             learning_cfg = entry.get("learning", {})
-            ppo_w = learning_cfg.get("ppo_weight")
-            im_w = learning_cfg.get("imitation_weight")
-            ent_w = learning_cfg.get("entropy_weight")
-            lb_w = learning_cfg.get("load_balance_weight", 0.0)
-            loss_scale = learning_cfg.get("loss_scale", 1)
+            ppo_w = learning_cfg.get("ppo_weight") or 0.0
+            im_w = learning_cfg.get("imitation_weight") or 0.0
+            ent_w = learning_cfg.get("entropy_weight") or 0.0
+            lb_w = learning_cfg.get("load_balance_weight") or 0.0
+            loss_scale = learning_cfg.get("loss_scale") or 1.0
             mbs = learning_cfg.get("min_batch_size")
-            n_threads = entry.get("num_threads", 1)
+            n_threads = entry.get("num_threads") or 1
             vbs = entry.get("vec_batch_size", None)
 
             # Action granulation
@@ -1850,11 +1853,63 @@ class ArnoldTrainer:
 
         return all_eval
 
+    def evaluate_detailed(
+        self,
+        split: str = "valid",
+    ) -> Dict[str, Tuple[Dict[str, float], List[Dict[str, Any]]]]:
+        """
+        Evaluate all experts and return per-motion results.
+
+        Args:
+            split: "valid" uses valid_experts wrappers,
+                   "train" uses train wrappers in eval mode.
+
+        Returns:
+            {expert_name: (aggregate_metrics, per_motion_results)}
+        """
+        results = {}
+
+        # For train split: temporarily swap valid_experts so vectorized
+        # workers (which read self.valid_experts) use train wrappers.
+        saved_valid = None
+        if split == "train":
+            saved_valid = self.valid_experts
+            self.valid_experts = {n: ctx.wrapper for n, ctx in self.experts.items()}
+            for ctx in self.experts.values():
+                ctx.wrapper.env.start_eval(im_eval=True)
+
+        try:
+            for expert_name, ctx in self.experts.items():
+                wrapper = self.valid_experts.get(expert_name)
+                if wrapper is None:
+                    raise ValueError(
+                        f"No wrapper for expert '{expert_name}'. "
+                        f"Set eval_frequency > 0 in config."
+                    )
+
+                if self.vectorized_eval and self.device.type in ('cuda', 'mps'):
+                    metrics, per_motion = self._evaluate_expert_vectorized(
+                        expert_name, ctx, wrapper, return_per_motion=True,
+                    )
+                else:
+                    metrics, per_motion = self.evaluate_expert(
+                        expert_name, ctx, wrapper, return_per_motion=True,
+                    )
+                results[expert_name] = (metrics, per_motion)
+        finally:
+            if split == "train" and saved_valid is not None:
+                for ctx in self.experts.values():
+                    ctx.wrapper.env.end_eval()
+                self.valid_experts = saved_valid
+
+        return results
+
     def evaluate_expert(
         self,
         expert_name: str,
         ctx: ExpertContext,
         valid_wrapper,
+        return_per_motion: bool = False,
     ) -> Dict[str, float]:
         """Evaluation для одного эксперта."""
         self.policy.eval()
@@ -1868,6 +1923,7 @@ class ArnoldTrainer:
         episode_mpjpes = []
         episode_frame_coverages = []
         episode_successes = []
+        per_motion_results: List[Dict[str, Any]] = []
 
         for motion_id in tqdm(
             valid_wrapper.forward_motions(),
@@ -1937,6 +1993,18 @@ class ArnoldTrainer:
                 val_loss = np.mean((np.array(step_values) - disc_returns) ** 2)
                 episode_value_losses.append(val_loss)
 
+            if return_per_motion:
+                per_motion_results.append({
+                    "motion_id": motion_id,
+                    "reward": episode_reward,
+                    "length": episode_length,
+                    "im_loss": float(np.mean(step_imitation_losses)) if step_imitation_losses else None,
+                    "mpjpe": info.get("mpjpe"),
+                    "max_mpjpe": info.get("max_mpjpe"),
+                    "frame_coverage": info.get("frame_coverage"),
+                    "success": info.get("success"),
+                })
+
         metrics = {
             "eval/mean_reward": float(np.mean(episode_rewards)),
             "eval/std_reward": float(np.std(episode_rewards)),
@@ -1970,6 +2038,8 @@ class ArnoldTrainer:
             + extra
         )
 
+        if return_per_motion:
+            return metrics, per_motion_results
         return metrics
 
     # ------------------------------------------------------------------
@@ -2062,10 +2132,12 @@ class ArnoldTrainer:
 
                 if done:
                     result_queue.put(("episode", expert_name, {
+                        "motion_id": env._current_eval_motion_id,
                         "reward": ep_reward,
                         "length": ep_length,
                         "im_loss": float(np.mean(ep_im_losses)) if ep_im_losses else None,
                         "mpjpe": info.get("mpjpe"),
+                        "max_mpjpe": info.get("max_mpjpe"),
                         "frame_coverage": info.get("frame_coverage"),
                         "success": info.get("success"),
                     }))
@@ -2103,10 +2175,14 @@ class ArnoldTrainer:
         expert_name: str,
         ctx: ExpertContext,
         valid_wrapper,
+        return_per_motion: bool = False,
     ) -> Dict[str, float]:
         """
         Vectorized evaluation: N env workers step on CPU,
         main process does batched inference on GPU/MPS.
+
+        If return_per_motion=True, returns a tuple (metrics, per_motion_results)
+        where per_motion_results is a list of dicts with per-motion metrics.
         """
         self.policy.eval()
 
@@ -2174,6 +2250,7 @@ class ArnoldTrainer:
         episode_mpjpes = []
         episode_frame_coverages = []
         episode_successes = []
+        per_motion_results: List[Dict[str, Any]] = []
 
         pbar = tqdm(total=total_motions, desc=f"Eval [{expert_name}]", unit="ep")
         workers_done = 0
@@ -2197,6 +2274,8 @@ class ArnoldTrainer:
                                 episode_frame_coverages.append(float(m["frame_coverage"]))
                             if m["success"] is not None:
                                 episode_successes.append(float(m["success"]))
+                            if return_per_motion:
+                                per_motion_results.append(m)
                             pbar.update(1)
                         elif msg[0] == "done":
                             workers_done += 1
@@ -2250,12 +2329,27 @@ class ArnoldTrainer:
 
         pbar.close()
 
-        # Cleanup
+        # Cleanup: drain remaining messages, then terminate
         stop_flag.value = 1
         for wh in workers:
             wh.action_ready.set()
+
+        # Drain any remaining messages (workers may block on put if queue is full)
+        deadline = time.time() + 10
+        while workers_done < n_workers and time.time() < deadline:
+            try:
+                msg = result_queue.get(timeout=0.5)
+                if msg[0] == "done":
+                    workers_done += 1
+                elif msg[0] == "episode" and return_per_motion:
+                    per_motion_results.append(msg[2])
+            except Exception:
+                pass
+
         for wh in workers:
-            wh.proc.join(timeout=5)
+            wh.proc.join(timeout=3)
+            if wh.proc.is_alive():
+                wh.proc.terminate()
 
         # Build metrics dict (same format as evaluate_expert)
         metrics = {
@@ -2290,6 +2384,8 @@ class ArnoldTrainer:
             + extra
         )
 
+        if return_per_motion:
+            return metrics, per_motion_results
         return metrics
 
     # ------------------------------------------------------------------
