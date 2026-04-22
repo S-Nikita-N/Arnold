@@ -222,6 +222,7 @@ class ArnoldTrainer:
         self.train_eval_frequency = cfg.run.train_eval_frequency
         self.resampling_interval = cfg.run.resampling_interval
         self.finish_episodes = cfg.run.finish_episodes
+        self.persistent_workers = cfg.run.get("persistent_workers", True)
         self.vectorized_eval = cfg.run.get("vectorized_eval", True)
         if not cfg.run.headless:
             self.vectorized_eval = False
@@ -249,6 +250,9 @@ class ArnoldTrainer:
 
         # Multiprocessing Event
         self.mp_done = fork_ctx.Event()
+
+        # Persistent workers state (lazy init in _ensure_persistent_workers)
+        self._persistent_state: Optional[dict] = None
 
         # Per-expert profiler reports (заполняется на epoch 0)
         self.profiler_reports: Dict[str, Profiler] = {}
@@ -678,6 +682,8 @@ class ArnoldTrainer:
         """
         # Vectorized: env workers on CPU, batched inference on GPU/MPS
         if self.device.type in ('cuda', 'mps'):
+            if self.persistent_workers:
+                return self._sample_vectorized_persistent()
             return self._sample_vectorized()
 
         t_start = time.time()
@@ -892,6 +898,536 @@ class ArnoldTrainer:
             if hasattr(wrapper.env, "get_termination_stats"):
                 term_stats = wrapper.env.get_termination_stats()
             result_queue.put(("logger", expert_name, obc_logger, term_stats))
+
+    def _vec_env_worker_persistent(
+        self,
+        expert_name: str,
+        worker_id: int,
+        obs_buf: torch.Tensor,
+        action_buf: torch.Tensor,
+        expert_action_buf: torch.Tensor,
+        reward_val,
+        done_val,
+        obs_ready,
+        action_ready,
+        stop_flag,
+        shutdown_flag,
+        epoch_start,
+        epoch_val,
+        resample_flag,
+        result_queue,
+        step_counter,
+        send_sigs: bool,
+    ) -> None:
+        """
+        Persistent env worker for vectorized sampling.
+
+        Outer loop: waits for epoch_start, runs inner sampling loop, sends
+        logger/stats, loops. Exits when shutdown_flag is set.
+        """
+        ctx = self.experts[expert_name]
+        wrapper = ctx.wrapper
+        parser = ObservationParser.from_env(wrapper.env, self.history_len)
+        action_parser = ActionParser.from_env(wrapper.env)
+
+        sigs_sent = False
+
+        try:
+            while True:
+                # Wait for next epoch or shutdown
+                while not epoch_start.wait(timeout=1.0):
+                    if shutdown_flag.value:
+                        return
+                epoch_start.clear()
+
+                if shutdown_flag.value:
+                    return
+
+                # Re-seed per epoch for reproducibility
+                current_epoch = epoch_val.value
+                seed = random.randint(0, 5000) * worker_id + current_epoch
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+
+                # Resample motions if main process requested it
+                if resample_flag.value and hasattr(wrapper.env, 'sample_motions'):
+                    wrapper.env.sample_motions()
+
+                obc_logger = OBCLogger()
+
+                # Reset env at epoch start
+                obs, info = wrapper.reset()
+                parser.reset(obs)
+                obs_ts, obs_sigs = parser.get_observation(torch.device("cpu"))
+                act_sigs = action_parser.action_signatures
+
+                if send_sigs and not sigs_sent:
+                    result_queue.put(("sigs", expert_name, obs_sigs, act_sigs))
+                    sigs_sent = True
+
+                obs_buf.copy_(obs_ts.squeeze(0))
+                if ctx.use_expert:
+                    ea = wrapper.get_expert_action(obs)
+                    expert_action_buf.copy_(torch.from_numpy(ea).float())
+
+                done_val.value = 0
+                reward_val.value = 0.0
+                step_counter.value = 0
+                obs_ready.set()
+
+                # Inner sampling loop (identical to ephemeral)
+                try:
+                    while True:
+                        action_ready.wait()
+                        action_ready.clear()
+
+                        if stop_flag.value:
+                            break
+
+                        action_np = action_buf.numpy().copy()
+                        next_obs, reward, terminated, truncated, info = wrapper.step(action_np)
+                        done = terminated or truncated
+
+                        reward_val.value = float(reward)
+                        done_val.value = 1 if done else 0
+
+                        obc_logger.step(
+                            reward=reward,
+                            info=info if isinstance(info, dict) else None,
+                        )
+                        with step_counter.get_lock():
+                            step_counter.value += 1
+
+                        if done:
+                            obc_logger.end_episode()
+                            obs, info = wrapper.reset()
+                            parser.reset(obs)
+                        else:
+                            parser.update(next_obs)
+                            obs = next_obs
+
+                        obs_ts, _ = parser.get_observation(torch.device("cpu"))
+                        obs_buf.copy_(obs_ts.squeeze(0))
+                        if ctx.use_expert:
+                            ea = wrapper.get_expert_action(obs)
+                            expert_action_buf.copy_(torch.from_numpy(ea).float())
+
+                        obs_ready.set()
+
+                except Exception as e:
+                    import traceback
+                    print(f"PersistentWorker [{expert_name}#{worker_id}] inner loop failed: {e}")
+                    traceback.print_exc()
+
+                # Send logger + termination stats for this epoch
+                term_stats = None
+                if hasattr(wrapper.env, "get_termination_stats"):
+                    term_stats = wrapper.env.get_termination_stats()
+                result_queue.put(("logger", expert_name, obc_logger, term_stats))
+
+        except Exception as e:
+            import traceback
+            print(f"PersistentWorker [{expert_name}#{worker_id}] outer loop failed: {e}")
+            traceback.print_exc()
+
+    # ------------------------------------------------------------------
+    #  Persistent Worker Management
+    # ------------------------------------------------------------------
+
+    def _ensure_persistent_workers(self) -> None:
+        """Lazily spawn persistent workers on first call. No-op if already alive."""
+        if self._persistent_state is not None:
+            return
+
+        result_queue = fork_ctx.Queue()
+        stop_flag = fork_ctx.Value('i', 0)
+        shutdown_flag = fork_ctx.Value('i', 0)
+        epoch_val = fork_ctx.Value('i', 0)
+        resample_flag = fork_ctx.Value('i', 0)
+
+        class _WH:
+            """Persistent worker handle."""
+            __slots__ = (
+                'expert_name', 'obs_buf', 'action_buf', 'expert_action_buf',
+                'reward_val', 'done_val', 'obs_ready', 'action_ready',
+                'epoch_start', 'proc', 'active',
+            )
+
+        workers_by_expert: Dict[str, List] = {n: [] for n in self.experts}
+        all_workers: List = []
+
+        for expert_name, ctx in self.experts.items():
+            obs_shape = (ctx.parser.n_obs_elements, self.history_len)
+            action_dim = ctx.wrapper.action_dim
+            n_workers = ctx.vec_batch_size or ctx.num_threads
+
+            for w_idx in range(n_workers):
+                wh = _WH()
+                wh.expert_name = expert_name
+                wh.obs_buf = torch.zeros(obs_shape, dtype=torch.float32).share_memory_()
+                wh.action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
+                wh.expert_action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
+                wh.reward_val = fork_ctx.Value('d', 0.0)
+                wh.done_val = fork_ctx.Value('i', 0)
+                wh.obs_ready = fork_ctx.Event()
+                wh.action_ready = fork_ctx.Event()
+                wh.epoch_start = fork_ctx.Event()
+                wh.active = True
+
+                global_wid = len(all_workers) + 1
+
+                wh.proc = fork_ctx.Process(
+                    target=self._vec_env_worker_persistent,
+                    args=(
+                        expert_name,
+                        global_wid,
+                        wh.obs_buf, wh.action_buf, wh.expert_action_buf,
+                        wh.reward_val, wh.done_val,
+                        wh.obs_ready, wh.action_ready,
+                        stop_flag, shutdown_flag,
+                        wh.epoch_start, epoch_val,
+                        resample_flag,
+                        result_queue,
+                        fork_ctx.Value('i', 0),  # step_counter per worker
+                        w_idx == 0,  # send_sigs
+                    ),
+                    daemon=True,
+                )
+                workers_by_expert[expert_name].append(wh)
+                all_workers.append(wh)
+
+        for wh in all_workers:
+            wh.proc.start()
+
+        total_workers = len(all_workers)
+        workers_per_expert = {n: len(ws) for n, ws in workers_by_expert.items()}
+        logger.info(
+            f"Persistent vectorized workers spawned: {total_workers} "
+            f"({workers_per_expert})"
+        )
+
+        # Collect signatures from first epoch trigger
+        # Signal all workers to start their first epoch
+        epoch_val.value = self.epoch
+        for wh in all_workers:
+            wh.epoch_start.set()
+
+        sigs_by_expert: Dict[str, Tuple] = {}
+        while len(sigs_by_expert) < len(self.experts):
+            msg = result_queue.get(timeout=30)
+            if msg[0] == "sigs":
+                sigs_by_expert[msg[1]] = (msg[2], msg[3])
+
+        self._persistent_state = {
+            "result_queue": result_queue,
+            "stop_flag": stop_flag,
+            "shutdown_flag": shutdown_flag,
+            "epoch_val": epoch_val,
+            "resample_flag": resample_flag,
+            "workers_by_expert": workers_by_expert,
+            "all_workers": all_workers,
+            "sigs_by_expert": sigs_by_expert,
+            "first_epoch": True,  # first epoch already triggered
+        }
+
+    def _shutdown_persistent_workers(self) -> None:
+        """Shutdown all persistent workers and clean up."""
+        if self._persistent_state is None:
+            return
+
+        state = self._persistent_state
+        state["shutdown_flag"].value = 1
+
+        # Wake workers so they see shutdown_flag
+        for wh in state["all_workers"]:
+            wh.epoch_start.set()
+            wh.action_ready.set()
+
+        for wh in state["all_workers"]:
+            wh.proc.join(timeout=10)
+            if wh.proc.is_alive():
+                wh.proc.terminate()
+
+        self._persistent_state = None
+        logger.info("Persistent workers shut down.")
+
+    def _sample_vectorized_persistent(self) -> Tuple[Dict[str, OBCBatch], Dict[str, OBCLogger]]:
+        """
+        Vectorized sampling with persistent workers.
+
+        Workers are already alive (spawned by _ensure_persistent_workers).
+        This method triggers a new epoch, runs the lockstep inference loop,
+        and collects results — without process spawn overhead.
+        """
+        self._ensure_persistent_workers()
+        state = self._persistent_state
+
+        t_start = time.time()
+        self.policy.eval()
+
+        optimizer_to(self.policy_optimizer, torch.device('cpu'))
+        optimizer_to(self.value_optimizer, torch.device('cpu'))
+
+        prof = Profiler(
+            device=str(self.device) if self.device.type == 'cuda' else None,
+        )
+        prof.time_enabled = (self.epoch == 0)
+
+        old_profiler = getattr(self.policy_module, 'profiler', None)
+        if hasattr(self.policy_module, 'set_profiler'):
+            self.policy_module.set_profiler(prof)
+
+        result_queue = state["result_queue"]
+        stop_flag = state["stop_flag"]
+        workers_by_expert = state["workers_by_expert"]
+        all_workers = state["all_workers"]
+        sigs_by_expert = state["sigs_by_expert"]
+
+        total_workers = len(all_workers)
+
+        # Reset stop flag and activate all workers
+        stop_flag.value = 0
+        for wh in all_workers:
+            wh.active = True
+
+        # Signal epoch start (skip on first epoch — already triggered in _ensure)
+        if not state["first_epoch"]:
+            state["epoch_val"].value = self.epoch
+            for wh in all_workers:
+                wh.epoch_start.set()
+        state["first_epoch"] = False
+
+        workers_per_expert = {n: len(ws) for n, ws in workers_by_expert.items()}
+        logger.info(
+            f"Persistent sampling: {total_workers} workers "
+            f"({workers_per_expert}), inference on {self.device}, "
+            f"finish_episodes={self.finish_episodes}"
+        )
+
+        # Wait for initial obs from all workers
+        def _wait_obs_active():
+            for wh in all_workers:
+                if not wh.active:
+                    continue
+                while not wh.obs_ready.wait(timeout=2.0):
+                    if not wh.proc.is_alive():
+                        raise RuntimeError(
+                            f"PersistentWorker [{wh.expert_name}] died "
+                            f"(exit code {wh.proc.exitcode})"
+                        )
+                wh.obs_ready.clear()
+
+        _wait_obs_active()
+
+        # Per-worker memory tracking
+        worker_mems: Dict[int, OBCMemory] = {id(w): OBCMemory() for w in all_workers}
+        worker_prev: Dict[int, Optional[dict]] = {id(w): None for w in all_workers}
+
+        per_expert_steps: Dict[str, int] = {n: 0 for n in self.experts}
+        target_steps = {n: ctx.min_batch_size for n, ctx in self.experts.items()}
+
+        pbars = {
+            n: tqdm(total=t, desc=f"  Sampling [{n}]", unit="step")
+            for n, t in target_steps.items()
+        }
+
+        device = self.device
+        device_type = "cuda" if device.type == "cuda" else "cpu"
+        use_amp = self.use_bfloat16 and device.type == "cuda"
+        has_prev = False
+        draining = False
+
+        # Main inference loop (identical to ephemeral)
+        with torch.no_grad():
+            while True:
+                if has_prev:
+                    with prof.section("store_memory"):
+                        for expert_name, workers in workers_by_expert.items():
+                            obs_sigs, act_sigs = sigs_by_expert[expert_name]
+
+                            for wh in workers:
+                                if not wh.active:
+                                    continue
+                                wid = id(wh)
+                                prev = worker_prev[wid]
+                                if prev is None:
+                                    continue
+                                mem = worker_mems[wid]
+
+                                mem.states.append(prev["obs"])
+                                mem.obs_signatures.append(obs_sigs)
+                                mem.action_signatures.append(act_sigs)
+                                mem.student_actions.append(prev["action"])
+                                mem.expert_actions.append(prev["expert_action"])
+                                mem.rewards.append(wh.reward_val.value)
+                                mem.values.append(prev["value"])
+                                mem.masks.append(0.0 if wh.done_val.value else 1.0)
+                                mem.log_probs.append(prev["log_prob"])
+                                per_expert_steps[expert_name] += 1
+
+                    for n, pbar in pbars.items():
+                        pbar.n = min(per_expert_steps[n], pbar.total)
+                        pbar.refresh()
+
+                    if draining:
+                        for wh in all_workers:
+                            if wh.active and wh.done_val.value:
+                                wh.active = False
+                        if not any(wh.active for wh in all_workers):
+                            break
+
+                    target_reached = all(
+                        per_expert_steps[n] >= target_steps[n]
+                        for n in self.experts
+                    )
+                    if target_reached:
+                        if not self.finish_episodes:
+                            break
+                        if not draining:
+                            draining = True
+                            for wh in all_workers:
+                                if wh.done_val.value:
+                                    wh.active = False
+                            if not any(wh.active for wh in all_workers):
+                                break
+
+                with prof.section("inference"):
+                    for expert_name, workers in workers_by_expert.items():
+                        obs_sigs, act_sigs = sigs_by_expert[expert_name]
+                        ctx = self.experts[expert_name]
+
+                        active_workers = [wh for wh in workers if wh.active]
+                        if not active_workers:
+                            continue
+
+                        with prof.section("stack_obs"):
+                            batch_obs = torch.stack(
+                                [wh.obs_buf.clone() for wh in active_workers]
+                            )
+
+                        with prof.section("gpu_forward"):
+                            with prof.section("to_device"):
+                                batch_obs_dev = batch_obs.to(device)
+                            with prof.section("policy_forward"):
+                                with torch.autocast(
+                                    device_type=device_type,
+                                    dtype=torch.bfloat16,
+                                    enabled=use_amp,
+                                ):
+                                    actions, log_probs, values = \
+                                        self.policy_module.get_action(
+                                            batch_obs_dev,
+                                            obs_sigs, act_sigs,
+                                            expert_name=expert_name,
+                                            deterministic=False,
+                                        )
+                            with prof.section("to_cpu"):
+                                actions_cpu = actions.cpu()
+                                log_probs_cpu = log_probs.cpu()
+                                values_cpu = values.cpu()
+
+                        with prof.section("scatter"):
+                            zero_ea = torch.zeros(ctx.wrapper.action_dim)
+                            for i, wh in enumerate(active_workers):
+                                worker_prev[id(wh)] = {
+                                    "obs": wh.obs_buf.clone(),
+                                    "action": actions_cpu[i],
+                                    "log_prob": log_probs_cpu[i],
+                                    "value": values_cpu[i],
+                                    "expert_action": (
+                                        wh.expert_action_buf.clone()
+                                        if ctx.use_expert else zero_ea
+                                    ),
+                                }
+                                wh.action_buf.copy_(actions_cpu[i])
+
+                has_prev = True
+
+                with prof.section("signal_workers"):
+                    for wh in all_workers:
+                        if wh.active:
+                            wh.action_ready.set()
+
+                with prof.section("wait_env_step"):
+                    _wait_obs_active()
+
+        # Stop workers (they'll send logger via queue, then wait for next epoch)
+        for pbar in pbars.values():
+            pbar.n = pbar.total
+            pbar.refresh()
+            pbar.close()
+
+        stop_flag.value = 1
+        for wh in all_workers:
+            wh.action_ready.set()
+
+        # Collect loggers from workers
+        per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
+        per_expert_term_stats: Dict[str, list] = {n: [] for n in self.experts}
+        collected = 0
+        while collected < total_workers:
+            try:
+                msg = result_queue.get(timeout=10)
+                if msg[0] == "logger":
+                    per_expert_loggers[msg[1]].append(msg[2])
+                    if msg[3] is not None:
+                        per_expert_term_stats[msg[1]].append(msg[3])
+                    collected += 1
+            except Exception:
+                break
+
+        # Restore profiler
+        if old_profiler is not None and hasattr(self.policy_module, 'set_profiler'):
+            self.policy_module.set_profiler(old_profiler)
+
+        optimizer_to(self.policy_optimizer, self.device)
+        optimizer_to(self.value_optimizer, self.device)
+
+        # Merge per expert
+        expert_batches: Dict[str, OBCBatch] = {}
+        expert_loggers: Dict[str, OBCLogger] = {}
+
+        for expert_name, workers in workers_by_expert.items():
+            merged = OBCMemory()
+            for wh in workers:
+                mem = worker_mems[id(wh)]
+                if len(mem) > 0 and mem.masks[-1] != 0.0:
+                    mem.masks[-1] = 0.0
+                merged.extend(mem)
+
+            batch = merged.to_batch(gamma=self.gamma, tau=self.tau, device=None)
+            expert_batches[expert_name] = batch
+            expert_loggers[expert_name] = OBCLogger.merge(
+                per_expert_loggers.get(expert_name, [])
+            )
+
+        # Merge termination stats
+        for expert_name, stats_list in per_expert_term_stats.items():
+            if not stats_list:
+                continue
+            ctx = self.experts[expert_name]
+            env = ctx.wrapper.env
+            if not hasattr(env, "_termination_counts"):
+                env._termination_counts = {}
+                env._termination_dists = {}
+            for worker_stats in stats_list:
+                for body, s in worker_stats.items():
+                    if body not in env._termination_counts:
+                        env._termination_counts[body] = 0
+                        env._termination_dists[body] = []
+                    env._termination_counts[body] += s["caused"]
+                    if s["mean_dist"] > 0 and s["caused"] > 0:
+                        env._termination_dists[body].extend([s["mean_dist"]] * s["caused"])
+
+        if prof.time_enabled:
+            self.profiler_reports["vectorized_sampling"] = prof
+
+        sample_time = time.time() - t_start
+        for lg in expert_loggers.values():
+            lg.sample_time = sample_time
+
+        return expert_batches, expert_loggers
 
     def _sample_vectorized(self) -> Tuple[Dict[str, OBCBatch], Dict[str, OBCLogger]]:
         """
@@ -1622,85 +2158,94 @@ class ArnoldTrainer:
             f"Training  |  experts: {', '.join(expert_names)}  |  epochs: {self.max_epochs}"
         ))
 
-        for epoch in range(self.epoch, self.max_epochs):
-            self.epoch = epoch
+        try:
+            for epoch in range(self.epoch, self.max_epochs):
+                self.epoch = epoch
 
-            # Pre-epoch: resample motions
-            for expert_name, ctx in self.experts.items():
-                if hasattr(ctx.wrapper.env, 'sample_motions') and epoch > 0:
-                    if epoch % self.resampling_interval == 0:
-                        ctx.wrapper.env.sample_motions()
+                # Pre-epoch: resample motions
+                need_resample = epoch > 0 and epoch % self.resampling_interval == 0
+                if self.persistent_workers and self._persistent_state is not None:
+                    # Signal persistent workers to resample (they handle it)
+                    self._persistent_state["resample_flag"].value = 1 if need_resample else 0
+                else:
+                    if need_resample:
+                        for expert_name, ctx in self.experts.items():
+                            if hasattr(ctx.wrapper.env, 'sample_motions'):
+                                ctx.wrapper.env.sample_motions()
 
-            # Sample
-            t_sample_start = time.time()
-            expert_batches, expert_loggers = self.sample()
-            t_sample = time.time() - t_sample_start
+                # Sample
+                t_sample_start = time.time()
+                expert_batches, expert_loggers = self.sample()
+                t_sample = time.time() - t_sample_start
 
-            # Update
-            t_update_start = time.time()
-            all_diagnostics = self.update_params(expert_batches, debug_memory=(epoch == 0))
-            t_update = time.time() - t_update_start
+                # Update
+                t_update_start = time.time()
+                all_diagnostics = self.update_params(expert_batches, debug_memory=(epoch == 0))
+                t_update = time.time() - t_update_start
 
-            # Apply timing and losses to loggers
-            total_steps_epoch = 0
-            for expert_name, obc_lg in expert_loggers.items():
-                obc_lg.sample_time = t_sample
-                obc_lg.update_time = t_update
-                diag = all_diagnostics[expert_name]
-                obc_lg.set_update_losses(
-                    ppo_loss=diag["ppo_loss"],
-                    imitation_loss=diag["imitation_loss"],
-                    value_loss=diag["value_loss"],
-                    entropy_loss=diag["entropy_loss"],
-                    load_balance_loss=diag["load_balance_loss"],
-                )
-                total_steps_epoch += obc_lg.num_steps
+                # Apply timing and losses to loggers
+                total_steps_epoch = 0
+                for expert_name, obc_lg in expert_loggers.items():
+                    obc_lg.sample_time = t_sample
+                    obc_lg.update_time = t_update
+                    diag = all_diagnostics[expert_name]
+                    obc_lg.set_update_losses(
+                        ppo_loss=diag["ppo_loss"],
+                        imitation_loss=diag["imitation_loss"],
+                        value_loss=diag["value_loss"],
+                        entropy_loss=diag["entropy_loss"],
+                        load_balance_loss=diag["load_balance_loss"],
+                    )
+                    total_steps_epoch += obc_lg.num_steps
 
-            self.num_steps += total_steps_epoch
+                self.num_steps += total_steps_epoch
 
-            if self.policy_scheduler is not None:
-                self.policy_scheduler.step()
-            if self.value_scheduler is not None:
-                self.value_scheduler.step()
+                if self.policy_scheduler is not None:
+                    self.policy_scheduler.step()
+                if self.value_scheduler is not None:
+                    self.value_scheduler.step()
 
-            # Logging
-            if epoch % self.log_frequency == 0:
-                self.log_train(epoch, expert_loggers, all_diagnostics)
+                # Logging
+                if epoch % self.log_frequency == 0:
+                    self.log_train(epoch, expert_loggers, all_diagnostics)
 
-            # Evaluation (valid)
-            if self.eval_frequency > 0 and epoch > 0 and epoch % self.eval_frequency == 0:
+                # Evaluation (valid)
+                if self.eval_frequency > 0 and epoch > 0 and epoch % self.eval_frequency == 0:
+                    all_eval = self.evaluate()
+                    self.eval_checkpoint(epoch, all_eval)
+
+                # Evaluation (train) — deterministic eval on training data
+                if self.train_eval_frequency > 0 and epoch > 0 and epoch % self.train_eval_frequency == 0:
+                    train_eval = self.evaluate_train()
+                    if self.use_wandb:
+                        merged = {}
+                        for expert_name, metrics in train_eval.items():
+                            for k, v in metrics.items():
+                                merged[f"{expert_name}/{k}"] = v
+                        self.wandb_logger.log_eval(epoch, merged)
+
+                # Save current checkpoint
+                if epoch > 0 and epoch % self.save_curr_frequency == 0:
+                    self.save_checkpoint(suffix="latest")
+
+                # Save numbered checkpoint
+                if epoch > 0 and epoch % self.save_frequency == 0:
+                    self.save_checkpoint(suffix=f"epoch_{epoch:05d}")
+
+            # Final evaluation + save
+            if self.eval_frequency > 0:
+                logger.info("Final evaluation...")
                 all_eval = self.evaluate()
                 self.eval_checkpoint(epoch, all_eval)
 
-            # Evaluation (train) — deterministic eval on training data
-            if self.train_eval_frequency > 0 and epoch > 0 and epoch % self.train_eval_frequency == 0:
-                train_eval = self.evaluate_train()
-                if self.use_wandb:
-                    merged = {}
-                    for expert_name, metrics in train_eval.items():
-                        for k, v in metrics.items():
-                            merged[f"{expert_name}/{k}"] = v
-                    self.wandb_logger.log_eval(epoch, merged)
+            self.save_checkpoint(suffix="latest")
+            logger.info("Training completed!")
 
-            # Save current checkpoint
-            if epoch > 0 and epoch % self.save_curr_frequency == 0:
-                self.save_checkpoint(suffix="latest")
+            if self.use_wandb:
+                self.wandb_logger.finish()
 
-            # Save numbered checkpoint
-            if epoch > 0 and epoch % self.save_frequency == 0:
-                self.save_checkpoint(suffix=f"epoch_{epoch:05d}")
-
-        # Final evaluation + save
-        if self.eval_frequency > 0:
-            logger.info("Final evaluation...")
-            all_eval = self.evaluate()
-            self.eval_checkpoint(epoch, all_eval)
-
-        self.save_checkpoint(suffix="latest")
-        logger.info("Training completed!")
-
-        if self.use_wandb:
-            self.wandb_logger.finish()
+        finally:
+            self._shutdown_persistent_workers()
 
     def eval_checkpoint(
         self,

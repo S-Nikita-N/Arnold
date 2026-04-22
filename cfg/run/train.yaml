@@ -15,6 +15,9 @@ headless: true
 #                          until all current episodes end (done/truncated)
 # finish_episodes: false = stop sampling immediately when min_batch_size is reached
 finish_episodes: false
+# persistent_workers: true  = workers spawn once and stay alive between epochs (faster)
+#                     false = workers spawn fresh each epoch (original behavior)
+persistent_workers: false
 
 # ==================== Paths ====================
 output_dir: data/trained_models/${exp_name}
