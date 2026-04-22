@@ -201,6 +201,7 @@ class ArnoldTrainer:
         self.clip_epsilon = cfg.learning.clip_epsilon
         self.value_clip = cfg.learning.value_clip
         self.opt_num_epochs = cfg.learning.opt_num_epochs
+        self.grad_accum_steps = cfg.learning.grad_accum_steps
         self.grad_clip = cfg.learning.grad_clip
         self.value_grad_clip = cfg.learning.value_grad_clip
         self.max_epochs = cfg.learning.max_epochs
@@ -1260,11 +1261,13 @@ class ArnoldTrainer:
             for n in self.experts
         }
 
-        # Общее число mini-batch updates для progress bar
+        # Общее число mini-batch forwards для progress bar
         total_updates = 0
         for expert_name, ed in expert_data.items():
             n_batches = max(1, ed["batch_size"] // self.batch_size)
             total_updates += self.opt_num_epochs * n_batches
+        # Log effective optimizer steps
+        effective_steps = total_updates // self.grad_accum_steps
 
         pbar = tqdm(total=total_updates, desc="Update", unit="batch")
 
@@ -1288,7 +1291,11 @@ class ArnoldTrainer:
 
             random.shuffle(schedule)
 
-            for expert_name, batch_indices in schedule:
+            accum_step = 0
+            self.policy_optimizer.zero_grad()
+            self.value_optimizer.zero_grad()
+
+            for sched_idx, (expert_name, batch_indices) in enumerate(schedule):
                 ed = expert_data[expert_name]
                 ctx = ed["ctx"]
 
@@ -1406,36 +1413,40 @@ class ArnoldTrainer:
                             policy_loss = policy_loss + ctx.load_balance_weight * lb_loss
                             per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
 
-                        # Apply expert loss scale
-                        policy_loss = policy_loss * ctx.loss_scale
-                        value_loss_total = value_loss_total * ctx.loss_scale
+                        # Apply expert loss scale and accumulation scaling
+                        scale = ctx.loss_scale / self.grad_accum_steps
+                        policy_loss = policy_loss * scale
+                        value_loss_total = value_loss_total * scale
 
-                        self.policy_optimizer.zero_grad()
-                        self.value_optimizer.zero_grad()
                         with prof.section("loss.backward"):
                             (policy_loss + value_loss_total).backward()
 
-                with prof.section("grad_clip + optimizer.step"):
-                    if self.grad_clip > 0:
-                        policy_grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.policy_module.policy_parameters(), self.grad_clip,
-                        )
-                        per_expert_diag[expert_name]["grad_norms"].append(policy_grad_norm.item())
-                    else:
-                        total_norm = sum(
-                            p.grad.norm().item() ** 2
-                            for p in self.policy_module.policy_parameters() if p.grad is not None
-                        ) ** 0.5
-                        per_expert_diag[expert_name]["grad_norms"].append(total_norm)
+                accum_step += 1
+                is_last = sched_idx == len(schedule) - 1
+                if accum_step % self.grad_accum_steps == 0 or is_last:
+                    with prof.section("grad_clip + optimizer.step"):
+                        if self.grad_clip > 0:
+                            policy_grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self.policy_module.policy_parameters(), self.grad_clip,
+                            )
+                            per_expert_diag[expert_name]["grad_norms"].append(policy_grad_norm.item())
+                        else:
+                            total_norm = sum(
+                                p.grad.norm().item() ** 2
+                                for p in self.policy_module.policy_parameters() if p.grad is not None
+                            ) ** 0.5
+                            per_expert_diag[expert_name]["grad_norms"].append(total_norm)
 
-                    if self.value_grad_clip > 0:
-                        value_grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.policy_module.value_parameters(), self.value_grad_clip,
-                        )
-                        per_expert_diag[expert_name]["value_grad_norms"].append(value_grad_norm.item())
+                        if self.value_grad_clip > 0:
+                            value_grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self.policy_module.value_parameters(), self.value_grad_clip,
+                            )
+                            per_expert_diag[expert_name]["value_grad_norms"].append(value_grad_norm.item())
 
-                    self.policy_optimizer.step()
-                    self.value_optimizer.step()
+                        self.policy_optimizer.step()
+                        self.value_optimizer.step()
+                        self.policy_optimizer.zero_grad()
+                        self.value_optimizer.zero_grad()
 
                 pbar.update(1)
 

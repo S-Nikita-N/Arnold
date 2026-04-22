@@ -38,6 +38,7 @@ tau: 0.95  # GAE lambda
 clip_epsilon: 0.2
 value_clip: true
 opt_num_epochs: 10
+grad_accum_steps: 1  # >1: accumulate gradients over N mini-batches before optimizer.step()
 grad_clip: 0.5
 value_grad_clip: 0.5
 
