@@ -888,7 +888,10 @@ class ArnoldTrainer:
             traceback.print_exc()
 
         finally:
-            result_queue.put(("logger", expert_name, obc_logger))
+            term_stats = None
+            if hasattr(wrapper.env, "get_termination_stats"):
+                term_stats = wrapper.env.get_termination_stats()
+            result_queue.put(("logger", expert_name, obc_logger, term_stats))
 
     def _sample_vectorized(self) -> Tuple[Dict[str, OBCBatch], Dict[str, OBCLogger]]:
         """
@@ -1163,12 +1166,15 @@ class ArnoldTrainer:
             wh.action_ready.set()
 
         per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
+        per_expert_term_stats: Dict[str, list] = {n: [] for n in self.experts}
         collected = 0
         while collected < total_workers:
             try:
                 msg = result_queue.get(timeout=10)
                 if msg[0] == "logger":
                     per_expert_loggers[msg[1]].append(msg[2])
+                    if msg[3] is not None:
+                        per_expert_term_stats[msg[1]].append(msg[3])
                     collected += 1
             except Exception:
                 break
@@ -1200,6 +1206,24 @@ class ArnoldTrainer:
             expert_loggers[expert_name] = OBCLogger.merge(
                 per_expert_loggers.get(expert_name, [])
             )
+
+        # Merge per-body termination stats from all workers into main env
+        for expert_name, stats_list in per_expert_term_stats.items():
+            if not stats_list:
+                continue
+            ctx = self.experts[expert_name]
+            env = ctx.wrapper.env
+            if not hasattr(env, "_termination_counts"):
+                env._termination_counts = {}
+                env._termination_dists = {}
+            for worker_stats in stats_list:
+                for body, s in worker_stats.items():
+                    if body not in env._termination_counts:
+                        env._termination_counts[body] = 0
+                        env._termination_dists[body] = []
+                    env._termination_counts[body] += s["caused"]
+                    if s["mean_dist"] > 0 and s["caused"] > 0:
+                        env._termination_dists[body].extend([s["mean_dist"]] * s["caused"])
 
         if prof.time_enabled:
             self.profiler_reports["vectorized_sampling"] = prof
@@ -1267,7 +1291,6 @@ class ArnoldTrainer:
             n_batches = max(1, ed["batch_size"] // self.batch_size)
             total_updates += self.opt_num_epochs * n_batches
         # Log effective optimizer steps
-        effective_steps = total_updates // self.grad_accum_steps
 
         pbar = tqdm(total=total_updates, desc="Update", unit="batch")
 
@@ -1842,6 +1865,20 @@ class ArnoldTrainer:
             logger.info(self._mem_profile_report)
             self._mem_profile_report = None
 
+        # Per-body termination stats
+        for expert_name in expert_loggers:
+            ctx = self.experts[expert_name]
+            env = ctx.wrapper.env
+            if hasattr(env, "get_termination_stats"):
+                stats = env.get_termination_stats()
+                if stats and sum(s["caused"] for s in stats.values()) > 0:
+                    total = sum(s["caused"] for s in stats.values())
+                    parts = []
+                    for body, s in sorted(stats.items(), key=lambda x: -x[1]["caused"]):
+                        if s["caused"] > 0:
+                            parts.append(f"{body}={s['caused']}({100*s['caused']/total:.0f}% d={s['mean_dist']*100:.1f}cm)")
+                    logger.info(f"  [{expert_name}] Terminations ({total}): {' | '.join(parts)}")
+
         if self.use_wandb:
             self.wandb_logger.log_train(
                 epoch=epoch,
@@ -2191,7 +2228,7 @@ class ArnoldTrainer:
                 ep_length += 1
 
                 if done:
-                    result_queue.put(("episode", expert_name, {
+                    ep_result = {
                         "motion_id": env._current_eval_motion_id,
                         "reward": ep_reward,
                         "length": ep_length,
@@ -2200,7 +2237,10 @@ class ArnoldTrainer:
                         "max_mpjpe": info.get("max_mpjpe"),
                         "frame_coverage": info.get("frame_coverage"),
                         "success": info.get("success"),
-                    }))
+                    }
+                    if terminated:
+                        ep_result["termination_body"] = info.get("termination_body")
+                    result_queue.put(("episode", expert_name, ep_result))
 
                     # Try next motion
                     if not _load_next_motion():

@@ -179,9 +179,10 @@ def validate(cfg: DictConfig) -> dict:
     expert_config = experts_list[0]
     expert_name = expert_config.type
 
-    logger.info(f"Loading expert environment (valid mode, headless={headless})...")
+    env_mode = run.get("mode", "valid")
+    logger.info(f"Loading expert environment (mode={env_mode}, headless={headless})...")
     overrides = [f"run.headless={str(headless).lower()}"]
-    expert = create_expert_wrapper(expert_config, mode="valid", overrides=overrides)
+    expert = create_expert_wrapper(expert_config, mode=env_mode, overrides=overrides)
     logger.info(f"Expert loaded. Obs dim: {expert.obs_dim}, Action dim: {expert.action_dim}")
 
     # Parser
@@ -209,8 +210,9 @@ def validate(cfg: DictConfig) -> dict:
     if num_motions > 0:
         total_motions = min(num_motions, total_motions)
 
-    logger.info(f"Validating on {total_motions} motions...")
-    expert.env.start_eval(im_eval=True)
+    logger.info(f"Validating on {total_motions} motions (mode={env_mode})...")
+    if env_mode != "train":
+        expert.env.start_eval(im_eval=True)
 
     profile_done = False
 
@@ -299,7 +301,8 @@ def validate(cfg: DictConfig) -> dict:
             pbar.set_postfix(postfix)
 
     finally:
-        expert.env.end_eval()
+        if env_mode != "train":
+            expert.env.end_eval()
 
     # Final metrics
     metrics = {

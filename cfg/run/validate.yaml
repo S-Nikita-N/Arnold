@@ -12,7 +12,9 @@ sleep_per_step: 0.0  # задержка между шагами (сек)
 num_threads: 1
 
 # ==================== Experts ====================
-# Аналогично train.yaml, но для валидации используется mode="valid"
+# mode: "valid" = eval config (no random_start, no heading randomization)
+#       "train" = train config (random_start, heading randomization)
+mode: valid
 experts: {}
 # ==================== Performance ====================
 # При true: не считать std head и value decoder в get_action (быстрее при eval)
