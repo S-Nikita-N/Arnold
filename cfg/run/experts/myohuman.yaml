@@ -19,3 +19,11 @@ learning:
   imitation_weight: null
   entropy_weight: null
   load_balance_weight: null
+
+# Kinesis teacher for knowledge distillation (legs+torso).
+teacher_policy:
+  enabled: false
+  type: kinesis_legs_back          # only supported variant
+  checkpoint: null                 # path to model.pth
+  motion_whitelist_file: null
+  arm_regularization_weight: 0.0

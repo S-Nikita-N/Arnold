@@ -105,6 +105,18 @@ class WandbLogger:
             log_dict[f"{expert_name}/loss/entropy"] = obc_logger.entropy_loss
             log_dict[f"{expert_name}/loss/total"] = obc_logger.total_loss
 
+            # Kinesis teacher diagnostics (0 if teacher disabled)
+            if obc_logger.teacher_total_steps > 0:
+                log_dict[f"{expert_name}/teacher/active_fraction"] = (
+                    obc_logger.teacher_active_steps / obc_logger.teacher_total_steps
+                )
+            if obc_logger.teacher_gate_confidence_n > 0:
+                log_dict[f"{expert_name}/teacher/gate_confidence"] = (
+                    obc_logger.teacher_gate_confidence_sum / obc_logger.teacher_gate_confidence_n
+                )
+            if obc_logger.arm_reg_loss > 0:
+                log_dict[f"{expert_name}/loss/arm_reg"] = obc_logger.arm_reg_loss
+
             # Timing
             log_dict[f"{expert_name}/time/sample"] = obc_logger.sample_time
             log_dict[f"{expert_name}/time/update"] = obc_logger.update_time
