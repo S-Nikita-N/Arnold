@@ -137,6 +137,11 @@ class WandbLogger:
                 if isinstance(v, (int, float)):
                     log_dict[f"{expert_name}/diag/{k}"] = v
 
+            # Явный лог im_contrib чтобы сразу видеть баланс с PPO
+            if "imitation_loss" in diag and "imitation_loss_per_sample" in diag:
+                log_dict[f"{expert_name}/loss/imitation_batch"] = diag["imitation_loss"]
+                log_dict[f"{expert_name}/loss/imitation_per_sample"] = diag["imitation_loss_per_sample"]
+
         wandb.log(log_dict, step=epoch)
 
     def log_eval(

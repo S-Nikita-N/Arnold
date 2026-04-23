@@ -2036,7 +2036,7 @@ class ArnoldTrainer:
 
         # Accumulators per expert
         per_expert_losses: Dict[str, Dict[str, list]] = {
-            n: {"ppo": [], "imitation": [], "value": [], "entropy": [], "sigma": [], "load_balance": [], "arm_reg": []}
+            n: {"ppo": [], "imitation": [], "imitation_per_sample": [], "value": [], "entropy": [], "sigma": [], "load_balance": [], "arm_reg": []}
             for n in self.experts
         }
         per_expert_diag: Dict[str, Dict[str, list]] = {
@@ -2166,6 +2166,8 @@ class ArnoldTrainer:
                                     per_sample = (diff * action_mask).sum(dim=1) / action_mask.sum()
                                 else:
                                     per_sample = ((pred_mean - mini_expert) ** 2).mean(dim=1)
+                                n_active = mini_ta.sum().clamp(min=1.0)
+                                imitation_loss_per_sample = (per_sample * mini_ta).sum() / n_active
                                 denom = float(mini_ta.shape[0])
                                 imitation_loss = (per_sample * mini_ta).sum() / denom
                             # Если на этом mini-batch teacher'а не звали вообще — не
@@ -2173,6 +2175,9 @@ class ArnoldTrainer:
                             if mini_ta.sum().item() > 0:
                                 policy_loss = policy_loss + ctx.imitation_weight * imitation_loss
                                 per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
+                                per_expert_losses[expert_name]["imitation_per_sample"].append(
+                                    imitation_loss_per_sample.item()
+                                )
 
                         # --- Arm regularization (hold arm activations near zero) ---
                         if ctx.arm_regularization_weight > 0:
@@ -2332,6 +2337,7 @@ class ArnoldTrainer:
             all_diagnostics[expert_name] = {
                 "ppo_loss": float(np.mean(losses["ppo"])) if losses["ppo"] else 0.0,
                 "imitation_loss": float(np.mean(losses["imitation"])) if losses["imitation"] else 0.0,
+                "imitation_loss_per_sample": float(np.mean(losses["imitation_per_sample"])) if losses["imitation_per_sample"] else 0.0,
                 "value_loss": float(np.mean(losses["value"])) if losses["value"] else 0.0,
                 "entropy_loss": float(np.mean(losses["entropy"])) if losses["entropy"] else 0.0,
                 "sigma_loss": float(np.mean(losses["sigma"])) if losses["sigma"] else 0.0,
@@ -2620,12 +2626,16 @@ class ArnoldTrainer:
                         obc_logger.teacher_gate_confidence_sum / obc_logger.teacher_gate_confidence_n
                         if obc_logger.teacher_gate_confidence_n > 0 else 0.0
                     )
+                    l_im = d.get('imitation_loss', 0)
+                    l_im_ps = d.get('imitation_loss_per_sample', 0)
                     logger.info(
                         f"  [{expert_name}] Teacher: "
                         f"active_frac={active_frac:.3f} "
                         f"({obc_logger.teacher_active_steps}/{obc_logger.teacher_total_steps})  "
                         f"gate_conf={gate_conf:.3f}  "
-                        f"L_im={d.get('imitation_loss', 0):.4f}  "
+                        f"L_im(batch)={l_im:.4f}  "
+                        f"L_im(per_sample)={l_im_ps:.4f}  "
+                        f"im_contrib={ctx.imitation_weight * l_im:.4f}  "
                         f"L_arm_reg={d.get('arm_reg_loss', 0):.4f}"
                     )
                 if "gate_entropy" in d:
