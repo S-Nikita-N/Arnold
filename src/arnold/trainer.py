@@ -2691,7 +2691,7 @@ class ArnoldTrainer:
                     parts = []
                     for body, s in sorted(stats.items(), key=lambda x: -x[1]["caused"]):
                         if s["caused"] > 0:
-                            parts.append(f"{body}={s['caused']}({100*s['caused']/total:.0f}% d={s['mean_dist']*100:.1f}cm)")
+                            parts.append(f"{body}={s['caused']}({100 * s['caused'] / total:.0f}% d={s['mean_dist'] * 100:.1f}cm)")
                     logger.info(f"  [{expert_name}] Terminations ({total}): {' | '.join(parts)}")
 
         if self.use_wandb:
@@ -2862,7 +2862,10 @@ class ArnoldTrainer:
                         deterministic=True,
                     )
 
-                    if ctx.use_expert:
+                    # Skip wrapper expert когда teacher-guided (Kinesis): у
+                    # MyoHumanWrapper в такой конфигурации нет загруженной
+                    # expert policy.
+                    if ctx.use_expert and ctx.kinesis_teacher is None:
                         expert_action = valid_wrapper.get_expert_action(obs)
                         expert_action_t = torch.from_numpy(expert_action).float().to(self.device)
                         im_loss = ((action.squeeze(0) - expert_action_t) ** 2).mean().item()
@@ -2995,6 +2998,8 @@ class ArnoldTrainer:
             env._active_motion_ids = np.array([motion_id])
             return True
 
+        eval_uses_wrapper_expert = ctx.use_expert and ctx.kinesis_teacher is None
+
         def _reset_and_fill_obs():
             """Reset env, fill shared obs buffer."""
             nonlocal obs, send_sigs
@@ -3006,7 +3011,7 @@ class ArnoldTrainer:
                 result_queue.put(("sigs", expert_name, obs_sigs, act_sigs))
                 send_sigs = False
             obs_buf.copy_(obs_ts.squeeze(0))
-            if ctx.use_expert:
+            if eval_uses_wrapper_expert:
                 ea = wrapper.get_expert_action(obs)
                 expert_action_buf.copy_(torch.from_numpy(ea).float())
 
@@ -3033,7 +3038,7 @@ class ArnoldTrainer:
 
                 action_np = action_buf.numpy().copy()
 
-                if ctx.use_expert:
+                if eval_uses_wrapper_expert:
                     ea_np = expert_action_buf.numpy().copy()
                     ep_im_losses.append(float(((action_np - ea_np) ** 2).mean()))
 
@@ -3071,7 +3076,7 @@ class ArnoldTrainer:
                 obs = next_obs
                 obs_ts, _ = parser.get_observation(torch.device("cpu"))
                 obs_buf.copy_(obs_ts.squeeze(0))
-                if ctx.use_expert:
+                if eval_uses_wrapper_expert:
                     ea = wrapper.get_expert_action(obs)
                     expert_action_buf.copy_(torch.from_numpy(ea).float())
                 obs_ready.set()
