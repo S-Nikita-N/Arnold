@@ -2166,7 +2166,7 @@ class ArnoldTrainer:
                                     per_sample = (diff * action_mask).sum(dim=1) / action_mask.sum()
                                 else:
                                     per_sample = ((pred_mean - mini_expert) ** 2).mean(dim=1)
-                                denom = mini_ta.sum().clamp(min=1.0)
+                                denom = float(mini_ta.shape[0])
                                 imitation_loss = (per_sample * mini_ta).sum() / denom
                             # Если на этом mini-batch teacher'а не звали вообще — не
                             # портим градиенты нулевым лоссом.
