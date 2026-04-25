@@ -17,7 +17,7 @@ Per-expert режим определяется по loss-весам каждог
         '+run/experts@run.experts.myo=myohuman' \
         run.experts.myo.simple=true \
         run.experts.myo.learning.ppo_weight=1.0 \
-        run.experts.myo.learning.imitation_weight=0 \
+        run.experts.myo.learning.obc_imitation_weight=0 \
         run.experts.myo.learning.entropy_weight=0.0001 \
         run.num_threads=15 \
         exp_name=ppo_myohuman
@@ -38,13 +38,13 @@ Per-expert режим определяется по loss-весам каждог
         run.experts.myo.num_threads=10 \
         run.experts.myo.min_batch_size=20480 \
         run.experts.myo.learning.ppo_weight=1.0 \
-        run.experts.myo.learning.imitation_weight=0 \
+        run.experts.myo.learning.obc_imitation_weight=0 \
         run.experts.myo.learning.entropy_weight=0.0001 \
         \
         run.experts.kin.num_threads=5 \
         run.experts.kin.min_batch_size=10240 \
         run.experts.kin.learning.ppo_weight=0.0 \
-        run.experts.kin.learning.imitation_weight=1.0 \
+        run.experts.kin.learning.obc_imitation_weight=1.0 \
         run.experts.kin.learning.entropy_weight=0.0 \
         \
         learning.batch_size=256 \
@@ -99,27 +99,6 @@ def main(cfg: DictConfig) -> None:
 
     logger = setup_logging(output_dir)
 
-    # Определяем режим по экспертам
-    experts_cfg = cfg.run.experts
-    expert_names = list(experts_cfg.keys()) if experts_cfg else []
-
-    if len(expert_names) > 1:
-        mode_str = f"MULTI-EXPERT ({', '.join(expert_names)})"
-    elif len(expert_names) == 1:
-        entry = list(experts_cfg.values())[0]
-        ppo_w = entry.learning.ppo_weight
-        im_w = entry.learning.imitation_weight
-        if im_w > 0 and ppo_w > 0:
-            mode_str = "OBC-PPO"
-        elif im_w > 0:
-            mode_str = "OBC"
-        else:
-            mode_str = "PPO"
-    else:
-        mode_str = "NO EXPERTS"
-
-    logger.info("=" * 60)
-    logger.info(f"Arnold Training — {mode_str}")
     logger.info("=" * 60)
     logger.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 

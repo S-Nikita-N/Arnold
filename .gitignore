@@ -3,3 +3,4 @@
 data/*
 docs/arnold_tex/*
 .env
+MUJOCO_LOG.TXT

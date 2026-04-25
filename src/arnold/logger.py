@@ -34,12 +34,6 @@ class OBCLogger:
         self.value_loss = 0.0
         self.entropy_loss = 0.0
 
-        self.teacher_gate_confidence_sum = 0.0   # сумма max(gate_softmax)
-        self.teacher_gate_confidence_n = 0         # число семплов, по которым считали
-        self.teacher_active_steps = 0              # число шагов, где мотив в whitelist
-        self.teacher_total_steps = 0               # общее число шагов, где teacher звали
-        self.arm_reg_loss = 0.0                    # среднее значение L2-регуляризации рук
-        
         # Episode lists
         self.episode_rewards: List[float] = []
         self.episode_lengths: List[int] = []

@@ -13,5 +13,5 @@ learning:
   loss_scale: 1.0
   min_batch_size: null
   ppo_weight: null
-  imitation_weight: null
+  obc_imitation_weight: null
   entropy_weight: null

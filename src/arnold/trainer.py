@@ -3,15 +3,15 @@ Arnold Trainer — универсальный трейнер для Arnold.
 
 Поддерживает три режима обучения:
 1. OBC (On-Policy Behavior Cloning):
-   ppo_weight=0, imitation_weight>0
+   ppo_weight=0, obc_imitation_weight>0
    → Чистая дистилляция из эксперта без PPO surrogate loss.
 
 2. OBC-PPO:
-   ppo_weight>0, imitation_weight>0
+   ppo_weight>0, obc_imitation_weight>0
    → Комбинация PPO и имитации — дистилляция с reinforcement learning.
 
 3. PPO:
-   ppo_weight>0, imitation_weight=0
+   ppo_weight>0, obc_imitation_weight=0
    → Чистый PPO без эксперта (не нужен загруженный эксперт).
 
 Multi-expert: каждый эксперт автономен — свои loss-веса, память, логгер, треды.
@@ -28,7 +28,6 @@ import torch
 import torch.nn as nn
 import multiprocessing as mp
 import warnings
-from pathlib import Path
 
 fork_ctx = mp.get_context('fork')
 
@@ -72,7 +71,7 @@ class ExpertContext:
 
     # Per-expert loss weights
     ppo_weight: float = 0.0
-    imitation_weight: float = 0.0
+    obc_imitation_weight: float = 0.0
     entropy_weight: float = 0.0
     load_balance_weight: float = 0.0
 
@@ -87,20 +86,18 @@ class ExpertContext:
     # Action granulation (опционально)
     muscle_grouping: Optional[Any] = None
 
-    # Kinesis teacher for knowledge distillation (None = disabled)
-    kinesis_teacher: Optional[Any] = None
-    kinesis_motion_whitelist: Optional[frozenset] = None
-    arm_regularization_weight: float = 0.0
+    # Offline BC weight (0 = disabled)
+    bc_imitation_weight: float = 0.0
 
     @property
     def use_expert(self) -> bool:
-        return self.imitation_weight > 0
+        return self.obc_imitation_weight > 0
 
     @property
     def training_mode(self) -> str:
-        if self.ppo_weight > 0 and self.imitation_weight > 0:
+        if self.ppo_weight > 0 and self.obc_imitation_weight > 0:
             return "obc-ppo"
-        elif self.imitation_weight > 0:
+        elif self.obc_imitation_weight > 0:
             return "obc"
         else:
             return "ppo"
@@ -160,7 +157,8 @@ def create_expert_wrapper(
 
     else:
         raise ValueError(
-            f"Unknown expert type: '{expert_type}'. Supported: 'kinesis', 'myohuman'"
+            f"Unknown expert type: '{expert_type}'. "
+            f"Supported: 'kinesis', 'myohuman'"
         )
 
 
@@ -313,7 +311,8 @@ class ArnoldTrainer:
 
             learning_cfg = entry.get("learning", {})
             ppo_w = learning_cfg.get("ppo_weight") or 0.0
-            im_w = learning_cfg.get("imitation_weight") or 0.0
+            im_w = learning_cfg.get("obc_imitation_weight") or 0.0
+            bc_w = learning_cfg.get("bc_imitation_weight") or 0.0
             ent_w = learning_cfg.get("entropy_weight") or 0.0
             lb_w = learning_cfg.get("load_balance_weight") or 0.0
             loss_scale = learning_cfg.get("loss_scale") or 1.0
@@ -341,7 +340,8 @@ class ArnoldTrainer:
                 action_parser=action_parser,
                 groups=groups,
                 ppo_weight=ppo_w,
-                imitation_weight=im_w,
+                obc_imitation_weight=im_w,
+                bc_imitation_weight=bc_w,
                 entropy_weight=ent_w,
                 load_balance_weight=lb_w,
                 num_threads=n_threads,
@@ -352,62 +352,32 @@ class ArnoldTrainer:
             )
             self.experts[name] = ctx
 
-            # Kinesis teacher (knowledge distillation)
-            tp_cfg = entry.get("teacher_policy", {})
-            if tp_cfg.get("enabled", False):
-                tp_type = tp_cfg.get("type", "")
-                if tp_type != "kinesis_legs_back":
-                    raise NotImplementedError(
-                        f"teacher_policy.type={tp_type!r}: "
-                        f"only 'kinesis_legs_back' is supported"
+            # Offline BC datasets
+            bc_cfg = entry.get("bc", {})
+            if bc_w > 0:
+                if self.cfg.learning.policy != "lattice":
+                    raise ValueError(
+                        f"Expert '{name}': bc_imitation_weight > 0 requires policy=lattice, "
+                        f"got policy={self.cfg.learning.policy}"
                     )
-                tp_ckpt = tp_cfg.get("checkpoint")
-                if not tp_ckpt:
-                    raise ValueError("teacher_policy.enabled=true but checkpoint is null")
-                from arnold.experts.kinesis_teacher import KinesisTeacher
-                ctx.kinesis_teacher = KinesisTeacher(tp_ckpt, device=self.device)
-                logger.info(f"  Kinesis teacher loaded: {tp_ckpt}")
-
-                # --- Sanity: control_mode должен быть direct (teacher обучен в direct) ---
-                env_cm = getattr(getattr(wrapper, "env", None), "control_mode", None)
-                if env_cm is not None and env_cm != "direct":
-                    raise RuntimeError(
-                        f"Kinesis teacher requires env.control_mode='direct' "
-                        f"(teacher outputs direct muscle activations), got '{env_cm}'. "
-                        f"Fix: by default cfg/run/experts/myohuman.yaml forces "
-                        f"run.control_mode=direct; if you overrode it, revert."
+                bc_dir = bc_cfg.get("dataset_dir")
+                if not bc_dir:
+                    raise ValueError(
+                        f"Expert '{name}': bc_imitation_weight > 0 but bc.dataset_dir is null"
                     )
+                wrapper.load_bc_datasets(
+                    dataset_dir=bc_dir,
+                    batch_size=bc_cfg.get("batch_size", 256),
+                    success_only=bc_cfg.get("success_only", False),
+                    max_mpjpe_threshold=bc_cfg.get("max_mpjpe_threshold"),
+                    mean_mpjpe_threshold=bc_cfg.get("mean_mpjpe_threshold"),
+                )
+                logger.info(f"  BC: weight={bc_w}")
 
-                # --- Motion whitelist (опционально) ---
-                wl_file = tp_cfg.get("motion_whitelist_file")
-                if wl_file:
-                    wl_path = Path(wl_file)
-                    if not wl_path.is_absolute():
-                        wl_path = Path.cwd() / wl_path
-                    if not wl_path.exists():
-                        raise FileNotFoundError(
-                            f"teacher_policy.motion_whitelist_file not found: {wl_path}"
-                        )
-                    with open(wl_path) as f:
-                        ids = {
-                            int(line.strip()) for line in f
-                            if line.strip() and not line.strip().startswith("#")
-                        }
-                    ctx.kinesis_motion_whitelist = frozenset(ids)
-                    logger.info(
-                        f"  Kinesis motion whitelist: {len(ids)} ids from {wl_path}"
-                    )
-
-                # --- Arm regularization ---
-                arm_w = float(tp_cfg.get("arm_regularization_weight", 0.0) or 0.0)
-                ctx.arm_regularization_weight = arm_w
-                if arm_w > 0:
-                    logger.info(f"  Arm regularization: weight={arm_w}")
-
-            if (ctx.use_expert and ctx.kinesis_teacher is None
+            if (ctx.use_expert
                     and hasattr(wrapper, 'has_expert') and not wrapper.has_expert):
                 logger.warning(
-                    f"Expert '{name}': imitation_weight > 0 but expert policy not loaded!"
+                    f"Expert '{name}': obc_imitation_weight > 0 but expert policy not loaded!"
                 )
 
             logger.info(
@@ -878,8 +848,6 @@ class ArnoldTrainer:
         result_queue,
         step_counter,
         send_sigs: bool,
-        kinesis_obs_buf: Optional[torch.Tensor] = None,
-        teacher_active_val=None,
     ) -> None:
         """
         Env worker for vectorized sampling.
@@ -894,24 +862,6 @@ class ArnoldTrainer:
         action_parser = ActionParser.from_env(wrapper.env)
         obc_logger = OBCLogger()
 
-        # Kinesis observation adapter (teacher-guided training)
-        kin_adapter = None
-        if kinesis_obs_buf is not None:
-            from arnold.experts.kinesis_teacher import KinesisObservationAdapter
-            kin_adapter = KinesisObservationAdapter(wrapper.env.body_names)
-
-        whitelist = ctx.kinesis_motion_whitelist  # frozenset[int] | None
-
-        def _refresh_teacher_active() -> None:
-            """Обновить shared teacher_active_val по текущему motion_id."""
-            if teacher_active_val is None:
-                return
-            if whitelist is None:
-                teacher_active_val.value = 1
-                return
-            mid = getattr(wrapper.env, "_sampled_motion_id", None)
-            teacher_active_val.value = 1 if (mid is not None and int(mid) in whitelist) else 0
-
         obs, info = wrapper.reset()
         parser.reset(obs)
         obs_ts, obs_sigs = parser.get_observation(torch.device("cpu"))
@@ -921,12 +871,9 @@ class ArnoldTrainer:
             result_queue.put(("sigs", expert_name, obs_sigs, act_sigs))
 
         obs_buf.copy_(obs_ts.squeeze(0))
-        if ctx.use_expert and not kin_adapter:
+        if ctx.use_expert:
             ea = wrapper.get_expert_action(obs)
             expert_action_buf.copy_(torch.from_numpy(ea).float())
-        if kin_adapter:
-            kinesis_obs_buf.copy_(torch.from_numpy(kin_adapter.build_obs(wrapper.env)))
-        _refresh_teacher_active()
 
         done_val.value = 0
         reward_val.value = 0.0
@@ -964,12 +911,9 @@ class ArnoldTrainer:
 
                 obs_ts, _ = parser.get_observation(torch.device("cpu"))
                 obs_buf.copy_(obs_ts.squeeze(0))
-                if ctx.use_expert and not kin_adapter:
+                if ctx.use_expert:
                     ea = wrapper.get_expert_action(obs)
                     expert_action_buf.copy_(torch.from_numpy(ea).float())
-                if kin_adapter:
-                    kinesis_obs_buf.copy_(torch.from_numpy(kin_adapter.build_obs(wrapper.env)))
-                _refresh_teacher_active()
 
                 obs_ready.set()
 
@@ -1003,8 +947,6 @@ class ArnoldTrainer:
         result_queue,
         step_counter,
         send_sigs: bool,
-        kinesis_obs_buf: Optional[torch.Tensor] = None,
-        teacher_active_val=None,
     ) -> None:
         """
         Persistent env worker for vectorized sampling.
@@ -1016,23 +958,6 @@ class ArnoldTrainer:
         wrapper = ctx.wrapper
         parser = ObservationParser.from_env(wrapper.env, self.history_len)
         action_parser = ActionParser.from_env(wrapper.env)
-
-        # Kinesis observation adapter (teacher-guided training)
-        kin_adapter = None
-        if kinesis_obs_buf is not None:
-            from arnold.experts.kinesis_teacher import KinesisObservationAdapter
-            kin_adapter = KinesisObservationAdapter(wrapper.env.body_names)
-
-        whitelist = ctx.kinesis_motion_whitelist  # frozenset[int] | None
-
-        def _refresh_teacher_active() -> None:
-            if teacher_active_val is None:
-                return
-            if whitelist is None:
-                teacher_active_val.value = 1
-                return
-            mid = getattr(wrapper.env, "_sampled_motion_id", None)
-            teacher_active_val.value = 1 if (mid is not None and int(mid) in whitelist) else 0
 
         sigs_sent = False
 
@@ -1071,12 +996,9 @@ class ArnoldTrainer:
                     sigs_sent = True
 
                 obs_buf.copy_(obs_ts.squeeze(0))
-                if ctx.use_expert and not kin_adapter:
+                if ctx.use_expert:
                     ea = wrapper.get_expert_action(obs)
                     expert_action_buf.copy_(torch.from_numpy(ea).float())
-                if kin_adapter:
-                    kinesis_obs_buf.copy_(torch.from_numpy(kin_adapter.build_obs(wrapper.env)))
-                _refresh_teacher_active()
 
                 done_val.value = 0
                 reward_val.value = 0.0
@@ -1116,12 +1038,9 @@ class ArnoldTrainer:
 
                         obs_ts, _ = parser.get_observation(torch.device("cpu"))
                         obs_buf.copy_(obs_ts.squeeze(0))
-                        if ctx.use_expert and not kin_adapter:
+                        if ctx.use_expert:
                             ea = wrapper.get_expert_action(obs)
                             expert_action_buf.copy_(torch.from_numpy(ea).float())
-                        if kin_adapter:
-                            kinesis_obs_buf.copy_(torch.from_numpy(kin_adapter.build_obs(wrapper.env)))
-                        _refresh_teacher_active()
 
                         obs_ready.set()
 
@@ -1160,7 +1079,6 @@ class ArnoldTrainer:
             """Persistent worker handle."""
             __slots__ = (
                 'expert_name', 'obs_buf', 'action_buf', 'expert_action_buf',
-                'kinesis_obs_buf', 'teacher_active_val',
                 'reward_val', 'done_val', 'obs_ready', 'action_ready',
                 'epoch_start', 'proc', 'active',
             )
@@ -1172,7 +1090,6 @@ class ArnoldTrainer:
             obs_shape = (ctx.parser.n_obs_elements, self.history_len)
             action_dim = ctx.wrapper.action_dim
             n_workers = ctx.vec_batch_size or ctx.num_threads
-            has_teacher = ctx.kinesis_teacher is not None
 
             for w_idx in range(n_workers):
                 wh = _WH()
@@ -1180,12 +1097,6 @@ class ArnoldTrainer:
                 wh.obs_buf = torch.zeros(obs_shape, dtype=torch.float32).share_memory_()
                 wh.action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
                 wh.expert_action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
-                wh.kinesis_obs_buf = (
-                    torch.zeros(453, dtype=torch.float32).share_memory_()
-                    if has_teacher else None
-                )
-                # teacher_active флаг per-step — нужен только если есть teacher
-                wh.teacher_active_val = fork_ctx.Value('i', 1) if has_teacher else None
                 wh.reward_val = fork_ctx.Value('d', 0.0)
                 wh.done_val = fork_ctx.Value('i', 0)
                 wh.obs_ready = fork_ctx.Event()
@@ -1209,8 +1120,6 @@ class ArnoldTrainer:
                         result_queue,
                         fork_ctx.Value('i', 0),  # step_counter per worker
                         w_idx == 0,  # send_sigs
-                        wh.kinesis_obs_buf,
-                        wh.teacher_active_val,
                     ),
                     daemon=True,
                 )
@@ -1344,13 +1253,6 @@ class ArnoldTrainer:
         worker_mems: Dict[int, OBCMemory] = {id(w): OBCMemory() for w in all_workers}
         worker_prev: Dict[int, Optional[dict]] = {id(w): None for w in all_workers}
 
-        # Per-expert accumulators for Kinesis teacher diagnostics
-        teacher_stats: Dict[str, Dict[str, float]] = {
-            name: {"conf_sum": 0.0, "conf_n": 0, "active": 0, "total": 0}
-            for name, ctx in self.experts.items()
-            if ctx.kinesis_teacher is not None
-        }
-
         per_expert_steps: Dict[str, int] = {n: 0 for n in self.experts}
         target_steps = {n: ctx.min_batch_size for n, ctx in self.experts.items()}
 
@@ -1387,7 +1289,6 @@ class ArnoldTrainer:
                                 mem.action_signatures.append(act_sigs)
                                 mem.student_actions.append(prev["action"])
                                 mem.expert_actions.append(prev["expert_action"])
-                                mem.teacher_active.append(prev["teacher_active"])
                                 mem.rewards.append(wh.reward_val.value)
                                 mem.values.append(prev["value"])
                                 mem.masks.append(0.0 if wh.done_val.value else 1.0)
@@ -1455,49 +1356,19 @@ class ArnoldTrainer:
                                 log_probs_cpu = log_probs.cpu()
                                 values_cpu = values.cpu()
 
-                        # Teacher inference (GPU, batched)
-                        teacher_actions_cpu = None
-                        teacher_conf_cpu = None
-                        if ctx.kinesis_teacher is not None:
-                            with prof.section("teacher_forward"):
-                                batch_kin = torch.stack([
-                                    wh.kinesis_obs_buf.clone()
-                                    for wh in active_workers
-                                ]).to(device)
-                                ta, tc = ctx.kinesis_teacher.forward_batch(batch_kin)
-                                teacher_actions_cpu = ta.cpu()
-                                teacher_conf_cpu = tc.cpu()
-                            # Aggregate gate confidence
-                            ts = teacher_stats[expert_name]
-                            ts["conf_sum"] += float(teacher_conf_cpu.sum().item())
-                            ts["conf_n"] += len(active_workers)
-
                         with prof.section("scatter"):
                             zero_ea = torch.zeros(ctx.wrapper.action_dim)
                             for i, wh in enumerate(active_workers):
-                                if teacher_actions_cpu is not None:
-                                    ea = teacher_actions_cpu[i]
-                                elif ctx.use_expert:
+                                if ctx.use_expert:
                                     ea = wh.expert_action_buf.clone()
                                 else:
                                     ea = zero_ea
-                                # teacher_active mask per-sample
-                                if wh.teacher_active_val is not None:
-                                    ta_flag = float(wh.teacher_active_val.value)
-                                    ts = teacher_stats[expert_name]
-                                    ts["total"] += 1
-                                    ts["active"] += int(wh.teacher_active_val.value)
-                                else:
-                                    ta_flag = 1.0
                                 worker_prev[id(wh)] = {
                                     "obs": wh.obs_buf.clone(),
                                     "action": actions_cpu[i],
                                     "log_prob": log_probs_cpu[i],
                                     "value": values_cpu[i],
                                     "expert_action": ea,
-                                    "teacher_active": torch.tensor(
-                                        [ta_flag], dtype=torch.float32,
-                                    ),
                                 }
                                 wh.action_buf.copy_(actions_cpu[i])
 
@@ -1586,15 +1457,6 @@ class ArnoldTrainer:
         for lg in expert_loggers.values():
             lg.sample_time = sample_time
 
-        # Forward Kinesis-teacher diagnostics to the merged loggers
-        for name, ts in teacher_stats.items():
-            if name in expert_loggers:
-                lg = expert_loggers[name]
-                lg.teacher_gate_confidence_sum = ts["conf_sum"]
-                lg.teacher_gate_confidence_n = ts["conf_n"]
-                lg.teacher_active_steps = ts["active"]
-                lg.teacher_total_steps = ts["total"]
-
         return expert_batches, expert_loggers
 
     def _sample_vectorized(self) -> Tuple[Dict[str, OBCBatch], Dict[str, OBCLogger]]:
@@ -1641,7 +1503,6 @@ class ArnoldTrainer:
             """Worker handle."""
             __slots__ = (
                 'expert_name', 'obs_buf', 'action_buf', 'expert_action_buf',
-                'kinesis_obs_buf', 'teacher_active_val',
                 'reward_val', 'done_val', 'obs_ready', 'action_ready', 'proc',
                 'active',
             )
@@ -1655,7 +1516,6 @@ class ArnoldTrainer:
             action_dim = ctx.wrapper.action_dim
             step_counter = fork_ctx.Value('i', 0)
             step_counters[expert_name] = step_counter
-            has_teacher = ctx.kinesis_teacher is not None
 
             n_workers = ctx.vec_batch_size or ctx.num_threads
 
@@ -1665,11 +1525,6 @@ class ArnoldTrainer:
                 wh.obs_buf = torch.zeros(obs_shape, dtype=torch.float32).share_memory_()
                 wh.action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
                 wh.expert_action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
-                wh.kinesis_obs_buf = (
-                    torch.zeros(453, dtype=torch.float32).share_memory_()
-                    if has_teacher else None
-                )
-                wh.teacher_active_val = fork_ctx.Value('i', 1) if has_teacher else None
                 wh.reward_val = fork_ctx.Value('d', 0.0)
                 wh.done_val = fork_ctx.Value('i', 0)
                 wh.obs_ready = fork_ctx.Event()
@@ -1688,8 +1543,6 @@ class ArnoldTrainer:
                         wh.obs_ready, wh.action_ready,
                         stop_flag, result_queue, step_counter,
                         w_idx == 0,
-                        wh.kinesis_obs_buf,
-                        wh.teacher_active_val,
                     ),
                     daemon=True,
                 )
@@ -1735,13 +1588,6 @@ class ArnoldTrainer:
         worker_mems: Dict[int, OBCMemory] = {id(w): OBCMemory() for w in all_workers}
         worker_prev: Dict[int, Optional[dict]] = {id(w): None for w in all_workers}
 
-        # Per-expert accumulators for Kinesis teacher diagnostics
-        teacher_stats: Dict[str, Dict[str, float]] = {
-            name: {"conf_sum": 0.0, "conf_n": 0, "active": 0, "total": 0}
-            for name, ctx in self.experts.items()
-            if ctx.kinesis_teacher is not None
-        }
-
         per_expert_steps: Dict[str, int] = {n: 0 for n in self.experts}
         target_steps = {n: ctx.min_batch_size for n, ctx in self.experts.items()}
 
@@ -1779,7 +1625,6 @@ class ArnoldTrainer:
                                 mem.action_signatures.append(act_sigs)
                                 mem.student_actions.append(prev["action"])
                                 mem.expert_actions.append(prev["expert_action"])
-                                mem.teacher_active.append(prev["teacher_active"])
                                 mem.rewards.append(wh.reward_val.value)
                                 mem.values.append(prev["value"])
                                 mem.masks.append(0.0 if wh.done_val.value else 1.0)
@@ -1850,47 +1695,19 @@ class ArnoldTrainer:
                                 log_probs_cpu = log_probs.cpu()
                                 values_cpu = values.cpu()
 
-                        # Teacher inference (GPU, batched)
-                        teacher_actions_cpu = None
-                        teacher_conf_cpu = None
-                        if ctx.kinesis_teacher is not None:
-                            with prof.section("teacher_forward"):
-                                batch_kin = torch.stack([
-                                    wh.kinesis_obs_buf.clone()
-                                    for wh in active_workers
-                                ]).to(device)
-                                ta, tc = ctx.kinesis_teacher.forward_batch(batch_kin)
-                                teacher_actions_cpu = ta.cpu()
-                                teacher_conf_cpu = tc.cpu()
-                            ts = teacher_stats[expert_name]
-                            ts["conf_sum"] += float(teacher_conf_cpu.sum().item())
-                            ts["conf_n"] += len(active_workers)
-
                         with prof.section("scatter"):
                             zero_ea = torch.zeros(ctx.wrapper.action_dim)
                             for i, wh in enumerate(active_workers):
-                                if teacher_actions_cpu is not None:
-                                    ea = teacher_actions_cpu[i]
-                                elif ctx.use_expert:
+                                if ctx.use_expert:
                                     ea = wh.expert_action_buf.clone()
                                 else:
                                     ea = zero_ea
-                                if wh.teacher_active_val is not None:
-                                    ta_flag = float(wh.teacher_active_val.value)
-                                    ts = teacher_stats[expert_name]
-                                    ts["total"] += 1
-                                    ts["active"] += int(wh.teacher_active_val.value)
-                                else:
-                                    ta_flag = 1.0
                                 worker_prev[id(wh)] = {
                                     "obs": wh.obs_buf.clone(),
                                     "action": actions_cpu[i],
                                     "log_prob": log_probs_cpu[i],
                                     "value": values_cpu[i],
                                     "expert_action": ea,
-                                    "teacher_active": torch.tensor(
-                                        [ta_flag], dtype=torch.float32,
-                                    ),
                                 }
                                 wh.action_buf.copy_(actions_cpu[i])
 
@@ -1982,14 +1799,6 @@ class ArnoldTrainer:
         for lg in expert_loggers.values():
             lg.sample_time = sample_time
 
-        for name, ts in teacher_stats.items():
-            if name in expert_loggers:
-                lg = expert_loggers[name]
-                lg.teacher_gate_confidence_sum = ts["conf_sum"]
-                lg.teacher_gate_confidence_n = ts["conf_n"]
-                lg.teacher_active_steps = ts["active"]
-                lg.teacher_total_steps = ts["total"]
-
         return expert_batches, expert_loggers
 
     # ------------------------------------------------------------------
@@ -2028,7 +1837,6 @@ class ArnoldTrainer:
                 "fixed_log_probs": batch.log_probs.to(self.device),
                 "old_values": batch.values.to(self.device),
                 "expert_actions": batch.expert_actions.to(self.device) if ctx.use_expert else None,
-                "teacher_active": batch.teacher_active.to(self.device),
                 "obs_signatures": batch.obs_signatures,
                 "action_signatures": batch.action_signatures,
                 "batch_size": batch.states.shape[0],
@@ -2036,7 +1844,7 @@ class ArnoldTrainer:
 
         # Accumulators per expert
         per_expert_losses: Dict[str, Dict[str, list]] = {
-            n: {"ppo": [], "imitation": [], "imitation_per_sample": [], "value": [], "entropy": [], "sigma": [], "load_balance": [], "arm_reg": []}
+            n: {"ppo": [], "imitation": [], "imitation_per_sample": [], "value": [], "entropy": [], "sigma": [], "load_balance": [], "bc": []}
             for n in self.experts
         }
         per_expert_diag: Dict[str, Dict[str, list]] = {
@@ -2151,44 +1959,15 @@ class ArnoldTrainer:
                                 per_expert_diag[expert_name]["clip_fracs"].append(clip_frac)
                                 per_expert_diag[expert_name]["approx_kls"].append(approx_kl)
 
-                        # --- Imitation ---
-                        if ctx.use_expert and ctx.imitation_weight > 0:
+                        # --- OBC Imitation ---
+                        if ctx.use_expert and ctx.obc_imitation_weight > 0:
                             with prof.section("imitation_loss"):
                                 mini_expert = ed["expert_actions"][batch_indices]
-                                # Per-sample teacher_active mask (1.0 = in-whitelist, 0.0 = skip).
-                                mini_ta = ed["teacher_active"][batch_indices].view(-1)
-                                if ctx.kinesis_teacher is not None:
-                                    # Mask arms (muscles 290:338) — teacher не управляет ими.
-                                    action_mask = ctx.kinesis_teacher.get_action_mask().to(self.device)
-                                    diff = (pred_mean - mini_expert) ** 2
-                                    # Сначала маскируем action-размер, потом усредняем по муск.,
-                                    # потом per-sample mask по teacher_active.
-                                    per_sample = (diff * action_mask).sum(dim=1) / action_mask.sum()
-                                else:
-                                    per_sample = ((pred_mean - mini_expert) ** 2).mean(dim=1)
-                                n_active = mini_ta.sum().clamp(min=1.0)
-                                imitation_loss_per_sample = (per_sample * mini_ta).sum() / n_active
-                                denom = float(mini_ta.shape[0])
-                                imitation_loss = (per_sample * mini_ta).sum() / denom
-                            # Если на этом mini-batch teacher'а не звали вообще — не
-                            # портим градиенты нулевым лоссом.
-                            if mini_ta.sum().item() > 0:
-                                policy_loss = policy_loss + ctx.imitation_weight * imitation_loss
-                                per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
-                                per_expert_losses[expert_name]["imitation_per_sample"].append(
-                                    imitation_loss_per_sample.item()
-                                )
-
-                        # --- Arm regularization (hold arm activations near zero) ---
-                        if ctx.arm_regularization_weight > 0:
-                            with prof.section("arm_reg_loss"):
-                                from arnold.experts.kinesis_teacher import (
-                                    ARM_ACTION_START, ARM_ACTION_END,
-                                )
-                                arm_slice = pred_mean[:, ARM_ACTION_START:ARM_ACTION_END]
-                                arm_reg_loss = (arm_slice ** 2).mean()
-                            policy_loss = policy_loss + ctx.arm_regularization_weight * arm_reg_loss
-                            per_expert_losses[expert_name]["arm_reg"].append(arm_reg_loss.item())
+                                per_sample = ((pred_mean - mini_expert) ** 2).mean(dim=1)
+                                imitation_loss = per_sample.mean()
+                            policy_loss = policy_loss + ctx.obc_imitation_weight * imitation_loss
+                            per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
+                            per_expert_losses[expert_name]["imitation_per_sample"].append(imitation_loss.item())
 
                         # --- Value ---
                         with prof.section("value_loss"):
@@ -2225,6 +2004,33 @@ class ArnoldTrainer:
                             lb_loss = forward_lb_loss.mean()
                             policy_loss = policy_loss + ctx.load_balance_weight * lb_loss
                             per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
+
+                        # --- Offline BC (masked MSE from pre-collected dataset) ---
+                        # BC obs is flat env obs → replicate across history_len
+                        # to match LatticePolicy input format.
+                        if ctx.bc_imitation_weight > 0:
+                            with prof.section("bc_loss"):
+                                bc_obs_flat, bc_target = ctx.wrapper.sample_train_bc_batch(
+                                    self.device,
+                                )
+                                # (B, obs_dim) → (B, obs_dim, history_len)
+                                bc_obs = bc_obs_flat.unsqueeze(-1).expand(
+                                    -1, -1, self.history_len,
+                                )
+                                bc_pred_mean, _, _ = self.policy_module.get_action(
+                                    bc_obs,
+                                    ed["obs_signatures"],
+                                    ed["action_signatures"],
+                                    expert_name=expert_name,
+                                    deterministic=True,
+                                    return_std=False,
+                                    return_value=False,
+                                )
+                                bc_loss = ctx.wrapper.compute_bc_loss(
+                                    bc_pred_mean, bc_target, self.device,
+                                )
+                            policy_loss = policy_loss + ctx.bc_imitation_weight * bc_loss
+                            per_expert_losses[expert_name]["bc"].append(bc_loss.item())
 
                         # Apply expert loss scale and accumulation scaling
                         scale = ctx.loss_scale / self.grad_accum_steps
@@ -2342,7 +2148,7 @@ class ArnoldTrainer:
                 "entropy_loss": float(np.mean(losses["entropy"])) if losses["entropy"] else 0.0,
                 "sigma_loss": float(np.mean(losses["sigma"])) if losses["sigma"] else 0.0,
                 "load_balance_loss": float(np.mean(losses["load_balance"])) if losses["load_balance"] else 0.0,
-                "arm_reg_loss": float(np.mean(losses["arm_reg"])) if losses["arm_reg"] else 0.0,
+                "bc_loss": float(np.mean(losses["bc"])) if losses["bc"] else 0.0,
                 "approx_kl": float(np.mean(diag["approx_kls"])) if diag["approx_kls"] else 0.0,
                 "clip_frac": float(np.mean(diag["clip_fracs"])) if diag["clip_fracs"] else 0.0,
                 "value_clip_frac": float(np.mean(diag["value_clip_fracs"])) if diag["value_clip_fracs"] else 0.0,
@@ -2452,7 +2258,6 @@ class ArnoldTrainer:
                         entropy_loss=diag["entropy_loss"],
                         load_balance_loss=diag["load_balance_loss"],
                     )
-                    obc_lg.arm_reg_loss = diag.get("arm_reg_loss", 0.0)
                     total_steps_epoch += obc_lg.num_steps
 
                 self.num_steps += total_steps_epoch
@@ -2559,7 +2364,8 @@ class ArnoldTrainer:
         for expert_name, ctx in self.experts.items():
             logger.info(
                 f"  {expert_name}: mode={ctx.training_mode.upper()}  "
-                f"ppo={ctx.ppo_weight}  im={ctx.imitation_weight}  "
+                f"ppo={ctx.ppo_weight}  obc_im={ctx.obc_imitation_weight}  "
+                f"bc_im={ctx.bc_imitation_weight}  "
                 f"ent={ctx.entropy_weight}  "
                 f"scale={ctx.loss_scale}"
             )
@@ -2616,27 +2422,44 @@ class ArnoldTrainer:
                     f"cov_max={d.get('cov_factor_abs_max', 0):.4f}"
                 )
 
-                # Kinesis teacher diagnostics (печатаем только если teacher активен)
-                if obc_logger.teacher_total_steps > 0 or ctx.kinesis_teacher is not None:
-                    active_frac = (
-                        obc_logger.teacher_active_steps / obc_logger.teacher_total_steps
-                        if obc_logger.teacher_total_steps > 0 else 0.0
-                    )
-                    gate_conf = (
-                        obc_logger.teacher_gate_confidence_sum / obc_logger.teacher_gate_confidence_n
-                        if obc_logger.teacher_gate_confidence_n > 0 else 0.0
-                    )
-                    l_im = d.get('imitation_loss', 0)
-                    l_im_ps = d.get('imitation_loss_per_sample', 0)
+                # Imitation diagnostics
+                l_im = d.get('imitation_loss', 0)
+                if l_im > 0:
                     logger.info(
-                        f"  [{expert_name}] Teacher: "
-                        f"active_frac={active_frac:.3f} "
-                        f"({obc_logger.teacher_active_steps}/{obc_logger.teacher_total_steps})  "
-                        f"gate_conf={gate_conf:.3f}  "
-                        f"L_im(batch)={l_im:.4f}  "
-                        f"L_im(per_sample)={l_im_ps:.4f}  "
-                        f"im_contrib={ctx.imitation_weight * l_im:.4f}  "
-                        f"L_arm_reg={d.get('arm_reg_loss', 0):.4f}"
+                        f"  [{expert_name}] OBC Imitation: "
+                        f"L_im={l_im:.4f}  "
+                        f"im_contrib={ctx.obc_imitation_weight * l_im:.4f}"
+                    )
+
+                # BC diagnostics
+                l_bc = d.get('bc_loss', 0)
+                if l_bc > 0:
+                    # Compute test BC loss
+                    bc_test_loss = 0.0
+                    if hasattr(ctx.wrapper, '_bc_test') and ctx.wrapper._bc_test is not None:
+                        bc_test_losses = []
+                        with torch.no_grad():
+                            for t_obs, t_act in ctx.wrapper.iter_test_bc_batches(
+                                self.batch_size, self.device,
+                            ):
+                                t_obs_ts = t_obs.unsqueeze(-1).expand(-1, -1, self.history_len)
+                                t_pred, _, _ = self.policy_module.get_action(
+                                    t_obs_ts,
+                                    ctx.parser.obs_signatures,
+                                    ctx.action_parser.action_signatures,
+                                    expert_name=expert_name,
+                                    deterministic=True,
+                                    return_std=False,
+                                    return_value=False,
+                                )
+                                bl = ctx.wrapper.compute_bc_loss(t_pred, t_act, self.device)
+                                bc_test_losses.append(bl.item())
+                        bc_test_loss = float(np.mean(bc_test_losses)) if bc_test_losses else 0.0
+                    logger.info(
+                        f"  [{expert_name}] BC: "
+                        f"train_loss={l_bc:.4f}  "
+                        f"test_loss={bc_test_loss:.4f}  "
+                        f"bc_contrib={ctx.bc_imitation_weight * l_bc:.4f}"
                     )
                 if "gate_entropy" in d:
                     n_experts = self.policy_module.num_experts if hasattr(self.policy_module, 'num_experts') else 0
@@ -2872,10 +2695,7 @@ class ArnoldTrainer:
                         deterministic=True,
                     )
 
-                    # Skip wrapper expert когда teacher-guided (Kinesis): у
-                    # MyoHumanWrapper в такой конфигурации нет загруженной
-                    # expert policy.
-                    if ctx.use_expert and ctx.kinesis_teacher is None:
+                    if ctx.use_expert:
                         expert_action = valid_wrapper.get_expert_action(obs)
                         expert_action_t = torch.from_numpy(expert_action).float().to(self.device)
                         im_loss = ((action.squeeze(0) - expert_action_t) ** 2).mean().item()
@@ -3008,7 +2828,7 @@ class ArnoldTrainer:
             env._active_motion_ids = np.array([motion_id])
             return True
 
-        eval_uses_wrapper_expert = ctx.use_expert and ctx.kinesis_teacher is None
+        eval_uses_wrapper_expert = ctx.use_expert
 
         def _reset_and_fill_obs():
             """Reset env, fill shared obs buffer."""
