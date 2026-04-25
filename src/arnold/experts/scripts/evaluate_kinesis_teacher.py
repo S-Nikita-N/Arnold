@@ -452,7 +452,12 @@ def run_eval(args):
     device = torch.device(args.device)
 
     mode = "valid" if args.split == "test" else "train"
-    overrides = ["run.headless=true"]
+    overrides = [
+        "run.headless=true",
+        "run.im_eval=true",
+        "run.test=true",
+        "run.random_start=false",
+    ]
     if args.split == "train":
         overrides.append("run=train_run")
 
