@@ -166,9 +166,6 @@ class MyoKinWrapper:
         return obs, info
 
     def step(self, action: np.ndarray):
-        """Step with arm override: replace arm actions before env.step."""
-        action = action.copy()
-        action[ARM_ACTION_START:ARM_ACTION_END] = self.arm_action_override
         action = self.preprocess_actions(action)
         next_obs, reward, terminated, truncated, info = self._env.step(action)
 
