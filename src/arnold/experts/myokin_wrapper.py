@@ -166,7 +166,7 @@ class MyoKinWrapper:
         # Zero out arm joints so arms start in neutral pose
         self._env.mj_data.qpos[self._arm_qpos_slice] = 0.0
         mujoco.mj_forward(self._env.mj_model, self._env.mj_data)
-        obs = self._env.get_obs()
+        obs = self._env.compute_observations()
         return obs, info
 
     def step(self, action: np.ndarray):
