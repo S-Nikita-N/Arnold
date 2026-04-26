@@ -1,0 +1,21 @@
+type: myokin
+config_path: null
+teacher_checkpoint: null   # Path to Kinesis MoE .pth (null = no teacher, PPO-only)
+arm_action_override: 0.0   # Value to override arm actions in step() (0.0 = neutral)
+overrides: []
+train_overrides: []
+valid_overrides: []
+
+# Per-expert parallelism
+num_threads: null
+vec_batch_size: null
+
+# Per-expert loss weights
+learning:
+  loss_scale: 1.0
+  min_batch_size: null
+  ppo_weight: null
+  obc_imitation_weight: null
+  bc_imitation_weight: null
+  entropy_weight: null
+  load_balance_weight: null

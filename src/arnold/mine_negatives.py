@@ -180,6 +180,54 @@ def log_summary(expert_name: str, split: str, per_motion: list, negatives: list)
 #  Mine (eval + filter)
 # ─────────────────────────────────────────────────────────────────────
 
+def _evaluate_all_experts(trainer, split):
+    """
+    Eval all experts with return_per_motion=True.
+
+    For split="train": temporarily swaps valid wrappers to train wrappers
+    so vectorized workers use the training env.
+
+    Returns:
+        {expert_name: (aggregate_metrics, per_motion_results)}
+    """
+    results = {}
+
+    saved_valid = None
+    if split == "train":
+        saved_valid = trainer.valid_experts
+        trainer.valid_experts = {
+            n: ctx.wrapper for n, ctx in trainer.experts.items()
+        }
+        for ctx in trainer.experts.values():
+            ctx.wrapper.env.start_eval(im_eval=True)
+
+    try:
+        for expert_name, ctx in trainer.experts.items():
+            wrapper = trainer.valid_experts.get(expert_name)
+            if wrapper is None:
+                raise ValueError(
+                    f"No wrapper for expert '{expert_name}'. "
+                    f"Set eval_frequency > 0 in config."
+                )
+
+            if trainer.vectorized_eval and trainer.device.type in ('cuda', 'mps'):
+                metrics, per_motion = trainer._evaluate_expert_vectorized(
+                    expert_name, ctx, wrapper, return_per_motion=True,
+                )
+            else:
+                metrics, per_motion = trainer.evaluate_expert(
+                    expert_name, ctx, wrapper, return_per_motion=True,
+                )
+            results[expert_name] = (metrics, per_motion)
+    finally:
+        if split == "train" and saved_valid is not None:
+            for ctx in trainer.experts.values():
+                ctx.wrapper.env.end_eval()
+            trainer.valid_experts = saved_valid
+
+    return results
+
+
 def mine_split(trainer, split, split_cfg, run_cfg, checkpoint_path):
     """Eval one split and save results."""
     mean_mpjpe = split_cfg.get("mean_mpjpe", None)
@@ -191,7 +239,7 @@ def mine_split(trainer, split, split_cfg, run_cfg, checkpoint_path):
     logger.info(f"  mean_mpjpe={mean_mpjpe}, max_mpjpe={max_mpjpe}, not_success={not_success}")
     logger.info(f"{'=' * 60}")
 
-    detailed = trainer.evaluate_detailed(split=split)
+    detailed = _evaluate_all_experts(trainer, split)
 
     for expert_name, (metrics, per_motion) in detailed.items():
         negatives = filter_negatives(

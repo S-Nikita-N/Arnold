@@ -155,10 +155,21 @@ def create_expert_wrapper(
             simple=simple,
         )
 
+    elif expert_type == "myokin":
+        from arnold.experts.myokin_wrapper import MyoKinWrapper
+        return MyoKinWrapper(
+            cfg_path=expert_cfg_path,
+            device="cpu",
+            overrides=expert_overrides,
+            mode=mode,
+            teacher_checkpoint=expert_entry.get("teacher_checkpoint"),
+            arm_action_override=expert_entry.get("arm_action_override", 0.0),
+        )
+
     else:
         raise ValueError(
             f"Unknown expert type: '{expert_type}'. "
-            f"Supported: 'kinesis', 'myohuman'"
+            f"Supported: 'kinesis', 'myohuman', 'myokin'"
         )
 
 
@@ -226,7 +237,6 @@ class ArnoldTrainer:
         self.train_eval_frequency = cfg.run.train_eval_frequency
         self.resampling_interval = cfg.run.resampling_interval
         self.finish_episodes = cfg.run.finish_episodes
-        self.persistent_workers = cfg.run.get("persistent_workers", True)
         self.vectorized_eval = cfg.run.get("vectorized_eval", True)
         if not cfg.run.headless:
             self.vectorized_eval = False
@@ -711,9 +721,7 @@ class ArnoldTrainer:
         """
         # Vectorized: env workers on CPU, batched inference on GPU/MPS
         if self.device.type in ('cuda', 'mps'):
-            if self.persistent_workers:
-                return self._sample_vectorized_persistent()
-            return self._sample_vectorized()
+            return self._sample_vectorized_persistent()
 
         t_start = time.time()
         self.mp_done.clear()
@@ -832,101 +840,6 @@ class ArnoldTrainer:
     # ------------------------------------------------------------------
     #  Vectorized Sampling
     # ------------------------------------------------------------------
-
-    def _vec_env_worker(
-        self,
-        expert_name: str,
-        worker_id: int,
-        obs_buf: torch.Tensor,
-        action_buf: torch.Tensor,
-        expert_action_buf: torch.Tensor,
-        reward_val,
-        done_val,
-        obs_ready,
-        action_ready,
-        stop_flag,
-        result_queue,
-        step_counter,
-        send_sigs: bool,
-    ) -> None:
-        """
-        Env worker for vectorized sampling.
-
-        Does only env.step + parser. Policy inference is done by main process.
-        Communicates via shared-memory tensors + Events.
-        """
-        self.seed_worker(worker_id)
-        ctx = self.experts[expert_name]
-        wrapper = ctx.wrapper
-        parser = ObservationParser.from_env(wrapper.env, self.history_len)
-        action_parser = ActionParser.from_env(wrapper.env)
-        obc_logger = OBCLogger()
-
-        obs, info = wrapper.reset()
-        parser.reset(obs)
-        obs_ts, obs_sigs = parser.get_observation(torch.device("cpu"))
-        act_sigs = action_parser.action_signatures
-
-        if send_sigs:
-            result_queue.put(("sigs", expert_name, obs_sigs, act_sigs))
-
-        obs_buf.copy_(obs_ts.squeeze(0))
-        if ctx.use_expert:
-            ea = wrapper.get_expert_action(obs)
-            expert_action_buf.copy_(torch.from_numpy(ea).float())
-
-        done_val.value = 0
-        reward_val.value = 0.0
-        obs_ready.set()
-
-        try:
-            while True:
-                action_ready.wait()
-                action_ready.clear()
-
-                if stop_flag.value:
-                    break
-
-                action_np = action_buf.numpy().copy()
-                next_obs, reward, terminated, truncated, info = wrapper.step(action_np)
-                done = terminated or truncated
-
-                reward_val.value = float(reward)
-                done_val.value = 1 if done else 0
-
-                obc_logger.step(
-                    reward=reward,
-                    info=info if isinstance(info, dict) else None,
-                )
-                with step_counter.get_lock():
-                    step_counter.value += 1
-
-                if done:
-                    obc_logger.end_episode()
-                    obs, info = wrapper.reset()
-                    parser.reset(obs)
-                else:
-                    parser.update(next_obs)
-                    obs = next_obs
-
-                obs_ts, _ = parser.get_observation(torch.device("cpu"))
-                obs_buf.copy_(obs_ts.squeeze(0))
-                if ctx.use_expert:
-                    ea = wrapper.get_expert_action(obs)
-                    expert_action_buf.copy_(torch.from_numpy(ea).float())
-
-                obs_ready.set()
-
-        except Exception as e:
-            import traceback
-            print(f"VecWorker [{expert_name}] failed: {e}")
-            traceback.print_exc()
-
-        finally:
-            term_stats = None
-            if hasattr(wrapper.env, "get_termination_stats"):
-                term_stats = wrapper.env.get_termination_stats()
-            result_queue.put(("logger", expert_name, obc_logger, term_stats))
 
     def _vec_env_worker_persistent(
         self,
@@ -1459,348 +1372,6 @@ class ArnoldTrainer:
 
         return expert_batches, expert_loggers
 
-    def _sample_vectorized(self) -> Tuple[Dict[str, OBCBatch], Dict[str, OBCLogger]]:
-        """
-        Vectorized sampling: env workers step on CPU, main process does
-        batched policy inference on GPU/MPS.
-
-        Workers communicate via shared-memory tensors + Events (lockstep).
-        Policy stays on device the entire time.
-
-        Config knobs:
-            vec_batch_size (per-expert): number of parallel envs / GPU batch.
-                Falls back to num_threads if not set.
-            finish_episodes (global, run config): when True, after reaching
-                min_batch_size the loop keeps stepping workers whose episodes
-                haven't ended yet (drain phase).  Workers that reach done/truncated
-                are deactivated.  When all workers are done, sampling completes.
-                When False (default), sampling stops immediately.
-
-        bfloat16 autocast is applied to GPU inference when use_bfloat16=True.
-        """
-        t_start = time.time()
-        self.policy.eval()
-
-        optimizer_to(self.policy_optimizer, torch.device('cpu'))
-        optimizer_to(self.value_optimizer, torch.device('cpu'))
-
-        prof = Profiler(
-            device=str(self.device) if self.device.type == 'cuda' else None,
-        )
-        prof.time_enabled = (self.epoch == 0)
-
-        # Подключаем общий профайлер к policy — секции внутри forward()
-        # (normalizer, shared_trunk, gate_forward, ...) попадут в тот же отчёт.
-        old_profiler = getattr(self.policy_module, 'profiler', None)
-        if hasattr(self.policy_module, 'set_profiler'):
-            self.policy_module.set_profiler(prof)
-
-        result_queue = fork_ctx.Queue()
-        stop_flag = fork_ctx.Value('i', 0)
-
-        # ── Spawn workers ────────────────────────────────────────
-        class _WH:
-            """Worker handle."""
-            __slots__ = (
-                'expert_name', 'obs_buf', 'action_buf', 'expert_action_buf',
-                'reward_val', 'done_val', 'obs_ready', 'action_ready', 'proc',
-                'active',
-            )
-
-        workers_by_expert: Dict[str, List] = {n: [] for n in self.experts}
-        all_workers: List = []
-        step_counters: Dict[str, Any] = {}
-
-        for expert_name, ctx in self.experts.items():
-            obs_shape = (ctx.parser.n_obs_elements, self.history_len)
-            action_dim = ctx.wrapper.action_dim
-            step_counter = fork_ctx.Value('i', 0)
-            step_counters[expert_name] = step_counter
-
-            n_workers = ctx.vec_batch_size or ctx.num_threads
-
-            for w_idx in range(n_workers):
-                wh = _WH()
-                wh.expert_name = expert_name
-                wh.obs_buf = torch.zeros(obs_shape, dtype=torch.float32).share_memory_()
-                wh.action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
-                wh.expert_action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
-                wh.reward_val = fork_ctx.Value('d', 0.0)
-                wh.done_val = fork_ctx.Value('i', 0)
-                wh.obs_ready = fork_ctx.Event()
-                wh.action_ready = fork_ctx.Event()
-                wh.active = True
-
-                global_wid = len(all_workers) + 1
-
-                wh.proc = fork_ctx.Process(
-                    target=self._vec_env_worker,
-                    args=(
-                        expert_name,
-                        global_wid,
-                        wh.obs_buf, wh.action_buf, wh.expert_action_buf,
-                        wh.reward_val, wh.done_val,
-                        wh.obs_ready, wh.action_ready,
-                        stop_flag, result_queue, step_counter,
-                        w_idx == 0,
-                    ),
-                    daemon=True,
-                )
-                workers_by_expert[expert_name].append(wh)
-                all_workers.append(wh)
-
-        for wh in all_workers:
-            wh.proc.start()
-
-        total_workers = len(all_workers)
-        workers_per_expert = {
-            n: len(ws) for n, ws in workers_by_expert.items()
-        }
-        logger.info(
-            f"Vectorized sampling: {total_workers} env workers "
-            f"({workers_per_expert}), inference on {self.device}, "
-            f"finish_episodes={self.finish_episodes}"
-        )
-
-        # ── Collect signatures (one per expert) ──────────────────
-        sigs_by_expert: Dict[str, Tuple] = {}
-        while len(sigs_by_expert) < len(self.experts):
-            msg = result_queue.get(timeout=30)
-            if msg[0] == "sigs":
-                sigs_by_expert[msg[1]] = (msg[2], msg[3])
-
-        # ── Wait for obs from active workers ─────────────────────
-        def _wait_obs_active():
-            for wh in all_workers:
-                if not wh.active:
-                    continue
-                while not wh.obs_ready.wait(timeout=2.0):
-                    if not wh.proc.is_alive():
-                        raise RuntimeError(
-                            f"VecWorker [{wh.expert_name}] died "
-                            f"(exit code {wh.proc.exitcode})"
-                        )
-                wh.obs_ready.clear()
-
-        _wait_obs_active()
-
-        # ── Per-worker memory tracking ───────────────────────────
-        worker_mems: Dict[int, OBCMemory] = {id(w): OBCMemory() for w in all_workers}
-        worker_prev: Dict[int, Optional[dict]] = {id(w): None for w in all_workers}
-
-        per_expert_steps: Dict[str, int] = {n: 0 for n in self.experts}
-        target_steps = {n: ctx.min_batch_size for n, ctx in self.experts.items()}
-
-        pbars = {
-            n: tqdm(total=t, desc=f"  Sampling [{n}]", unit="step")
-            for n, t in target_steps.items()
-        }
-
-        device = self.device
-        device_type = "cuda" if device.type == "cuda" else "cpu"
-        use_amp = self.use_bfloat16 and device.type == "cuda"
-        has_prev = False
-        draining = False
-
-        # ── Main inference loop ──────────────────────────────────
-        with torch.no_grad():
-            while True:
-                # ── Store memory from previous step ──────────────
-                if has_prev:
-                    with prof.section("store_memory"):
-                        for expert_name, workers in workers_by_expert.items():
-                            obs_sigs, act_sigs = sigs_by_expert[expert_name]
-
-                            for wh in workers:
-                                if not wh.active:
-                                    continue
-                                wid = id(wh)
-                                prev = worker_prev[wid]
-                                if prev is None:
-                                    continue
-                                mem = worker_mems[wid]
-
-                                mem.states.append(prev["obs"])
-                                mem.obs_signatures.append(obs_sigs)
-                                mem.action_signatures.append(act_sigs)
-                                mem.student_actions.append(prev["action"])
-                                mem.expert_actions.append(prev["expert_action"])
-                                mem.rewards.append(wh.reward_val.value)
-                                mem.values.append(prev["value"])
-                                mem.masks.append(0.0 if wh.done_val.value else 1.0)
-                                mem.log_probs.append(prev["log_prob"])
-                                per_expert_steps[expert_name] += 1
-
-                    for n, pbar in pbars.items():
-                        pbar.n = min(per_expert_steps[n], pbar.total)
-                        pbar.refresh()
-
-                    # ── Drain phase: deactivate workers whose episode ended ──
-                    if draining:
-                        for wh in all_workers:
-                            if wh.active and wh.done_val.value:
-                                wh.active = False
-                        if not any(wh.active for wh in all_workers):
-                            break
-
-                    # ── Check if target reached ──────────────────
-                    target_reached = all(
-                        per_expert_steps[n] >= target_steps[n]
-                        for n in self.experts
-                    )
-                    if target_reached:
-                        if not self.finish_episodes:
-                            break
-                        if not draining:
-                            draining = True
-                            for wh in all_workers:
-                                if wh.done_val.value:
-                                    wh.active = False
-                            if not any(wh.active for wh in all_workers):
-                                break
-
-                # ── Batched inference per expert (active only) ───
-                with prof.section("inference"):
-                    for expert_name, workers in workers_by_expert.items():
-                        obs_sigs, act_sigs = sigs_by_expert[expert_name]
-                        ctx = self.experts[expert_name]
-
-                        active_workers = [wh for wh in workers if wh.active]
-                        if not active_workers:
-                            continue
-
-                        with prof.section("stack_obs"):
-                            batch_obs = torch.stack(
-                                [wh.obs_buf.clone() for wh in active_workers]
-                            )
-
-                        with prof.section("gpu_forward"):
-                            with prof.section("to_device"):
-                                batch_obs_dev = batch_obs.to(device)
-                            with prof.section("policy_forward"):
-                                with torch.autocast(
-                                    device_type=device_type,
-                                    dtype=torch.bfloat16,
-                                    enabled=use_amp,
-                                ):
-                                    actions, log_probs, values = \
-                                        self.policy_module.get_action(
-                                            batch_obs_dev,
-                                            obs_sigs, act_sigs,
-                                            expert_name=expert_name,
-                                            deterministic=False,
-                                        )
-                            with prof.section("to_cpu"):
-                                actions_cpu = actions.cpu()
-                                log_probs_cpu = log_probs.cpu()
-                                values_cpu = values.cpu()
-
-                        with prof.section("scatter"):
-                            zero_ea = torch.zeros(ctx.wrapper.action_dim)
-                            for i, wh in enumerate(active_workers):
-                                if ctx.use_expert:
-                                    ea = wh.expert_action_buf.clone()
-                                else:
-                                    ea = zero_ea
-                                worker_prev[id(wh)] = {
-                                    "obs": wh.obs_buf.clone(),
-                                    "action": actions_cpu[i],
-                                    "log_prob": log_probs_cpu[i],
-                                    "value": values_cpu[i],
-                                    "expert_action": ea,
-                                }
-                                wh.action_buf.copy_(actions_cpu[i])
-
-                has_prev = True
-
-                # Signal active workers → env.step → wait for next obs
-                with prof.section("signal_workers"):
-                    for wh in all_workers:
-                        if wh.active:
-                            wh.action_ready.set()
-
-                with prof.section("wait_env_step"):
-                    _wait_obs_active()
-
-        # ── Cleanup ──────────────────────────────────────────────
-        for pbar in pbars.values():
-            pbar.n = pbar.total
-            pbar.refresh()
-            pbar.close()
-
-        stop_flag.value = 1
-        for wh in all_workers:
-            wh.action_ready.set()
-
-        per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
-        per_expert_term_stats: Dict[str, list] = {n: [] for n in self.experts}
-        collected = 0
-        while collected < total_workers:
-            try:
-                msg = result_queue.get(timeout=10)
-                if msg[0] == "logger":
-                    per_expert_loggers[msg[1]].append(msg[2])
-                    if msg[3] is not None:
-                        per_expert_term_stats[msg[1]].append(msg[3])
-                    collected += 1
-            except Exception:
-                break
-
-        for wh in all_workers:
-            wh.proc.join(timeout=5)
-
-        # Восстанавливаем дефолтный профайлер policy (выключен)
-        if old_profiler is not None and hasattr(self.policy_module, 'set_profiler'):
-            self.policy_module.set_profiler(old_profiler)
-
-        optimizer_to(self.policy_optimizer, self.device)
-        optimizer_to(self.value_optimizer, self.device)
-
-        # ── Merge per expert ─────────────────────────────────────
-        expert_batches: Dict[str, OBCBatch] = {}
-        expert_loggers: Dict[str, OBCLogger] = {}
-
-        for expert_name, workers in workers_by_expert.items():
-            merged = OBCMemory()
-            for wh in workers:
-                mem = worker_mems[id(wh)]
-                if len(mem) > 0 and mem.masks[-1] != 0.0:
-                    mem.masks[-1] = 0.0
-                merged.extend(mem)
-
-            batch = merged.to_batch(gamma=self.gamma, tau=self.tau, device=None)
-            expert_batches[expert_name] = batch
-            expert_loggers[expert_name] = OBCLogger.merge(
-                per_expert_loggers.get(expert_name, [])
-            )
-
-        # Merge per-body termination stats from all workers into main env
-        for expert_name, stats_list in per_expert_term_stats.items():
-            if not stats_list:
-                continue
-            ctx = self.experts[expert_name]
-            env = ctx.wrapper.env
-            if not hasattr(env, "_termination_counts"):
-                env._termination_counts = {}
-                env._termination_dists = {}
-            for worker_stats in stats_list:
-                for body, s in worker_stats.items():
-                    if body not in env._termination_counts:
-                        env._termination_counts[body] = 0
-                        env._termination_dists[body] = []
-                    env._termination_counts[body] += s["caused"]
-                    if s["mean_dist"] > 0 and s["caused"] > 0:
-                        env._termination_dists[body].extend([s["mean_dist"]] * s["caused"])
-
-        if prof.time_enabled:
-            self.profiler_reports["vectorized_sampling"] = prof
-
-        sample_time = time.time() - t_start
-        for lg in expert_loggers.values():
-            lg.sample_time = sample_time
-
-        return expert_batches, expert_loggers
-
     # ------------------------------------------------------------------
     #  Update
     # ------------------------------------------------------------------
@@ -2224,16 +1795,14 @@ class ArnoldTrainer:
             for epoch in range(self.epoch, self.max_epochs):
                 self.epoch = epoch
 
-                # Pre-epoch: resample motions
+                # Pre-epoch: resample motions (persistent workers handle it)
                 need_resample = epoch > 0 and epoch % self.resampling_interval == 0
-                if self.persistent_workers and self._persistent_state is not None:
-                    # Signal persistent workers to resample (they handle it)
+                if self._persistent_state is not None:
                     self._persistent_state["resample_flag"].value = 1 if need_resample else 0
-                else:
-                    if need_resample:
-                        for expert_name, ctx in self.experts.items():
-                            if hasattr(ctx.wrapper.env, 'sample_motions'):
-                                ctx.wrapper.env.sample_motions()
+                elif need_resample:
+                    for expert_name, ctx in self.experts.items():
+                        if hasattr(ctx.wrapper.env, 'sample_motions'):
+                            ctx.wrapper.env.sample_motions()
 
                 # Sample
                 t_sample_start = time.time()
@@ -2599,56 +2168,51 @@ class ArnoldTrainer:
 
         return all_eval
 
-    def evaluate_detailed(
-        self,
-        split: str = "valid",
-    ) -> Dict[str, Tuple[Dict[str, float], List[Dict[str, Any]]]]:
-        """
-        Evaluate all experts and return per-motion results.
+    @staticmethod
+    def _build_eval_metrics(
+        expert_name: str,
+        episode_rewards: list,
+        episode_lengths: list,
+        episode_imitation_losses: list,
+        episode_mpjpes: list,
+        episode_frame_coverages: list,
+        episode_successes: list,
+        use_expert: bool,
+        label: str = "",
+    ) -> Dict[str, float]:
+        """Build metrics dict and log summary. Shared by sequential and vectorized eval."""
+        metrics = {
+            "eval/mean_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
+            "eval/std_reward": float(np.std(episode_rewards)) if episode_rewards else 0.0,
+            "eval/mean_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
+            "eval/std_length": float(np.std(episode_lengths)) if episode_lengths else 0.0,
+        }
+        if episode_imitation_losses:
+            metrics["eval/imitation_loss"] = float(np.mean(episode_imitation_losses))
+        if episode_mpjpes:
+            metrics["eval/mpjpe"] = float(np.mean(episode_mpjpes))
+        if episode_frame_coverages:
+            metrics["eval/frame_coverage"] = float(np.mean(episode_frame_coverages))
+        if episode_successes:
+            metrics["eval/success_rate"] = float(np.mean(episode_successes))
 
-        Args:
-            split: "valid" uses valid_experts wrappers,
-                   "train" uses train wrappers in eval mode.
+        extra = ""
+        if "eval/mpjpe" in metrics:
+            extra += f", mpjpe={metrics['eval/mpjpe'] * 1000:.2f}mm"
+        if "eval/frame_coverage" in metrics:
+            extra += f", frame_cov={metrics['eval/frame_coverage']:.3f}"
+        if "eval/success_rate" in metrics:
+            extra += f", success={metrics['eval/success_rate']:.3f}"
 
-        Returns:
-            {expert_name: (aggregate_metrics, per_motion_results)}
-        """
-        results = {}
-
-        # For train split: temporarily swap valid_experts so vectorized
-        # workers (which read self.valid_experts) use train wrappers.
-        saved_valid = None
-        if split == "train":
-            saved_valid = self.valid_experts
-            self.valid_experts = {n: ctx.wrapper for n, ctx in self.experts.items()}
-            for ctx in self.experts.values():
-                ctx.wrapper.env.start_eval(im_eval=True)
-
-        try:
-            for expert_name, ctx in self.experts.items():
-                wrapper = self.valid_experts.get(expert_name)
-                if wrapper is None:
-                    raise ValueError(
-                        f"No wrapper for expert '{expert_name}'. "
-                        f"Set eval_frequency > 0 in config."
-                    )
-
-                if self.vectorized_eval and self.device.type in ('cuda', 'mps'):
-                    metrics, per_motion = self._evaluate_expert_vectorized(
-                        expert_name, ctx, wrapper, return_per_motion=True,
-                    )
-                else:
-                    metrics, per_motion = self.evaluate_expert(
-                        expert_name, ctx, wrapper, return_per_motion=True,
-                    )
-                results[expert_name] = (metrics, per_motion)
-        finally:
-            if split == "train" and saved_valid is not None:
-                for ctx in self.experts.values():
-                    ctx.wrapper.env.end_eval()
-                self.valid_experts = saved_valid
-
-        return results
+        tag = f" ({label})" if label else ""
+        logger.info(
+            f"Eval [{expert_name}]{tag}: "
+            f"reward={metrics['eval/mean_reward']:.4f}±{metrics['eval/std_reward']:.4f}, "
+            f"length={metrics['eval/mean_length']:.2f}±{metrics['eval/std_length']:.2f}"
+            + (f", im_loss={metrics.get('eval/imitation_loss', 0):.4f}" if use_expert else "")
+            + extra
+        )
+        return metrics
 
     def evaluate_expert(
         self,
@@ -2657,7 +2221,7 @@ class ArnoldTrainer:
         valid_wrapper,
         return_per_motion: bool = False,
     ) -> Dict[str, float]:
-        """Evaluation для одного эксперта."""
+        """Sequential evaluation для одного эксперта (CPU inference)."""
         self.policy.eval()
         valid_parser = ObservationParser.from_env(valid_wrapper.env, self.history_len)
         valid_action_parser = ActionParser.from_env(valid_wrapper.env)
@@ -2665,7 +2229,6 @@ class ArnoldTrainer:
         episode_rewards = []
         episode_lengths = []
         episode_imitation_losses = []
-        episode_value_losses = []
         episode_mpjpes = []
         episode_frame_coverages = []
         episode_successes = []
@@ -2682,18 +2245,17 @@ class ArnoldTrainer:
             episode_reward = 0.0
             episode_length = 0
             step_imitation_losses = []
-            step_values = []
-            step_rewards = []
 
             for t in range(10000):
                 obs_ts, obs_sigs = valid_parser.get_observation(self.device)
                 act_sigs = valid_action_parser.action_signatures
 
                 with torch.no_grad():
-                    action, _, value = self.policy_module.get_action(
+                    action, _, _ = self.policy_module.get_action(
                         obs_ts, obs_sigs, act_sigs,
                         expert_name=expert_name,
                         deterministic=True,
+                        return_value=False,
                     )
 
                     if ctx.use_expert:
@@ -2702,15 +2264,12 @@ class ArnoldTrainer:
                         im_loss = ((action.squeeze(0) - expert_action_t) ** 2).mean().item()
                         step_imitation_losses.append(im_loss)
 
-                    step_values.append(value.item())
-
                 action_np = action.squeeze(0).cpu().numpy()
                 next_obs, reward, terminated, truncated, info = valid_wrapper.step(action_np)
                 done = terminated or truncated
 
                 episode_reward += reward
                 episode_length += 1
-                step_rewards.append(reward)
 
                 valid_parser.update(next_obs)
                 obs = next_obs
@@ -2730,15 +2289,6 @@ class ArnoldTrainer:
             if step_imitation_losses:
                 episode_imitation_losses.append(np.mean(step_imitation_losses))
 
-            if step_values and step_rewards:
-                disc_returns = np.zeros(len(step_rewards), dtype=np.float64)
-                running = 0.0
-                for ri in reversed(range(len(step_rewards))):
-                    running = step_rewards[ri] + self.gamma * running
-                    disc_returns[ri] = running
-                val_loss = np.mean((np.array(step_values) - disc_returns) ** 2)
-                episode_value_losses.append(val_loss)
-
             if return_per_motion:
                 per_motion_results.append({
                     "motion_id": motion_id,
@@ -2751,37 +2301,11 @@ class ArnoldTrainer:
                     "success": info.get("success"),
                 })
 
-        metrics = {
-            "eval/mean_reward": float(np.mean(episode_rewards)),
-            "eval/std_reward": float(np.std(episode_rewards)),
-            "eval/mean_length": float(np.mean(episode_lengths)),
-            "eval/std_length": float(np.std(episode_lengths)),
-            "eval/value_loss": float(np.mean(episode_value_losses)) if episode_value_losses else 0.0,
-        }
-        if episode_imitation_losses:
-            metrics["eval/imitation_loss"] = float(np.mean(episode_imitation_losses))
-        if episode_mpjpes:
-            metrics["eval/mpjpe"] = float(np.mean(episode_mpjpes))
-        if episode_frame_coverages:
-            metrics["eval/frame_coverage"] = float(np.mean(episode_frame_coverages))
-        if episode_successes:
-            metrics["eval/success_rate"] = float(np.mean(episode_successes))
-
-        extra = ""
-        if "eval/mpjpe" in metrics:
-            extra += f", mpjpe={metrics['eval/mpjpe'] * 1000:.2f}mm"
-        if "eval/frame_coverage" in metrics:
-            extra += f", frame_cov={metrics['eval/frame_coverage']:.3f}"
-        if "eval/success_rate" in metrics:
-            extra += f", success={metrics['eval/success_rate']:.3f}"
-
-        logger.info(
-            f"Eval [{expert_name}]: "
-            f"reward={metrics['eval/mean_reward']:.4f}±{metrics['eval/std_reward']:.4f}, "
-            f"length={metrics['eval/mean_length']:.2f}±{metrics['eval/std_length']:.2f}"
-            + (f", im_loss={metrics.get('eval/imitation_loss', 0):.4f}" if ctx.use_expert else "")
-            + f", val_loss={metrics['eval/value_loss']:.4f}"
-            + extra
+        metrics = self._build_eval_metrics(
+            expert_name, episode_rewards, episode_lengths,
+            episode_imitation_losses, episode_mpjpes,
+            episode_frame_coverages, episode_successes,
+            use_expert=ctx.use_expert,
         )
 
         if return_per_motion:
@@ -3102,37 +2626,12 @@ class ArnoldTrainer:
             if wh.proc.is_alive():
                 wh.proc.terminate()
 
-        # Build metrics dict (same format as evaluate_expert)
-        metrics = {
-            "eval/mean_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
-            "eval/std_reward": float(np.std(episode_rewards)) if episode_rewards else 0.0,
-            "eval/mean_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
-            "eval/std_length": float(np.std(episode_lengths)) if episode_lengths else 0.0,
-            "eval/value_loss": 0.0,  # not computed in vectorized mode
-        }
-        if episode_imitation_losses:
-            metrics["eval/imitation_loss"] = float(np.mean(episode_imitation_losses))
-        if episode_mpjpes:
-            metrics["eval/mpjpe"] = float(np.mean(episode_mpjpes))
-        if episode_frame_coverages:
-            metrics["eval/frame_coverage"] = float(np.mean(episode_frame_coverages))
-        if episode_successes:
-            metrics["eval/success_rate"] = float(np.mean(episode_successes))
-
-        extra = ""
-        if "eval/mpjpe" in metrics:
-            extra += f", mpjpe={metrics['eval/mpjpe'] * 1000:.2f}mm"
-        if "eval/frame_coverage" in metrics:
-            extra += f", frame_cov={metrics['eval/frame_coverage']:.3f}"
-        if "eval/success_rate" in metrics:
-            extra += f", success={metrics['eval/success_rate']:.3f}"
-
-        logger.info(
-            f"Eval [{expert_name}] (vectorized, {n_workers} workers): "
-            f"reward={metrics['eval/mean_reward']:.4f}±{metrics['eval/std_reward']:.4f}, "
-            f"length={metrics['eval/mean_length']:.2f}±{metrics['eval/std_length']:.2f}"
-            + (f", im_loss={metrics.get('eval/imitation_loss', 0):.4f}" if ctx.use_expert else "")
-            + extra
+        metrics = self._build_eval_metrics(
+            expert_name, episode_rewards, episode_lengths,
+            episode_imitation_losses, episode_mpjpes,
+            episode_frame_coverages, episode_successes,
+            use_expert=ctx.use_expert,
+            label=f"vectorized, {n_workers} workers",
         )
 
         if return_per_motion:
@@ -3258,19 +2757,31 @@ class ArnoldTrainer:
                 f"{len(pruned)} pruned (not in target experts)"
             )
 
-            logger.info("Transfer mode: reinitializing value nets")
-            if self.cfg.learning.policy == "transformer":
-                for module in [self.policy_module.value_decoder, self.policy_module.value_head]:
-                    for param in module.parameters():
+            if self.cfg.learning.get("transfer_keep_value", False):
+                logger.info("Transfer mode: keeping value net from checkpoint")
+            else:
+                logger.info("Transfer mode: reinitializing value nets")
+                if self.cfg.learning.policy == "transformer":
+                    for module in [self.policy_module.value_decoder, self.policy_module.value_head]:
+                        for param in module.parameters():
+                            if param.dim() >= 2:
+                                nn.init.xavier_uniform_(param)
+                            elif param.dim() == 1:
+                                nn.init.zeros_(param)
+                    nn.init.normal_(self.policy_module.value_query.data)
+                elif self.cfg.learning.policy in ("lattice", "moe"):
+                    for param in self.policy_module.value_net.parameters():
                         if param.dim() >= 2:
                             nn.init.xavier_uniform_(param)
                         elif param.dim() == 1:
                             nn.init.zeros_(param)
-                nn.init.normal_(self.policy_module.value_query.data)
-            else:
-                raise NotImplementedError(
-                    "Transfer mode not implemented for lattice policy"
-                )
+                    self.policy_module.value_head.weight.data.mul_(0.0)
+                    nn.init.xavier_uniform_(self.policy_module.value_head.weight)
+                    self.policy_module.value_head.weight.data.mul_(0.1)
+                    self.policy_module.value_head.bias.data.zero_()
+
+            # Reinit action head for masked indices (e.g. arms after OBC on legs-only teacher)
+            self._transfer_reinit_masked_actions()
 
         prev_mode = checkpoint.get("training_mode", "unknown")
         src_epoch = checkpoint.get("epoch", "?")
@@ -3278,4 +2789,53 @@ class ArnoldTrainer:
             f"Loaded checkpoint from {path} "
             f"(epoch={src_epoch}, mode={prev_mode}), "
             f"resuming from epoch {self.epoch}"
+        )
+
+    def _transfer_reinit_masked_actions(self) -> None:
+        """Reinit action head rows for masked action indices (e.g. arms after OBC on legs-only teacher).
+
+        Uses get_action_mask() from any expert wrapper that provides it.
+        Indices where mask=0 get reinitialized in:
+          - action_mean.weight (rows)
+          - action_mean.bias
+          - log_std (diagonal part)
+        """
+        if self.cfg.learning.policy != "lattice":
+            raise NotImplementedError(
+                "Transfer reinit for masked actions not implemented for this policy"
+            )
+
+        # Collect union of masked indices across all experts
+        masked_indices = set()
+        for ctx in self.experts.values():
+            if hasattr(ctx.wrapper, 'get_action_mask'):
+                mask = ctx.wrapper.get_action_mask()
+                zero_idx = (mask == 0).nonzero(as_tuple=True)[0].tolist()
+                masked_indices.update(zero_idx)
+
+        if not masked_indices:
+            return
+
+        idx = sorted(masked_indices)
+        idx_t = torch.tensor(idx, dtype=torch.long)
+
+        pm = self.policy_module
+        with torch.no_grad():
+            # action_mean: nn.Linear(latent_dim, action_dim)
+            # weight shape: (action_dim, latent_dim) — reinit rows
+            fan_in = pm.action_mean.weight.shape[1]
+            std = (2.0 / (fan_in + 1)) ** 0.5
+            pm.action_mean.weight[idx_t] = torch.randn_like(
+                pm.action_mean.weight[idx_t],
+            ) * std * 0.1
+            pm.action_mean.bias[idx_t] = 0.0
+
+            # log_std: (1, action_dim + latent_dim)
+            sub_cfg = self.cfg.learning.get("lattice", {})
+            log_std_init = sub_cfg.get("log_std_init", 0.0) if sub_cfg else 0.0
+            pm.log_std.data[0, idx_t] = log_std_init
+
+        logger.info(
+            f"Transfer mode: reinitialized action head for {len(idx)} masked indices "
+            f"(arms: {idx[0]}..{idx[-1]})"
         )

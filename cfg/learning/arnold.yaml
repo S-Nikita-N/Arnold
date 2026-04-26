@@ -46,6 +46,7 @@ value_grad_clip: 0.5
 max_epochs: 100000
 use_scheduler: false
 transfer_mode: true
+transfer_keep_value: true  # false = reinit value net from scratch at transfer
 use_compile: false
 use_bfloat16: false
 
