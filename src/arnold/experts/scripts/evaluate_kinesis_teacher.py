@@ -458,8 +458,6 @@ def run_eval(args):
         "run.test=true",
         "run.random_start=false",
     ]
-    if args.split == "train":
-        overrides.append("run=train_run")
 
     wrapper = MyoHumanWrapper(
         checkpoint_epoch=0,

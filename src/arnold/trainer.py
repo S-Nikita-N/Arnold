@@ -2434,31 +2434,9 @@ class ArnoldTrainer:
                 # BC diagnostics
                 l_bc = d.get('bc_loss', 0)
                 if l_bc > 0:
-                    # Compute test BC loss
-                    bc_test_loss = 0.0
-                    if hasattr(ctx.wrapper, '_bc_test') and ctx.wrapper._bc_test is not None:
-                        bc_test_losses = []
-                        with torch.no_grad():
-                            for t_obs, t_act in ctx.wrapper.iter_test_bc_batches(
-                                self.batch_size, self.device,
-                            ):
-                                t_obs_ts = t_obs.unsqueeze(-1).expand(-1, -1, self.history_len)
-                                t_pred, _, _ = self.policy_module.get_action(
-                                    t_obs_ts,
-                                    ctx.parser.obs_signatures,
-                                    ctx.action_parser.action_signatures,
-                                    expert_name=expert_name,
-                                    deterministic=True,
-                                    return_std=False,
-                                    return_value=False,
-                                )
-                                bl = ctx.wrapper.compute_bc_loss(t_pred, t_act, self.device)
-                                bc_test_losses.append(bl.item())
-                        bc_test_loss = float(np.mean(bc_test_losses)) if bc_test_losses else 0.0
                     logger.info(
                         f"  [{expert_name}] BC: "
                         f"train_loss={l_bc:.4f}  "
-                        f"test_loss={bc_test_loss:.4f}  "
                         f"bc_contrib={ctx.bc_imitation_weight * l_bc:.4f}"
                     )
                 if "gate_entropy" in d:
@@ -2558,6 +2536,29 @@ class ArnoldTrainer:
                 all_eval[expert_name] = self.evaluate_expert(
                     expert_name, ctx, valid_wrapper,
                 )
+
+            # BC test loss
+            if ctx.bc_imitation_weight > 0 and hasattr(ctx.wrapper, '_bc_test') and ctx.wrapper._bc_test is not None:
+                bc_test_losses = []
+                with torch.no_grad():
+                    for t_obs, t_act in ctx.wrapper.iter_test_bc_batches(
+                        self.batch_size, self.device,
+                    ):
+                        t_obs_ts = t_obs.unsqueeze(-1).expand(-1, -1, self.history_len)
+                        t_pred, _, _ = self.policy_module.get_action(
+                            t_obs_ts,
+                            ctx.parser.obs_signatures,
+                            ctx.action_parser.action_signatures,
+                            expert_name=expert_name,
+                            deterministic=True,
+                            return_std=False,
+                            return_value=False,
+                        )
+                        bl = ctx.wrapper.compute_bc_loss(t_pred, t_act, self.device)
+                        bc_test_losses.append(bl.item())
+                bc_test_loss = float(np.mean(bc_test_losses))
+                all_eval[expert_name]["eval/bc_test_loss"] = bc_test_loss
+                logger.info(f"  [{expert_name}] BC test_loss={bc_test_loss:.4f}")
 
         return all_eval
 
