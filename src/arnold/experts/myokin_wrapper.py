@@ -127,16 +127,8 @@ class MyoKinWrapper:
         self._action_mask = torch.zeros(self.action_dim, dtype=torch.float32)
         self._action_mask[:ARM_ACTION_START] = 1.0
 
-        # Precompute arm qpos/qvel indices from actuator→joint mapping
-        model = self._env.mj_model
-        arm_qpos_idx = []
-        arm_qvel_idx = []
-        for act_id in range(ARM_ACTION_START, ARM_ACTION_END):
-            joint_id = model.actuator_trnid[act_id, 0]
-            arm_qpos_idx.append(model.jnt_qposadr[joint_id])
-            arm_qvel_idx.append(model.jnt_dofadr[joint_id])
-        self._arm_qpos_idx = np.array(sorted(set(arm_qpos_idx)), dtype=np.intp)
-        self._arm_qvel_idx = np.array(sorted(set(arm_qvel_idx)), dtype=np.intp)
+        # Arm joint qpos indices in MyoHuman model (same as evaluate_kinesis_teacher)
+        self._arm_qpos_slice = slice(27, 59)
 
     def _load_teacher(self, checkpoint_path: str) -> None:
         """Load frozen Kinesis MoE teacher."""
@@ -172,8 +164,7 @@ class MyoKinWrapper:
     def reset(self) -> Tuple[np.ndarray, dict]:
         obs, info = self._env.reset()
         # Zero out arm joints so arms start in neutral pose
-        self._env.mj_data.qpos[self._arm_qpos_idx] = 0.0
-        self._env.mj_data.qvel[self._arm_qvel_idx] = 0.0
+        self._env.mj_data.qpos[self._arm_qpos_slice] = 0.0
         mujoco.mj_forward(self._env.mj_model, self._env.mj_data)
         obs = self._env.get_obs()
         return obs, info
