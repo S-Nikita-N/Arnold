@@ -1504,14 +1504,13 @@ class ArnoldTrainer:
                                 pred_mean, cov_factor, diag_std,
                             )
 
-                        with prof.section("compute_log_prob"):
-                            new_log_probs = safe_lrmvn_log_prob(dist, mini_actions.float()).unsqueeze(-1)
-
                         policy_loss = torch.tensor(0.0, device=self.device)
                         value_loss_total = torch.tensor(0.0, device=self.device)
 
                         # --- PPO ---
                         if ctx.ppo_weight > 0:
+                            with prof.section("compute_log_prob"):
+                                new_log_probs = safe_lrmvn_log_prob(dist, mini_actions.float()).unsqueeze(-1)
                             with prof.section("ppo_loss"):
                                 log_ratio = new_log_probs - mini_fixed_lp
                                 ratio = torch.exp(log_ratio)
