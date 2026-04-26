@@ -138,11 +138,7 @@ class MyoKinWrapper:
         )
 
         self._teacher = KinesisTeacher(checkpoint_path, device=self.device)
-        mh_body_names = [
-            self._env.mj_model.body(i).name
-            for i in range(self._env.mj_model.nbody)
-        ]
-        self._obs_adapter = KinesisObservationAdapter(mh_body_names)
+        self._obs_adapter = KinesisObservationAdapter(self._env.body_names)
         logger.info(f"MyoKin teacher loaded from {checkpoint_path}")
 
     @property
