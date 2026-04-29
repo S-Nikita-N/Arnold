@@ -6,9 +6,12 @@ Hard Negative Mining — оценка политики на всех motion и �
   1. mine   — eval + filter + save (default)
   2. refilter — пересчитать фильтр из существующего JSON без повторного eval
 
-Результат:
-  - {output_name}_{split}.txt — motion_id по одному на строку (для MyoLegsIm)
-  - {output_name}_{split}.json — полная мета + per-motion метрики
+Результат (split = train | valid — valid соответствует eval/val):
+  - {output_name}_{split}.json — meta + ключ \"frames\": все мотии eval (и «хорошие», и «плохие»)
+  - {output_name}_{split}_negatives.txt — motion_id негативов (для motion_ids_file и т.п.)
+  - {output_name}_{split}_positives.txt — комплемент по тем же порогам
+
+  По умолчанию output_name=eval → eval_train.json, eval_valid.json и пары txt.
 
 Критерии негатива задаются раздельно для train и test:
   run.train.mean_mpjpe=0.05   (строже — модель видела эти motions)
@@ -22,11 +25,10 @@ Hard Negative Mining — оценка политики на всех motion и �
         '+run/experts@run.experts.myo=myohuman' \
         resume_checkpoint=runs/exp/model.pth
 
-    # Refilter (no eval, just re-apply thresholds to existing JSON)
+    # Refilter: JSON с ключом "frames", перезапись того же .json и *_negatives/_positives.txt
     poetry run python -m arnold.mine_negatives refilter \
-        --json data/trained_models/exp/negatives_valid.json \
-        --mean-mpjpe 0.06 --not-success \
-        --output data/trained_models/exp/negatives_valid_strict.txt
+        --json data/trained_models/exp/eval_valid.json \
+        --mean-mpjpe 0.06 --not-success
 """
 
 import os
@@ -78,24 +80,30 @@ def filter_negatives(
     return negatives
 
 
+def derive_positives(per_motion: list, negatives: list) -> list:
+    """Комплемент к негативам по motion_id (один motion — одна запись)."""
+    neg_ids = {int(r["motion_id"]) for r in negatives}
+    return [r for r in per_motion if int(r["motion_id"]) not in neg_ids]
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  Save
 # ─────────────────────────────────────────────────────────────────────
 
-def save_txt(negatives: list, total: int, path: str) -> None:
-    """Save plain txt with motion IDs."""
+def save_motion_id_txt(items: list, total: int, path: str, label: str) -> None:
+    """Построчно motion_id; первая строка — счётчик (label: negatives | positives)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    neg_ids = sorted(int(r["motion_id"]) for r in negatives)
+    ids_ = sorted(int(r["motion_id"]) for r in items)
     with open(path, "w") as f:
-        f.write(f"# {len(neg_ids)} negatives / {total} total\n")
-        for mid in neg_ids:
+        f.write(f"# {len(ids_)} {label} / {total} total\n")
+        for mid in ids_:
             f.write(f"{mid}\n")
 
 
-def save_json(per_motion: list, negatives: list, meta: dict, path: str) -> None:
-    """Save full JSON with meta + per-motion results."""
+def save_eval_json(frames: list, meta: dict, path: str) -> None:
+    """Полный eval: meta + frames (все мотии)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    output = {"meta": meta, "negatives": negatives, "all_results": per_motion}
+    output = {"meta": meta, "frames": frames}
     with open(path, "w") as f:
         json.dump(output, f, indent=2, default=str)
 
@@ -110,28 +118,34 @@ def save_results(
     checkpoint_path: str,
     epoch: int,
     criteria: dict,
-) -> str:
-    """Save txt + json. Returns txt path."""
+) -> tuple[str, str, str]:
+    """Пишет eval json + два txt. Возвращает (neg_txt, pos_txt, json_path)."""
     base = f"{output_name}_{split}"
     if expert_name:
         base = f"{base}_{expert_name}"
-    txt_path = os.path.join(output_dir, f"{base}.txt")
-    json_path = os.path.join(output_dir, f"{base}.json")
+    stem = os.path.join(output_dir, base)
+    neg_path = f"{stem}_negatives.txt"
+    pos_path = f"{stem}_positives.txt"
+    json_path = f"{stem}.json"
 
-    save_txt(negatives, len(per_motion), txt_path)
+    positives = derive_positives(per_motion, negatives)
+    total = len(per_motion)
+    save_motion_id_txt(negatives, total, neg_path, "negatives")
+    save_motion_id_txt(positives, total, pos_path, "positives")
 
     meta = {
         "checkpoint": str(checkpoint_path),
         "split": split,
         "epoch": epoch,
         "expert_name": expert_name,
-        "total_motions": len(per_motion),
+        "total_motions": total,
         "negatives_count": len(negatives),
+        "positives_count": len(positives),
         **criteria,
     }
-    save_json(per_motion, negatives, meta, json_path)
+    save_eval_json(per_motion, meta, json_path)
 
-    return txt_path
+    return neg_path, pos_path, json_path
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -165,8 +179,7 @@ def log_group_stats(items: list, label: str) -> None:
 def log_summary(expert_name: str, split: str, per_motion: list, negatives: list) -> None:
     total = len(per_motion)
     n_neg = len(negatives)
-    neg_ids = {id(r) for r in negatives}
-    positives = [r for r in per_motion if id(r) not in neg_ids]
+    positives = derive_positives(per_motion, negatives)
 
     logger.info(
         f"[{expert_name}] {split}: "
@@ -257,7 +270,7 @@ def mine_split(trainer, split, split_cfg, run_cfg, checkpoint_path):
             "not_success": not_success,
         }
         multi_expert = len(detailed) > 1
-        txt_path = save_results(
+        neg_path, pos_path, json_path = save_results(
             per_motion=per_motion,
             negatives=negatives,
             output_dir=run_cfg.output_dir,
@@ -268,7 +281,9 @@ def mine_split(trainer, split, split_cfg, run_cfg, checkpoint_path):
             epoch=trainer.epoch,
             criteria=criteria,
         )
-        logger.info(f"  → {txt_path}")
+        logger.info(f"  → {neg_path}")
+        logger.info(f"  → {pos_path}")
+        logger.info(f"  → {json_path}")
 
 
 def hydra_main():
@@ -322,15 +337,24 @@ def hydra_main():
 # ─────────────────────────────────────────────────────────────────────
 
 def refilter_main():
-    """Re-apply filter thresholds to an existing JSON without re-running eval."""
+    """Перефильтрация порогами без eval: JSON с ключом \"frames\" → тот же json + txt."""
     parser = argparse.ArgumentParser(
-        description="Refilter negatives from existing JSON"
+        description="Refilter from eval JSON (required key: frames)",
     )
-    parser.add_argument("--json", required=True, help="Path to existing *_split.json")
+    parser.add_argument(
+        "--json",
+        required=True,
+        dest="json_path",
+        help="Путь к eval_*.json (обязательно поле frames)",
+    )
     parser.add_argument("--mean-mpjpe", type=float, default=None)
     parser.add_argument("--max-mpjpe", type=float, default=None)
     parser.add_argument("--not-success", action="store_true")
-    parser.add_argument("--output", default=None, help="Output .txt path (default: replaces original)")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Явный путь к *_negatives.txt (позитивы — *_positives.txt рядом; json по умолчанию всё равно --json)",
+    )
     args = parser.parse_args(sys.argv[2:])  # skip "refilter"
 
     logging.basicConfig(
@@ -339,14 +363,16 @@ def refilter_main():
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    with open(args.json, "r") as f:
+    with open(args.json_path, "r") as f:
         data = json.load(f)
 
-    all_results = data["all_results"]
-    meta = data["meta"]
+    if "frames" not in data:
+        raise ValueError('Eval JSON must contain a top-level "frames" array.')
+    frames = data["frames"]
+    meta = data.get("meta", {})
 
     negatives = filter_negatives(
-        all_results,
+        frames,
         mean_mpjpe=args.mean_mpjpe,
         max_mpjpe=args.max_mpjpe,
         not_success=args.not_success,
@@ -354,27 +380,44 @@ def refilter_main():
 
     split = meta.get("split", "unknown")
     expert = meta.get("expert_name", "")
-    log_summary(expert or "myo", split, all_results, negatives)
+    log_summary(expert or "myo", split, frames, negatives)
 
-    # Save txt
+    inp = os.path.abspath(args.json_path)
+    json_out = inp
+
     if args.output is None:
-        txt_path = args.json.replace(".json", ".txt")
+        stem = os.path.splitext(inp)[0]
+        neg_path = f"{stem}_negatives.txt"
+        pos_path = f"{stem}_positives.txt"
     else:
-        txt_path = args.output
-    save_txt(negatives, len(all_results), txt_path)
+        neg_path = os.path.abspath(args.output)
+        dire = os.path.dirname(neg_path)
+        base = os.path.basename(neg_path)
+        if base.endswith("_negatives.txt"):
+            pos_path = os.path.join(dire, base.replace("_negatives.txt", "_positives.txt"))
+        else:
+            stem, _ext = os.path.splitext(neg_path)
+            pos_path = f"{stem}_positives.txt"
 
-    # Update JSON meta
+    total = len(frames)
+    save_motion_id_txt(negatives, total, neg_path, "negatives")
+    positives = derive_positives(frames, negatives)
+    save_motion_id_txt(positives, total, pos_path, "positives")
+
+    meta = dict(meta)
     meta.update({
         "mean_mpjpe": args.mean_mpjpe,
         "max_mpjpe": args.max_mpjpe,
         "not_success": args.not_success,
         "negatives_count": len(negatives),
+        "positives_count": len(positives),
+        "total_motions": total,
     })
-    json_path = txt_path.replace(".txt", ".json")
-    save_json(all_results, negatives, meta, json_path)
+    save_eval_json(frames, meta, json_out)
 
-    logger.info(f"  → {txt_path}")
-    logger.info(f"  → {json_path}")
+    logger.info(f"  → {neg_path}")
+    logger.info(f"  → {pos_path}")
+    logger.info(f"  → {json_out}")
 
 
 # ─────────────────────────────────────────────────────────────────────

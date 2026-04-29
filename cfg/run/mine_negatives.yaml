@@ -17,7 +17,7 @@ test:
   not_success: true
 
 # ==================== Output ====================
-output_name: negatives  # base name: {output_dir}/{output_name}_{split}.txt + .json meta
+output_name: eval
 
 # ==================== Parallelism ====================
 num_threads: null     # null = use expert's num_threads

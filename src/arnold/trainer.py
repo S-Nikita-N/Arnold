@@ -1794,6 +1794,21 @@ class ArnoldTrainer:
             for epoch in range(self.epoch, self.max_epochs):
                 self.epoch = epoch
 
+                # Evaluation (valid)
+                if self.eval_frequency > 0 and epoch % self.eval_frequency == 0:
+                    all_eval = self.evaluate()
+                    self.eval_checkpoint(epoch, all_eval)
+
+                # Evaluation (train) — deterministic eval on training data
+                if self.train_eval_frequency > 0 and epoch % self.train_eval_frequency == 0:
+                    train_eval = self.evaluate_train()
+                    if self.use_wandb:
+                        merged = {}
+                        for expert_name, metrics in train_eval.items():
+                            for k, v in metrics.items():
+                                merged[f"{expert_name}/{k}"] = v
+                        self.wandb_logger.log_eval(epoch, merged)
+
                 # Pre-epoch: resample motions (persistent workers handle it)
                 need_resample = epoch > 0 and epoch % self.resampling_interval == 0
                 if self._persistent_state is not None:
@@ -1838,21 +1853,6 @@ class ArnoldTrainer:
                 # Logging
                 if epoch % self.log_frequency == 0:
                     self.log_train(epoch, expert_loggers, all_diagnostics)
-
-                # Evaluation (valid)
-                if self.eval_frequency > 0 and epoch > 0 and epoch % self.eval_frequency == 0:
-                    all_eval = self.evaluate()
-                    self.eval_checkpoint(epoch, all_eval)
-
-                # Evaluation (train) — deterministic eval on training data
-                if self.train_eval_frequency > 0 and epoch > 0 and epoch % self.train_eval_frequency == 0:
-                    train_eval = self.evaluate_train()
-                    if self.use_wandb:
-                        merged = {}
-                        for expert_name, metrics in train_eval.items():
-                            for k, v in metrics.items():
-                                merged[f"{expert_name}/{k}"] = v
-                        self.wandb_logger.log_eval(epoch, merged)
 
                 # Save current checkpoint
                 if epoch > 0 and epoch % self.save_curr_frequency == 0:

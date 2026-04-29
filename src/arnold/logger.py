@@ -62,8 +62,10 @@ class OBCLogger:
         # Сохраняем компоненты reward из info
         if info:
             for k, v in info.items():
-                if isinstance(v, (int, float)):
-                    self.info_dict[k].append(v)
+                if isinstance(v, (bool, np.bool_)):
+                    self.info_dict[k].append(1.0 if v else 0.0)
+                elif isinstance(v, (int, float, np.floating, np.integer)):
+                    self.info_dict[k].append(float(v))
     
     def end_episode(self):
         """Завершает эпизод."""
@@ -170,7 +172,9 @@ class OBCLogger:
     
     def get_log_str(self, epoch: int, expert_name: str) -> str:
         """Возвращает строку для печати."""
-        reward_str = " ".join([f"{np.mean(v):.3f}" for k, v in self.info_dict.items() if v])
+        reward_str = " ".join(
+            [f"{np.mean(v):.3f}" for k, v in self.info_dict.items() if len(v) > 0]
+        )
         
         return (
             f"Ep: {epoch} \t {expert_name} "
