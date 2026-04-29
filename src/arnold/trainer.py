@@ -433,8 +433,8 @@ class ArnoldTrainer:
         """
         Load Arnold LatticePolicy as a frozen teacher on the main process GPU.
 
-        Returns the loaded policy module. Used for batched teacher inference
-        during sampling/eval (centralized on GPU instead of per-worker CPU).
+        MLP structure is inferred from checkpoint weights (action_mean.weight
+        gives latent_dim, net.affine_layers.{i} give layer sizes).
         """
         from arnold.torch_model.policy_lattice import LatticePolicy
 
@@ -446,15 +446,17 @@ class ArnoldTrainer:
         state_dim = wrapper.env.observation_space.shape[0]
         action_dim = wrapper.env.action_space.shape[0]
 
-        # Infer MLP units from checkpoint
         layer_dims = []
         i = 0
-        while f"net.layers.{i}.weight" in policy_state:
-            layer_dims.append(policy_state[f"net.layers.{i}.weight"].shape[0])
-            i += 2
+        while f"net.affine_layers.{i}.weight" in policy_state:
+            layer_dims.append(
+                policy_state[f"net.affine_layers.{i}.weight"].shape[0]
+            )
+            i += 1
         if not layer_dims:
             raise ValueError(
-                f"Cannot infer MLP structure from checkpoint: {checkpoint_path}"
+                f"Cannot infer MLP from {checkpoint_path}: "
+                f"no 'net.affine_layers.*.weight' keys found"
             )
 
         teacher = LatticePolicy(
@@ -462,7 +464,7 @@ class ArnoldTrainer:
             action_dim=action_dim,
             mlp_units=tuple(layer_dims),
         )
-        teacher.load_state_dict(policy_state, strict=False)
+        teacher.load_state_dict(policy_state, strict=True)
         teacher.to(self.device)
         teacher.eval()
         for p in teacher.parameters():
