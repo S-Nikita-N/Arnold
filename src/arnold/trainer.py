@@ -89,6 +89,10 @@ class ExpertContext:
     # Offline BC weight (0 = disabled)
     bc_imitation_weight: float = 0.0
 
+    # Centralized GPU teacher (Arnold LatticePolicy loaded on main process GPU
+    # for batched inference during sampling/eval). None = no centralized teacher.
+    gpu_teacher: Optional[Any] = None
+
     @property
     def use_expert(self) -> bool:
         return self.obc_imitation_weight > 0
@@ -145,14 +149,13 @@ def create_expert_wrapper(
 
     elif expert_type == "myohuman":
         from arnold.experts.myohuman_wrapper import MyoHumanWrapper
-        simple = expert_entry.get("simple", False)
         return MyoHumanWrapper(
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
             device="cpu",
             overrides=expert_overrides,
             mode=mode,
-            simple=simple,
+            simple=expert_entry.get("simple", False),
         )
 
     elif expert_type == "myokin":
@@ -360,6 +363,13 @@ class ArnoldTrainer:
                 loss_scale=loss_scale,
                 muscle_grouping=muscle_grouping,
             )
+
+            teacher_ckpt = entry.get("teacher_checkpoint")
+            # GPU teacher path: only for myohuman (Arnold LatticePolicy distillation).
+            # Myokin uses its own wrapper-side Kinesis MoE teacher (different format).
+            if teacher_ckpt and entry.type == "myohuman":
+                ctx.gpu_teacher = self._load_gpu_teacher(name, wrapper, teacher_ckpt)
+
             self.experts[name] = ctx
 
             # Offline BC datasets
@@ -384,11 +394,15 @@ class ArnoldTrainer:
                 )
                 logger.info(f"  BC: weight={bc_w}")
 
-            if (ctx.use_expert
-                    and hasattr(wrapper, 'has_expert') and not wrapper.has_expert):
-                logger.warning(
-                    f"Expert '{name}': obc_imitation_weight > 0 but expert policy not loaded!"
+            if ctx.use_expert and ctx.gpu_teacher is None:
+                wrapper_has_expert = (
+                    hasattr(wrapper, 'has_expert') and wrapper.has_expert
                 )
+                if not wrapper_has_expert:
+                    logger.warning(
+                        f"Expert '{name}': obc_imitation_weight > 0 but no teacher loaded "
+                        f"(neither GPU teacher_checkpoint nor wrapper-side expert)."
+                    )
 
             logger.info(
                 f"  mode={ctx.training_mode}  "
@@ -412,6 +426,53 @@ class ArnoldTrainer:
             self.best_eval_episode_avg_length[name] = 0.0
             self.best_eval_imitation_loss[name] = float('inf')
             self.best_eval_mpjpe[name] = float('inf')
+
+    def _load_gpu_teacher(
+        self, expert_name: str, wrapper: Any, checkpoint_path: str,
+    ) -> Any:
+        """
+        Load Arnold LatticePolicy as a frozen teacher on the main process GPU.
+
+        Returns the loaded policy module. Used for batched teacher inference
+        during sampling/eval (centralized on GPU instead of per-worker CPU).
+        """
+        from arnold.torch_model.policy_lattice import LatticePolicy
+
+        ckpt = torch.load(
+            checkpoint_path, map_location=self.device, weights_only=True,
+        )
+        policy_state = ckpt["policy"]
+
+        state_dim = wrapper.env.observation_space.shape[0]
+        action_dim = wrapper.env.action_space.shape[0]
+
+        # Infer MLP units from checkpoint
+        layer_dims = []
+        i = 0
+        while f"net.layers.{i}.weight" in policy_state:
+            layer_dims.append(policy_state[f"net.layers.{i}.weight"].shape[0])
+            i += 2
+        if not layer_dims:
+            raise ValueError(
+                f"Cannot infer MLP structure from checkpoint: {checkpoint_path}"
+            )
+
+        teacher = LatticePolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            mlp_units=tuple(layer_dims),
+        )
+        teacher.load_state_dict(policy_state, strict=False)
+        teacher.to(self.device)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+
+        logger.info(
+            f"  GPU teacher [{expert_name}] loaded from {checkpoint_path} "
+            f"(epoch {ckpt.get('epoch', '?')}, mlp={layer_dims})"
+        )
+        return teacher
 
     def setup_policy(self) -> None:
         """Создаёт policy: TransformerPolicy или LatticePolicy."""
@@ -653,8 +714,18 @@ class ArnoldTrainer:
 
                     if ctx.use_expert:
                         with p.section("expert.get_action"):
-                            expert_action = wrapper.get_expert_action(obs)
-                            expert_action_t = torch.from_numpy(expert_action).float()
+                            if ctx.gpu_teacher is not None:
+                                with torch.no_grad():
+                                    t_mean, _, _, _, _ = ctx.gpu_teacher(
+                                        obs_ts.to(self.device),
+                                        obs_sigs, act_sigs,
+                                        expert_name=expert_name,
+                                        return_std=False, return_value=False,
+                                    )
+                                expert_action_t = t_mean.squeeze(0).float().cpu()
+                            else:
+                                expert_action = wrapper.get_expert_action(obs)
+                                expert_action_t = torch.from_numpy(expert_action).float()
                     else:
                         expert_action_t = zero_expert
 
@@ -909,7 +980,9 @@ class ArnoldTrainer:
                     sigs_sent = True
 
                 obs_buf.copy_(obs_ts.squeeze(0))
-                if ctx.use_expert:
+                # Wrapper-side teacher (CPU). Centralized GPU teacher fills the
+                # buffer in the main inference loop instead.
+                if ctx.use_expert and wrapper.has_expert:
                     ea = wrapper.get_expert_action(obs)
                     expert_action_buf.copy_(torch.from_numpy(ea).float())
 
@@ -951,7 +1024,7 @@ class ArnoldTrainer:
 
                         obs_ts, _ = parser.get_observation(torch.device("cpu"))
                         obs_buf.copy_(obs_ts.squeeze(0))
-                        if ctx.use_expert:
+                        if ctx.use_expert and wrapper.has_expert:
                             ea = wrapper.get_expert_action(obs)
                             expert_action_buf.copy_(torch.from_numpy(ea).float())
 
@@ -1264,6 +1337,20 @@ class ArnoldTrainer:
                                             expert_name=expert_name,
                                             deterministic=False,
                                         )
+                            teacher_actions_cpu = None
+                            if ctx.gpu_teacher is not None and ctx.use_expert:
+                                with prof.section("teacher_forward"):
+                                    with torch.autocast(
+                                        device_type=device_type,
+                                        dtype=torch.bfloat16,
+                                        enabled=use_amp,
+                                    ):
+                                        t_mean, _, _, _, _ = ctx.gpu_teacher(
+                                            batch_obs_dev, obs_sigs, act_sigs,
+                                            expert_name=expert_name,
+                                            return_std=False, return_value=False,
+                                        )
+                                    teacher_actions_cpu = t_mean.float().cpu()
                             with prof.section("to_cpu"):
                                 actions_cpu = actions.cpu()
                                 log_probs_cpu = log_probs.cpu()
@@ -1272,10 +1359,13 @@ class ArnoldTrainer:
                         with prof.section("scatter"):
                             zero_ea = torch.zeros(ctx.wrapper.action_dim)
                             for i, wh in enumerate(active_workers):
-                                if ctx.use_expert:
-                                    ea = wh.expert_action_buf.clone()
-                                else:
+                                if not ctx.use_expert:
                                     ea = zero_ea
+                                elif teacher_actions_cpu is not None:
+                                    ea = teacher_actions_cpu[i]
+                                    wh.expert_action_buf.copy_(ea)
+                                else:
+                                    ea = wh.expert_action_buf.clone()
                                 worker_prev[id(wh)] = {
                                     "obs": wh.obs_buf.clone(),
                                     "action": actions_cpu[i],
@@ -2258,8 +2348,16 @@ class ArnoldTrainer:
                     )
 
                     if ctx.use_expert:
-                        expert_action = valid_wrapper.get_expert_action(obs)
-                        expert_action_t = torch.from_numpy(expert_action).float().to(self.device)
+                        if ctx.gpu_teacher is not None:
+                            t_mean, _, _, _, _ = ctx.gpu_teacher(
+                                obs_ts, obs_sigs, act_sigs,
+                                expert_name=expert_name,
+                                return_std=False, return_value=False,
+                            )
+                            expert_action_t = t_mean.squeeze(0).float()
+                        else:
+                            expert_action = valid_wrapper.get_expert_action(obs)
+                            expert_action_t = torch.from_numpy(expert_action).float().to(self.device)
                         im_loss = ((action.squeeze(0) - expert_action_t) ** 2).mean().item()
                         step_imitation_losses.append(im_loss)
 
@@ -2352,7 +2450,9 @@ class ArnoldTrainer:
             env._active_motion_ids = np.array([motion_id])
             return True
 
-        eval_uses_wrapper_expert = ctx.use_expert
+        # Worker fills expert_action_buf only if wrapper has its own teacher
+        # (CPU per-worker). Centralized GPU teacher fills it in main loop.
+        eval_uses_wrapper_expert = ctx.use_expert and wrapper.has_expert
 
         def _reset_and_fill_obs():
             """Reset env, fill shared obs buffer."""
@@ -2578,6 +2678,7 @@ class ArnoldTrainer:
 
                 # Batched GPU inference
                 batch_obs = torch.stack([wh.obs_buf.clone() for wh in active_workers])
+                batch_obs_dev = batch_obs.to(device)
 
                 with torch.autocast(
                     device_type=device_type,
@@ -2585,7 +2686,7 @@ class ArnoldTrainer:
                     enabled=use_amp,
                 ):
                     actions, _, _ = self.policy_module.get_action(
-                        batch_obs.to(device),
+                        batch_obs_dev,
                         obs_sigs, act_sigs,
                         expert_name=expert_name,
                         deterministic=True,
@@ -2594,8 +2695,25 @@ class ArnoldTrainer:
                     )
                 actions_cpu = actions.cpu()
 
+                # Centralized GPU teacher fills expert_action_buf for OBC eval
+                teacher_actions_cpu = None
+                if ctx.gpu_teacher is not None and ctx.use_expert:
+                    with torch.autocast(
+                        device_type=device_type,
+                        dtype=torch.bfloat16,
+                        enabled=use_amp,
+                    ):
+                        t_mean, _, _, _, _ = ctx.gpu_teacher(
+                            batch_obs_dev, obs_sigs, act_sigs,
+                            expert_name=expert_name,
+                            return_std=False, return_value=False,
+                        )
+                    teacher_actions_cpu = t_mean.float().cpu()
+
                 for i, wh in enumerate(active_workers):
                     wh.action_buf.copy_(actions_cpu[i])
+                    if teacher_actions_cpu is not None:
+                        wh.expert_action_buf.copy_(teacher_actions_cpu[i])
                     if ctx.use_expert:
                         # expert_action already in buf from worker
                         pass

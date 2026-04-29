@@ -158,7 +158,7 @@ class MyoHumanWrapper:
             self.actions_low = self._env.action_space.low.copy()
             self.actions_high = self._env.action_space.high.copy()
 
-            # Загружаем эксперта если указан checkpoint
+            # Загружаем эксперта
             if checkpoint_epoch != 0:
                 self._load_expert(checkpoint_epoch)
 
@@ -235,16 +235,10 @@ class MyoHumanWrapper:
         return self._env.forward_motions()
 
     def get_expert_action(self, flat_obs: np.ndarray) -> np.ndarray:
-        """
-        Получить действие эксперта по плоскому obs.
-
-        Raises:
-            RuntimeError: Если эксперт не загружен.
-        """
+        """Получить действие эксперта по плоскому obs (MyoHuman-native policy)."""
         if self._expert_policy is None:
             raise RuntimeError(
-                "Expert policy not loaded. Use checkpoint_epoch != 0 to load expert, "
-                "or set obc_imitation_weight=0 for PPO-only training."
+                "Expert policy not loaded. Use checkpoint_epoch != 0."
             )
 
         with torch.no_grad():
@@ -293,149 +287,6 @@ class MyoHumanWrapper:
         """Пересэмплирует движения из библиотеки."""
         if hasattr(self._env, "sample_motions"):
             self._env.sample_motions()
-
-    # ------------------------------------------------------------------
-    #  Offline BC (Behavioral Cloning) from pre-collected demonstrations
-    # ------------------------------------------------------------------
-
-    def load_bc_datasets(
-        self,
-        dataset_dir: str,
-        batch_size: int = 256,
-        success_only: bool = False,
-        max_mpjpe_threshold: float = None,
-        mean_mpjpe_threshold: float = None,
-    ) -> None:
-        """Load BC datasets from *dataset_dir*.
-
-        Expected files: train.json, train.npz, test.json, test.npz.
-        JSON contains per-motion metrics + per-frame metrics used for filtering.
-        NPZ contains obs, actions, action_mask, motion_ids, frame_idx.
-        """
-        d = Path(dataset_dir)
-        self._bc_batch_size = batch_size
-
-        train_npz = d / "train.npz"
-        train_json = d / "train.json"
-        test_npz = d / "test.npz"
-        test_json = d / "test.json"
-
-        if not train_npz.exists():
-            raise FileNotFoundError(f"BC train dataset not found: {train_npz}")
-        if not train_json.exists():
-            raise FileNotFoundError(f"BC train metadata not found: {train_json}")
-
-        logger.info("Loading BC datasets from %s", d)
-        logger.info("  filters: success_only=%s  max_mpjpe=%s  mean_mpjpe=%s  batch_size=%d",
-                     success_only, max_mpjpe_threshold, mean_mpjpe_threshold, batch_size)
-
-        logger.info("[train]")
-        self._bc_train = self._load_and_filter(
-            train_npz, train_json,
-            success_only, max_mpjpe_threshold, mean_mpjpe_threshold,
-        )
-
-        if test_npz.exists() and test_json.exists():
-            logger.info("[test]")
-            self._bc_test = self._load_and_filter(
-                test_npz, test_json,
-                success_only, max_mpjpe_threshold, mean_mpjpe_threshold,
-            )
-        else:
-            self._bc_test = None
-            logger.info("[test] not found, skipping")
-
-    @staticmethod
-    def _load_and_filter(
-        npz_path: Path,
-        json_path: Path,
-        success_only: bool,
-        max_mpjpe_threshold: float,
-        mean_mpjpe_threshold: float,
-    ) -> dict:
-        """Load npz + json, build per-frame mask, return filtered tensors."""
-        import json as json_mod
-
-        data = np.load(str(npz_path))
-        obs = data["obs"]               # (N, obs_dim)
-        actions = data["actions"]        # (N, act_dim)
-        action_mask = data["action_mask"]  # (act_dim,)
-        motion_ids = data["motion_ids"]  # (N,)
-        frame_idx = data["frame_idx"]    # (N,)
-
-        with open(json_path) as f:
-            meta = json_mod.load(f)
-
-        # Build per-motion lookup: motion_id → result dict
-        by_motion = {r["motion_id"]: r for r in meta["results"]}
-        total_motions = len(by_motion)
-        successful_motions = sum(1 for r in by_motion.values() if r["success"])
-
-        # Per-frame boolean mask + per-reason counters
-        n_total = len(obs)
-        keep = np.ones(n_total, dtype=bool)
-        dropped_success = 0
-        dropped_max_mpjpe = 0
-        dropped_mean_mpjpe = 0
-        dropped_missing = 0
-
-        for i in range(n_total):
-            mid = int(motion_ids[i])
-            fid = int(frame_idx[i])
-            r = by_motion.get(mid)
-            if r is None:
-                keep[i] = False
-                dropped_missing += 1
-                continue
-
-            if success_only and not r["success"]:
-                keep[i] = False
-                dropped_success += 1
-                continue
-
-            fm = r["frame_metrics"]
-            if fid < len(fm):
-                if max_mpjpe_threshold is not None and fm[fid]["max_mpjpe"] > max_mpjpe_threshold:
-                    keep[i] = False
-                    dropped_max_mpjpe += 1
-                    continue
-                if mean_mpjpe_threshold is not None and fm[fid]["mean_mpjpe"] > mean_mpjpe_threshold:
-                    keep[i] = False
-                    dropped_mean_mpjpe += 1
-
-        obs = obs[keep]
-        actions = actions[keep]
-        n_kept = len(obs)
-        kept_motion_ids = set(motion_ids[keep].tolist())
-
-        if n_kept == 0:
-            raise ValueError(
-                f"BC filtering removed all frames from {npz_path} "
-                f"(success_only={success_only}, max_mpjpe={max_mpjpe_threshold}, "
-                f"mean_mpjpe={mean_mpjpe_threshold})"
-            )
-
-        logger.info("BC dataset: %s", npz_path)
-        logger.info("  motions: %d total, %d successful, %d kept after filter",
-                     total_motions, successful_motions, len(kept_motion_ids))
-        logger.info("  frames:  %d / %d kept (%.1f%%)",
-                     n_kept, n_total, 100 * n_kept / n_total)
-        if dropped_success:
-            logger.info("  dropped by success_only:       %d frames", dropped_success)
-        if dropped_max_mpjpe:
-            logger.info("  dropped by max_mpjpe > %.4f:   %d frames",
-                         max_mpjpe_threshold, dropped_max_mpjpe)
-        if dropped_mean_mpjpe:
-            logger.info("  dropped by mean_mpjpe > %.4f:  %d frames",
-                         mean_mpjpe_threshold, dropped_mean_mpjpe)
-        if dropped_missing:
-            logger.info("  dropped (missing metadata):    %d frames", dropped_missing)
-
-        return {
-            "obs": torch.from_numpy(obs).float(),
-            "actions": torch.from_numpy(actions).float(),
-            "action_mask": torch.from_numpy(action_mask).float(),
-        }
 
     def sample_train_bc_batch(
         self, device: torch.device,

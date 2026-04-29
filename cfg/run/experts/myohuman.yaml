@@ -1,6 +1,7 @@
 type: myohuman
 config_path: null
 checkpoint_epoch: 0
+teacher_checkpoint: null  # Path to Arnold checkpoint (.pth) for OBC distillation
 simple: false
 overrides: []       # Hydra overrides for both train and valid envs
 train_overrides: [] # Hydra overrides for train env only, e.g. ["run.motion_ids_file=/path/to/negatives.txt"]
