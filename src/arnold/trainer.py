@@ -238,6 +238,7 @@ class ArnoldTrainer:
         self.output_dir = cfg.run.output_dir
         self.eval_frequency = cfg.run.eval_frequency
         self.train_eval_frequency = cfg.run.train_eval_frequency
+        self.skip_initial_eval = cfg.run.skip_initial_eval
         self.resampling_interval = cfg.run.resampling_interval
         self.finish_episodes = cfg.run.finish_episodes
         self.vectorized_eval = cfg.run.get("vectorized_eval", True)
@@ -1887,12 +1888,20 @@ class ArnoldTrainer:
                 self.epoch = epoch
 
                 # Evaluation (valid)
-                if self.eval_frequency > 0 and epoch % self.eval_frequency == 0:
+                if (
+                    self.eval_frequency > 0
+                    and epoch % self.eval_frequency == 0
+                    and not (self.skip_initial_eval and epoch == 0)
+                ):
                     all_eval = self.evaluate()
                     self.eval_checkpoint(epoch, all_eval)
 
                 # Evaluation (train) — deterministic eval on training data
-                if self.train_eval_frequency > 0 and epoch % self.train_eval_frequency == 0:
+                if (
+                    self.train_eval_frequency > 0
+                    and epoch % self.train_eval_frequency == 0
+                    and not (self.skip_initial_eval and epoch == 0)
+                ):
                     train_eval = self.evaluate_train()
                     if self.use_wandb:
                         merged = {}

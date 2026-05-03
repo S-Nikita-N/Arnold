@@ -14,7 +14,7 @@ transformer:
   num_heads: 4
   num_enc_layers: 6
   num_act_dec_layers: 6
-  num_val_dec_layers: 1
+  num_val_dec_layers: 6
   dropout: 0.0
   detached_value_encoder: false
   action_cov_rank: 16  # 0 = independent (diagonal), >0 = low-rank (Lattice-like)
