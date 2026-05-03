@@ -19,3 +19,4 @@ learning:
   bc_imitation_weight: null
   entropy_weight: null
   load_balance_weight: null
+  mean_penalty_weight: null  # >0 enables penalty mean(relu(|μ|-1)²) on action mean outside [-1,1]

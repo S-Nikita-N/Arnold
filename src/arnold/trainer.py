@@ -89,6 +89,9 @@ class ExpertContext:
     # Offline BC weight (0 = disabled)
     bc_imitation_weight: float = 0.0
 
+    # Penalty for action mean leaving [-1, 1] action box (0 = disabled).
+    mean_penalty_weight: float = 0.0
+
     # Centralized GPU teacher (Arnold LatticePolicy loaded on main process GPU
     # for batched inference during sampling/eval). None = no centralized teacher.
     gpu_teacher: Optional[Any] = None
@@ -329,6 +332,7 @@ class ArnoldTrainer:
             bc_w = learning_cfg.get("bc_imitation_weight") or 0.0
             ent_w = learning_cfg.get("entropy_weight") or 0.0
             lb_w = learning_cfg.get("load_balance_weight") or 0.0
+            mp_w = learning_cfg.get("mean_penalty_weight") or 0.0
             loss_scale = learning_cfg.get("loss_scale") or 1.0
             mbs = learning_cfg.get("min_batch_size")
             n_threads = entry.get("num_threads") or 1
@@ -358,6 +362,7 @@ class ArnoldTrainer:
                 bc_imitation_weight=bc_w,
                 entropy_weight=ent_w,
                 load_balance_weight=lb_w,
+                mean_penalty_weight=mp_w,
                 num_threads=n_threads,
                 min_batch_size=mbs,
                 vec_batch_size=vbs,
@@ -1508,7 +1513,7 @@ class ArnoldTrainer:
 
         # Accumulators per expert
         per_expert_losses: Dict[str, Dict[str, list]] = {
-            n: {"ppo": [], "imitation": [], "imitation_per_sample": [], "value": [], "entropy": [], "sigma": [], "load_balance": [], "bc": []}
+            n: {"ppo": [], "imitation": [], "imitation_per_sample": [], "value": [], "entropy": [], "sigma": [], "load_balance": [], "bc": [], "mean_penalty": []}
             for n in self.experts
         }
         per_expert_diag: Dict[str, Dict[str, list]] = {
@@ -1668,6 +1673,14 @@ class ArnoldTrainer:
                             policy_loss = policy_loss + ctx.load_balance_weight * lb_loss
                             per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
 
+                        # --- Mean penalty: keep pred_mean inside [-1, 1] action box ---
+                        if ctx.mean_penalty_weight > 0:
+                            with prof.section("mean_penalty"):
+                                out_of_box = torch.relu(pred_mean.abs() - 1.0)
+                                mean_penalty = (out_of_box ** 2).mean()
+                            policy_loss = policy_loss + ctx.mean_penalty_weight * mean_penalty
+                            per_expert_losses[expert_name]["mean_penalty"].append(mean_penalty.item())
+
                         # --- Offline BC (masked MSE from pre-collected dataset) ---
                         # BC obs is flat env obs → replicate across history_len
                         # to match LatticePolicy input format.
@@ -1812,6 +1825,7 @@ class ArnoldTrainer:
                 "sigma_loss": float(np.mean(losses["sigma"])) if losses["sigma"] else 0.0,
                 "load_balance_loss": float(np.mean(losses["load_balance"])) if losses["load_balance"] else 0.0,
                 "bc_loss": float(np.mean(losses["bc"])) if losses["bc"] else 0.0,
+                "mean_penalty_loss": float(np.mean(losses["mean_penalty"])) if losses["mean_penalty"] else 0.0,
                 "approx_kl": float(np.mean(diag["approx_kls"])) if diag["approx_kls"] else 0.0,
                 "clip_frac": float(np.mean(diag["clip_fracs"])) if diag["clip_fracs"] else 0.0,
                 "value_clip_frac": float(np.mean(diag["value_clip_fracs"])) if diag["value_clip_fracs"] else 0.0,
