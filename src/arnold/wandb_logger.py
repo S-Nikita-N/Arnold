@@ -103,6 +103,7 @@ class WandbLogger:
             log_dict[f"{expert_name}/loss/imitation"] = obc_logger.imitation_loss
             log_dict[f"{expert_name}/loss/value"] = obc_logger.value_loss
             log_dict[f"{expert_name}/loss/entropy"] = obc_logger.entropy_loss
+            log_dict[f"{expert_name}/loss/mean_penalty"] = obc_logger.mean_penalty_loss
             log_dict[f"{expert_name}/loss/total"] = obc_logger.total_loss
 
             # Timing

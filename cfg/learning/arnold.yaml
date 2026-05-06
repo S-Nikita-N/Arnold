@@ -21,6 +21,9 @@ transformer:
   cov_mode: head  # action_out | head
   min_diag_std: 0.0001
   log_std_init: 0
+  tanh_mean_squash: false
+  tanh_mean_a: 1.2
+  tanh_mean_b: 0.1
   action_granulation: none  # none | anatomical | functional | hybrid
   # Hierarchical decoder (optional, overrides num_act_dec_layers):
   # Types: g2g (group_to_group) | wg (within_group). cross_attn defaults: g2g=true, wg=false.
@@ -72,3 +75,7 @@ lattice:
   fix_std: false
   log_std_init: 0
   min_diag_std: 0.0001
+  # Soft squashing of action mean: μ ← a·tanh(μ) + b·μ.
+  tanh_mean_squash: false
+  tanh_mean_a: 1.2
+  tanh_mean_b: 0.1

@@ -1955,6 +1955,7 @@ class ArnoldTrainer:
                         value_loss=diag["value_loss"],
                         entropy_loss=diag["entropy_loss"],
                         load_balance_loss=diag["load_balance_loss"],
+                        mean_penalty_loss=diag.get("mean_penalty_loss", 0.0),
                     )
                     total_steps_epoch += obc_lg.num_steps
 

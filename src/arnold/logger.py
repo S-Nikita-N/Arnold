@@ -33,6 +33,7 @@ class OBCLogger:
         self.imitation_loss = 0.0
         self.value_loss = 0.0
         self.entropy_loss = 0.0
+        self.mean_penalty_loss = 0.0
 
         # Episode lists
         self.episode_rewards: List[float] = []
@@ -117,6 +118,7 @@ class OBCLogger:
         value_loss: float,
         entropy_loss: float,
         load_balance_loss: float,
+        mean_penalty_loss: float = 0.0,
     ) -> None:
         """Присваивает лоссы, посчитанные в update_params."""
         self.ppo_loss = ppo_loss
@@ -124,7 +126,8 @@ class OBCLogger:
         self.value_loss = value_loss
         self.entropy_loss = entropy_loss
         self.load_balance_loss = load_balance_loss
-    
+        self.mean_penalty_loss = mean_penalty_loss
+
     def reset_losses(self):
         """Сбрасывает losses (между эпохами)."""
         self.ppo_loss = 0.0
@@ -132,6 +135,7 @@ class OBCLogger:
         self.value_loss = 0.0
         self.entropy_loss = 0.0
         self.load_balance_loss = 0.0
+        self.mean_penalty_loss = 0.0
         
     def reset_episodes(self):
         """Сбрасывает episode статистику."""
@@ -184,6 +188,6 @@ class OBCLogger:
             f"R_range ({self.min_reward:.4f}, {self.max_reward:.4f}) "
             f"[{reward_str}] \t "
             f"L_ppo {self.ppo_loss:.4f} L_im {self.imitation_loss:.4f} "
-            f"L_val {self.value_loss:.4f} L_ent {self.entropy_loss:.4f} L_bal {self.load_balance_loss:.4f} \t "
+            f"L_val {self.value_loss:.4f} L_ent {self.entropy_loss:.4f} L_bal {self.load_balance_loss:.4f} L_mp {self.mean_penalty_loss:.4f} \t "
             f"num_s {self.num_steps} eps_len {self.avg_episode_len:.2f}"
         )

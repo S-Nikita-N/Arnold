@@ -58,6 +58,9 @@ class LatticePolicy(nn.Module):
         fix_std: bool = False,
         log_std_init: float = 0.0,
         min_diag_std: float = 1e-4,
+        tanh_mean_squash: bool = False,
+        tanh_mean_a: float = 1.2,
+        tanh_mean_b: float = 0.1,
     ):
         super().__init__()
 
@@ -65,6 +68,11 @@ class LatticePolicy(nn.Module):
         self.action_dim = action_dim
         self.latent_dim = mlp_units[-1]
         self.min_diag_std = min_diag_std
+
+        # Soft mean squashing: μ ← a·tanh(μ) + b·μ
+        self.tanh_mean_squash = tanh_mean_squash
+        self.tanh_mean_a = tanh_mean_a
+        self.tanh_mean_b = tanh_mean_b
 
         # ── Normalizer ────────────────────────────────────────────────
         self.obs_normalizer = SignatureNormalizerModule()
@@ -148,6 +156,11 @@ class LatticePolicy(nn.Module):
         # ── 2. Action head ───────────────────────────────────────────
         with p.section("action_head"):
             action_mean = self.action_mean(latent)
+            if self.tanh_mean_squash:
+                action_mean = (
+                    self.tanh_mean_a * torch.tanh(action_mean)
+                    + self.tanh_mean_b * action_mean
+                )
 
         # ── 3. Covariance ────────────────────────────────────────────
         cov_factor = None

@@ -371,6 +371,9 @@ class TransformerPolicy(nn.Module):
         action_groupings: Optional[Dict[str, MuscleGrouping]] = None,
         action_signatures_by_expert: Optional[Dict[str, List[Tuple[str, ...]]]] = None,
         action_decoder_layers: Optional[List[Dict[str, Any]]] = None,
+        tanh_mean_squash: bool = False,
+        tanh_mean_a: float = 1.2,
+        tanh_mean_b: float = 0.1,
     ):
         """
         Args:
@@ -392,6 +395,11 @@ class TransformerPolicy(nn.Module):
         self.action_cov_rank = action_cov_rank
         self.cov_mode = cov_mode
         self.min_diag_std = min_diag_std
+
+        # Soft mean squashing: μ ← a·tanh(μ) + b·μ
+        self.tanh_mean_squash = tanh_mean_squash
+        self.tanh_mean_a = tanh_mean_a
+        self.tanh_mean_b = tanh_mean_b
 
         if action_cov_rank == 0:
             self.latent_dim = 0
@@ -601,6 +609,10 @@ class TransformerPolicy(nn.Module):
             with p.section("action_decoder"):
                 action_out = self.action_decoder(action_query, encoder_out)
                 mean = self.action_mean_head(action_out).squeeze(-1)
+
+        # ── Soft mean squashing ──────────────────────────────────────
+        if self.tanh_mean_squash:
+            mean = self.tanh_mean_a * torch.tanh(mean) + self.tanh_mean_b * mean
 
         # ── Covariance ───────────────────────────────────────────────
         cov_factor = None
