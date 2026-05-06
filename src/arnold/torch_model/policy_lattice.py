@@ -147,7 +147,6 @@ class LatticePolicy(nn.Module):
         with p.section("normalizer"):
             obs_norm = self.obs_normalizer(obs_signatures, obs_timeseries)
             x = obs_norm[:, :, -1]
-            batch_size = x.shape[0]
 
         # ── 1. Main MLP ─────────────────────────────────────────────
         with p.section("lattice_net"):
@@ -157,10 +156,13 @@ class LatticePolicy(nn.Module):
         with p.section("action_head"):
             action_mean = self.action_mean(latent)
             if self.tanh_mean_squash:
+                self._last_raw_mean = action_mean.detach()
                 action_mean = (
                     self.tanh_mean_a * torch.tanh(action_mean)
                     + self.tanh_mean_b * action_mean
                 )
+            else:
+                self._last_raw_mean = None
 
         # ── 3. Covariance ────────────────────────────────────────────
         cov_factor = None

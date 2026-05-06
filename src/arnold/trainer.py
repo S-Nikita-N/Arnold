@@ -1782,6 +1782,21 @@ class ArnoldTrainer:
                 act_abs_mean = diag_actions.abs().mean().item()
                 act_min = diag_actions.min().item()
                 act_max = diag_actions.max().item()
+
+                # Pre-squash mean (raw, before tanh transformation), if enabled
+                raw_mean_t = getattr(self.policy_module, "_last_raw_mean", None)
+                if raw_mean_t is not None:
+                    raw_act_mean = raw_mean_t.mean().item()
+                    raw_act_std = raw_mean_t.std().item()
+                    raw_act_abs_mean = raw_mean_t.abs().mean().item()
+                    raw_act_min = raw_mean_t.min().item()
+                    raw_act_max = raw_mean_t.max().item()
+                else:
+                    raw_act_mean = act_mean
+                    raw_act_std = act_std
+                    raw_act_abs_mean = act_abs_mean
+                    raw_act_min = act_min
+                    raw_act_max = act_max
                 val_post_mean = diag_values.mean().item() if diag_values is not None else 0.0
                 val_post_std = diag_values.std().item() if diag_values is not None else 0.0
                 latent_std_mean = diag_latent_std.mean().item() if diag_latent_std is not None else 0.0
@@ -1844,6 +1859,11 @@ class ArnoldTrainer:
                 "act_abs_mean": act_abs_mean,
                 "act_min": act_min,
                 "act_max": act_max,
+                "raw_act_mean": raw_act_mean,
+                "raw_act_std": raw_act_std,
+                "raw_act_abs_mean": raw_act_abs_mean,
+                "raw_act_min": raw_act_min,
+                "raw_act_max": raw_act_max,
                 "logstd_mean": logstd_mean,
                 "logstd_min": logstd_min,
                 "logstd_max": logstd_max,
@@ -2096,6 +2116,13 @@ class ArnoldTrainer:
                     f"act_range=[{d.get('act_min', 0):.3f}, {d.get('act_max', 0):.3f}]  "
                     f"logstd={d.get('logstd_mean', 0):.3f} [{d.get('logstd_min', 0):.3f}, {d.get('logstd_max', 0):.3f}]  "
                     f"val_post={d.get('val_post_mean', 0):.3f}±{d.get('val_post_std', 0):.3f}  "
+                )
+                logger.info(
+                    f"  [{expert_name}] Policy out (raw, pre-squash): "
+                    f"act_mean={d.get('raw_act_mean', 0):.4f}  "
+                    f"act_std={d.get('raw_act_std', 0):.4f}  "
+                    f"|act|={d.get('raw_act_abs_mean', 0):.4f}  "
+                    f"act_range=[{d.get('raw_act_min', 0):.3f}, {d.get('raw_act_max', 0):.3f}]"
                 )
                 logger.info(
                     f"  [{expert_name}] Covariance: "

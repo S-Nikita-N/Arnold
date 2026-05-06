@@ -612,7 +612,10 @@ class TransformerPolicy(nn.Module):
 
         # ── Soft mean squashing ──────────────────────────────────────
         if self.tanh_mean_squash:
+            self._last_raw_mean = mean.detach()
             mean = self.tanh_mean_a * torch.tanh(mean) + self.tanh_mean_b * mean
+        else:
+            self._last_raw_mean = None
 
         # ── Covariance ───────────────────────────────────────────────
         cov_factor = None
