@@ -75,7 +75,7 @@ def validate_vectorized(cfg: DictConfig) -> dict:
 
     trainer = ArnoldTrainer(cfg, device=cfg.device)
 
-    mode = run.get("mode", "valid")
+    mode = cfg.run.get("mode", "valid")
     if mode == "train":
         # Swap valid wrappers to train wrappers and put envs into eval mode
         # (same trick as mine_negatives / trainer.evaluate_train).
