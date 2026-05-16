@@ -188,6 +188,8 @@ class GateMoEPolicy(nn.Module):
     #  Action sampling
     # ------------------------------------------------------------------
 
+    _DBG_CALL_NO = 0
+
     def get_action(
         self,
         obs_timeseries: torch.Tensor,
@@ -198,22 +200,31 @@ class GateMoEPolicy(nn.Module):
         return_std: bool = True,
         return_value: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Returns (env_action, store_action, log_prob, value).
-
-          env_action:   (B, action_dim) continuous — то что идёт в среду.
-          store_action: (B,) long — expert_idx, хранится в memory для log_prob.
-          log_prob:     (B, 1) — log P(expert_idx | state) из Categorical.
-          value:        (B, 1) — критик.
-        """
         p = self.profiler
+        GateMoEPolicy._DBG_CALL_NO += 1
+        dbg = GateMoEPolicy._DBG_CALL_NO <= 3
+        if dbg:
+            print(
+                f"[GATE call={GateMoEPolicy._DBG_CALL_NO}] get_action: "
+                f"obs_shape={tuple(obs_timeseries.shape)} device={obs_timeseries.device} "
+                f"dtype={obs_timeseries.dtype} deterministic={deterministic}",
+                flush=True,
+            )
 
+        if dbg:
+            print(f"[GATE call={GateMoEPolicy._DBG_CALL_NO}] -> forward()", flush=True)
         gate_logits, _, _, value, _ = self.forward(
             obs_timeseries, obs_signatures, action_signatures,
             expert_name=expert_name,
             return_std=return_std,
             return_value=return_value,
         )
+        if dbg:
+            print(
+                f"[GATE call={GateMoEPolicy._DBG_CALL_NO}] forward done. "
+                f"gate_logits={tuple(gate_logits.shape)} value={None if value is None else tuple(value.shape)}",
+                flush=True,
+            )
 
         with p.section("dist_build"):
             dist = self.build_action_dist(gate_logits)
@@ -224,9 +235,14 @@ class GateMoEPolicy(nn.Module):
             else:
                 expert_idx = dist.sample()
             log_prob = dist.log_prob(expert_idx).unsqueeze(-1)
+        if dbg:
+            counts = torch.bincount(expert_idx.cpu(), minlength=self.num_experts).tolist()
+            print(f"[GATE call={GateMoEPolicy._DBG_CALL_NO}] sampled idx counts={counts}", flush=True)
 
         # ── Forward через выбранных экспертов ──────────────────────
         with p.section("experts_forward"):
+            if dbg:
+                print(f"[GATE call={GateMoEPolicy._DBG_CALL_NO}] -> _run_selected_experts()", flush=True)
             env_action = self._run_selected_experts(
                 obs_timeseries,
                 obs_signatures,
@@ -234,6 +250,12 @@ class GateMoEPolicy(nn.Module):
                 expert_name,
                 expert_idx,
             )
+            if dbg:
+                print(
+                    f"[GATE call={GateMoEPolicy._DBG_CALL_NO}] _run_selected_experts done. "
+                    f"env_action={tuple(env_action.shape)}",
+                    flush=True,
+                )
 
         return env_action, expert_idx, log_prob, value
 
@@ -257,6 +279,7 @@ class GateMoEPolicy(nn.Module):
             dtype=obs_timeseries.dtype,
         )
 
+        dbg = GateMoEPolicy._DBG_CALL_NO <= 3
         unique_idx = torch.unique(expert_idx)
         for idx_val in unique_idx.tolist():
             mask = expert_idx == idx_val
@@ -266,6 +289,11 @@ class GateMoEPolicy(nn.Module):
             sub_obs_sigs = obs_signatures
             sub_act_sigs = action_signatures
             expert = self.experts[idx_val]
+            if dbg:
+                print(
+                    f"[GATE _run_experts] idx={idx_val} sub_obs={tuple(sub_obs.shape)} -> expert.forward",
+                    flush=True,
+                )
             with torch.no_grad():
                 mean, _, _, _, _ = expert.forward(
                     sub_obs, sub_obs_sigs, sub_act_sigs,
@@ -274,5 +302,7 @@ class GateMoEPolicy(nn.Module):
                     return_value=False,
                 )
             env_action[mask] = mean
+            if dbg:
+                print(f"[GATE _run_experts] idx={idx_val} expert.forward done", flush=True)
 
         return env_action
