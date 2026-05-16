@@ -45,7 +45,6 @@ from arnold.logger import OBCLogger
 from arnold.wandb_logger import WandbLogger
 from arnold.learning_utils import to_test, to_cpu, optimizer_to
 from arnold.profiler import Profiler
-from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
 
 warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
 
@@ -85,9 +84,6 @@ class ExpertContext:
 
     # Action granulation (опционально)
     muscle_grouping: Optional[Any] = None
-
-    # Offline BC weight (0 = disabled)
-    bc_imitation_weight: float = 0.0
 
     # Penalty for action mean leaving [-1, 1] action box (0 = disabled).
     mean_penalty_weight: float = 0.0
@@ -329,7 +325,6 @@ class ArnoldTrainer:
             learning_cfg = entry.get("learning", {})
             ppo_w = learning_cfg.get("ppo_weight") or 0.0
             im_w = learning_cfg.get("obc_imitation_weight") or 0.0
-            bc_w = learning_cfg.get("bc_imitation_weight") or 0.0
             ent_w = learning_cfg.get("entropy_weight") or 0.0
             lb_w = learning_cfg.get("load_balance_weight") or 0.0
             mp_w = learning_cfg.get("mean_penalty_weight") or 0.0
@@ -359,7 +354,6 @@ class ArnoldTrainer:
                 groups=groups,
                 ppo_weight=ppo_w,
                 obc_imitation_weight=im_w,
-                bc_imitation_weight=bc_w,
                 entropy_weight=ent_w,
                 load_balance_weight=lb_w,
                 mean_penalty_weight=mp_w,
@@ -377,28 +371,6 @@ class ArnoldTrainer:
                 ctx.gpu_teacher = self._load_gpu_teacher(name, wrapper, teacher_ckpt)
 
             self.experts[name] = ctx
-
-            # Offline BC datasets
-            bc_cfg = entry.get("bc", {})
-            if bc_w > 0:
-                if self.cfg.learning.policy != "lattice":
-                    raise ValueError(
-                        f"Expert '{name}': bc_imitation_weight > 0 requires policy=lattice, "
-                        f"got policy={self.cfg.learning.policy}"
-                    )
-                bc_dir = bc_cfg.get("dataset_dir")
-                if not bc_dir:
-                    raise ValueError(
-                        f"Expert '{name}': bc_imitation_weight > 0 but bc.dataset_dir is null"
-                    )
-                wrapper.load_bc_datasets(
-                    dataset_dir=bc_dir,
-                    batch_size=bc_cfg.get("batch_size", 256),
-                    success_only=bc_cfg.get("success_only", False),
-                    max_mpjpe_threshold=bc_cfg.get("max_mpjpe_threshold"),
-                    mean_mpjpe_threshold=bc_cfg.get("mean_mpjpe_threshold"),
-                )
-                logger.info(f"  BC: weight={bc_w}")
 
             if ctx.use_expert and ctx.gpu_teacher is None:
                 wrapper_has_expert = (
@@ -492,10 +464,12 @@ class ArnoldTrainer:
             self._setup_lattice_policy()
         elif self.cfg.learning.policy == "moe":
             self._setup_moe_policy()
+        elif self.cfg.learning.policy == "gate_moe":
+            self._setup_gate_moe_policy()
         else:
             raise ValueError(
                 f"Unknown policy: {self.cfg.learning.policy}. "
-                f"Supported: transformer, lattice, moe"
+                f"Supported: transformer, lattice, moe, gate_moe"
             )
 
         self.policy.to(self.device)
@@ -630,6 +604,46 @@ class ArnoldTrainer:
             **moe_cfg,
         )
 
+    def _setup_gate_moe_policy(self) -> None:
+        """Frozen-experts MoE + trainable Categorical gate. Single-expert."""
+        from arnold.torch_model.policy_gate_moe import GateMoEPolicy
+
+        if len(self.experts) > 1:
+            raise ValueError(
+                f"gate_moe policy supports only one expert, "
+                f"now: {list(self.experts.keys())}"
+            )
+
+        ctx = next(iter(self.experts.values()))
+        state_dim = ctx.parser.n_obs_elements
+        action_dim = ctx.wrapper.action_dim
+
+        gate_cfg = OmegaConf.to_container(self.cfg.learning.gate_moe, resolve=True)
+        expert_ckpts = list(gate_cfg.get("expert_checkpoints", []) or [])
+        if not expert_ckpts:
+            raise ValueError(
+                "gate_moe.expert_checkpoints is empty. "
+                "Pass via CLI: 'learning.gate_moe.expert_checkpoints=[path1,path2,...]'"
+            )
+
+        logger.info(
+            f"GateMoE setup:\n"
+            f"  state_dim={state_dim}  action_dim={action_dim}\n"
+            f"  num_experts={len(expert_ckpts)}\n"
+            f"  gate_units={gate_cfg.get('gate_units')}  "
+            f"activation={gate_cfg.get('gate_activation')}"
+        )
+        for i, ckpt in enumerate(expert_ckpts):
+            logger.info(f"  expert {i}: {ckpt}")
+
+        self.policy = GateMoEPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            expert_checkpoints=expert_ckpts,
+            gate_units=tuple(gate_cfg.get("gate_units", (1024, 512, 256))),
+            gate_activation=gate_cfg.get("gate_activation", "silu"),
+        )
+
     def setup_optimizer(self) -> None:
         self.policy_optimizer = torch.optim.AdamW(
             self.policy_module.policy_parameters(),
@@ -714,7 +728,7 @@ class ArnoldTrainer:
 
                     with p.section("policy.forward"):
                         with torch.no_grad():
-                            student_action, log_prob, value = self.policy_module.get_action(
+                            env_action, policy_action, log_prob, value = self.policy_module.get_action(
                                 obs_ts, obs_sigs, act_sigs,
                                 expert_name=expert_name,
                                 deterministic=False,
@@ -737,16 +751,16 @@ class ArnoldTrainer:
                     else:
                         expert_action_t = zero_expert
 
-                    student_action_np = student_action.squeeze(0).cpu().numpy()
+                    env_action_np = env_action.squeeze(0).cpu().numpy()
                     with p.section("env.step"):
-                        next_obs, reward, terminated, truncated, info = wrapper.step(student_action_np)
+                        next_obs, reward, terminated, truncated, info = wrapper.step(env_action_np)
                     done = terminated or truncated
 
                     with p.section("memory.append"):
                         memory.states.append(obs_ts.squeeze(0).cpu())
                         memory.obs_signatures.append(obs_sigs)
                         memory.action_signatures.append(act_sigs)
-                        memory.student_actions.append(student_action.squeeze(0).cpu())
+                        memory.policy_actions.append(policy_action.squeeze(0).cpu())
                         memory.expert_actions.append(expert_action_t.cpu())
                         memory.rewards.append(reward)
                         memory.values.append(value.squeeze(0).cpu())
@@ -1281,7 +1295,7 @@ class ArnoldTrainer:
                                 mem.states.append(prev["obs"])
                                 mem.obs_signatures.append(obs_sigs)
                                 mem.action_signatures.append(act_sigs)
-                                mem.student_actions.append(prev["action"])
+                                mem.policy_actions.append(prev["action"])
                                 mem.expert_actions.append(prev["expert_action"])
                                 mem.rewards.append(wh.reward_val.value)
                                 mem.values.append(prev["value"])
@@ -1338,13 +1352,12 @@ class ArnoldTrainer:
                                     dtype=torch.bfloat16,
                                     enabled=use_amp,
                                 ):
-                                    actions, log_probs, values = \
-                                        self.policy_module.get_action(
-                                            batch_obs_dev,
-                                            obs_sigs, act_sigs,
-                                            expert_name=expert_name,
-                                            deterministic=False,
-                                        )
+                                    env_actions, policy_actions, log_probs, values = self.policy_module.get_action(
+                                        batch_obs_dev,
+                                        obs_sigs, act_sigs,
+                                        expert_name=expert_name,
+                                        deterministic=False,
+                                    )
                             teacher_actions_cpu = None
                             if ctx.gpu_teacher is not None and ctx.use_expert:
                                 with prof.section("teacher_forward"):
@@ -1360,7 +1373,8 @@ class ArnoldTrainer:
                                         )
                                     teacher_actions_cpu = t_mean.float().cpu()
                             with prof.section("to_cpu"):
-                                actions_cpu = actions.cpu()
+                                env_actions_cpu = env_actions.float().cpu()
+                                policy_actions_cpu = policy_actions.cpu()
                                 log_probs_cpu = log_probs.cpu()
                                 values_cpu = values.cpu()
 
@@ -1376,12 +1390,12 @@ class ArnoldTrainer:
                                     ea = wh.expert_action_buf.clone()
                                 worker_prev[id(wh)] = {
                                     "obs": wh.obs_buf.clone(),
-                                    "action": actions_cpu[i],
+                                    "action": policy_actions_cpu[i],
                                     "log_prob": log_probs_cpu[i],
                                     "value": values_cpu[i],
                                     "expert_action": ea,
                                 }
-                                wh.action_buf.copy_(actions_cpu[i])
+                                wh.action_buf.copy_(env_actions_cpu[i])
 
                 has_prev = True
 
@@ -1500,7 +1514,7 @@ class ArnoldTrainer:
             expert_data[expert_name] = {
                 "ctx": ctx,
                 "states": batch.states.to(self.device),
-                "actions": batch.student_actions.to(self.device),
+                "actions": batch.policy_actions.to(self.device),
                 "returns": batch.returns.to(self.device),
                 "advantages": batch.advantages.to(self.device),
                 "fixed_log_probs": batch.log_probs.to(self.device),
@@ -1513,7 +1527,7 @@ class ArnoldTrainer:
 
         # Accumulators per expert
         per_expert_losses: Dict[str, Dict[str, list]] = {
-            n: {"ppo": [], "imitation": [], "imitation_per_sample": [], "value": [], "entropy": [], "sigma": [], "load_balance": [], "bc": [], "mean_penalty": []}
+            n: {"ppo": [], "imitation": [], "imitation_per_sample": [], "value": [], "entropy": [], "sigma": [], "load_balance": [], "mean_penalty": []}
             for n in self.experts
         }
         per_expert_diag: Dict[str, Dict[str, list]] = {
@@ -1608,7 +1622,7 @@ class ArnoldTrainer:
                         # --- PPO ---
                         if ctx.ppo_weight > 0:
                             with prof.section("compute_log_prob"):
-                                new_log_probs = safe_lrmvn_log_prob(dist, mini_actions.float()).unsqueeze(-1)
+                                new_log_probs = self.policy_module.dist_log_prob(dist, mini_actions)
                             with prof.section("ppo_loss"):
                                 log_ratio = new_log_probs - mini_fixed_lp
                                 ratio = torch.exp(log_ratio)
@@ -1628,7 +1642,11 @@ class ArnoldTrainer:
                                 per_expert_diag[expert_name]["approx_kls"].append(approx_kl)
 
                         # --- OBC Imitation ---
-                        if ctx.use_expert and ctx.obc_imitation_weight > 0:
+                        # Skipped for gate_moe: pred_mean is gate logits, not action mean.
+                        if (
+                            ctx.use_expert and ctx.obc_imitation_weight > 0
+                            and self.cfg.learning.policy != "gate_moe"
+                        ):
                             with prof.section("imitation_loss"):
                                 mini_expert = ed["expert_actions"][batch_indices]
                                 per_sample = ((pred_mean - mini_expert) ** 2).mean(dim=1)
@@ -1662,7 +1680,7 @@ class ArnoldTrainer:
                         # --- Entropy ---
                         if ctx.entropy_weight > 0:
                             with prof.section("entropy"):
-                                entropy = dist.entropy().mean()
+                                entropy = self.policy_module.dist_entropy(dist)
                             entropy_loss = -entropy
                             policy_loss = policy_loss + ctx.entropy_weight * entropy_loss
                             per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
@@ -1674,39 +1692,16 @@ class ArnoldTrainer:
                             per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
 
                         # --- Mean penalty: keep pred_mean inside [-1, 1] action box ---
-                        if ctx.mean_penalty_weight > 0:
+                        # Skipped for gate_moe: pred_mean is gate logits, not action mean.
+                        if (
+                            ctx.mean_penalty_weight > 0
+                            and self.cfg.learning.policy != "gate_moe"
+                        ):
                             with prof.section("mean_penalty"):
                                 out_of_box = torch.relu(pred_mean.abs() - 1.0)
                                 mean_penalty = (out_of_box ** 2).mean()
                             policy_loss = policy_loss + ctx.mean_penalty_weight * mean_penalty
                             per_expert_losses[expert_name]["mean_penalty"].append(mean_penalty.item())
-
-                        # --- Offline BC (masked MSE from pre-collected dataset) ---
-                        # BC obs is flat env obs → replicate across history_len
-                        # to match LatticePolicy input format.
-                        if ctx.bc_imitation_weight > 0:
-                            with prof.section("bc_loss"):
-                                bc_obs_flat, bc_target = ctx.wrapper.sample_train_bc_batch(
-                                    self.device,
-                                )
-                                # (B, obs_dim) → (B, obs_dim, history_len)
-                                bc_obs = bc_obs_flat.unsqueeze(-1).expand(
-                                    -1, -1, self.history_len,
-                                )
-                                bc_pred_mean, _, _ = self.policy_module.get_action(
-                                    bc_obs,
-                                    ed["obs_signatures"],
-                                    ed["action_signatures"],
-                                    expert_name=expert_name,
-                                    deterministic=True,
-                                    return_std=False,
-                                    return_value=False,
-                                )
-                                bc_loss = ctx.wrapper.compute_bc_loss(
-                                    bc_pred_mean, bc_target, self.device,
-                                )
-                            policy_loss = policy_loss + ctx.bc_imitation_weight * bc_loss
-                            per_expert_losses[expert_name]["bc"].append(bc_loss.item())
 
                         # Apply expert loss scale and accumulation scaling
                         scale = ctx.loss_scale / self.grad_accum_steps
@@ -1774,35 +1769,27 @@ class ArnoldTrainer:
                 )
                 diag_actions, diag_cov_factor, diag_diag_std, diag_values, diag_latent_std = diag_out[:5]
 
-                logstd_mean = diag_diag_std.log().mean().item()
-                logstd_min = diag_diag_std.log().min().item()
-                logstd_max = diag_diag_std.log().max().item()
+                if diag_diag_std is not None:
+                    logstd_mean = diag_diag_std.log().mean().item()
+                    logstd_min = diag_diag_std.log().min().item()
+                    logstd_max = diag_diag_std.log().max().item()
+                else:
+                    logstd_mean = logstd_min = logstd_max = 0.0
+                    
                 act_mean = diag_actions.mean().item()
                 act_std = diag_actions.std().item()
                 act_abs_mean = diag_actions.abs().mean().item()
                 act_min = diag_actions.min().item()
                 act_max = diag_actions.max().item()
-
-                # Pre-squash mean (raw, before tanh transformation), if enabled
-                raw_mean_t = getattr(self.policy_module, "_last_raw_mean", None)
-                if raw_mean_t is not None:
-                    raw_act_mean = raw_mean_t.mean().item()
-                    raw_act_std = raw_mean_t.std().item()
-                    raw_act_abs_mean = raw_mean_t.abs().mean().item()
-                    raw_act_min = raw_mean_t.min().item()
-                    raw_act_max = raw_mean_t.max().item()
-                else:
-                    raw_act_mean = act_mean
-                    raw_act_std = act_std
-                    raw_act_abs_mean = act_abs_mean
-                    raw_act_min = act_min
-                    raw_act_max = act_max
                 val_post_mean = diag_values.mean().item() if diag_values is not None else 0.0
                 val_post_std = diag_values.std().item() if diag_values is not None else 0.0
                 latent_std_mean = diag_latent_std.mean().item() if diag_latent_std is not None else 0.0
                 latent_std_min = diag_latent_std.min().item() if diag_latent_std is not None else 0.0
                 latent_std_max = diag_latent_std.max().item() if diag_latent_std is not None else 0.0
 
+                cov_factor_norm = 0.0
+                lr_fraction = 0.0
+                cov_factor_abs_max = 0.0
                 if diag_cov_factor is not None:
                     lr_var = diag_cov_factor.pow(2).sum(dim=-1).mean().item()
                     diag_var = diag_diag_std.pow(2).mean().item()
@@ -1839,7 +1826,6 @@ class ArnoldTrainer:
                 "entropy_loss": float(np.mean(losses["entropy"])) if losses["entropy"] else 0.0,
                 "sigma_loss": float(np.mean(losses["sigma"])) if losses["sigma"] else 0.0,
                 "load_balance_loss": float(np.mean(losses["load_balance"])) if losses["load_balance"] else 0.0,
-                "bc_loss": float(np.mean(losses["bc"])) if losses["bc"] else 0.0,
                 "mean_penalty_loss": float(np.mean(losses["mean_penalty"])) if losses["mean_penalty"] else 0.0,
                 "approx_kl": float(np.mean(diag["approx_kls"])) if diag["approx_kls"] else 0.0,
                 "clip_frac": float(np.mean(diag["clip_fracs"])) if diag["clip_fracs"] else 0.0,
@@ -1859,11 +1845,6 @@ class ArnoldTrainer:
                 "act_abs_mean": act_abs_mean,
                 "act_min": act_min,
                 "act_max": act_max,
-                "raw_act_mean": raw_act_mean,
-                "raw_act_std": raw_act_std,
-                "raw_act_abs_mean": raw_act_abs_mean,
-                "raw_act_min": raw_act_min,
-                "raw_act_max": raw_act_max,
                 "logstd_mean": logstd_mean,
                 "logstd_min": logstd_min,
                 "logstd_max": logstd_max,
@@ -2069,7 +2050,6 @@ class ArnoldTrainer:
             logger.info(
                 f"  {expert_name}: mode={ctx.training_mode.upper()}  "
                 f"ppo={ctx.ppo_weight}  obc_im={ctx.obc_imitation_weight}  "
-                f"bc_im={ctx.bc_imitation_weight}  "
                 f"ent={ctx.entropy_weight}  "
                 f"scale={ctx.loss_scale}"
             )
@@ -2118,13 +2098,6 @@ class ArnoldTrainer:
                     f"val_post={d.get('val_post_mean', 0):.3f}±{d.get('val_post_std', 0):.3f}  "
                 )
                 logger.info(
-                    f"  [{expert_name}] Policy out (raw, pre-squash): "
-                    f"act_mean={d.get('raw_act_mean', 0):.4f}  "
-                    f"act_std={d.get('raw_act_std', 0):.4f}  "
-                    f"|act|={d.get('raw_act_abs_mean', 0):.4f}  "
-                    f"act_range=[{d.get('raw_act_min', 0):.3f}, {d.get('raw_act_max', 0):.3f}]"
-                )
-                logger.info(
                     f"  [{expert_name}] Covariance: "
                     f"sigma_loss={d.get('sigma_loss', 0):.4f}  "
                     f"latent_std={d.get('latent_std_mean', 0):.4f} [{d.get('latent_std_min', 0):.4f}, {d.get('latent_std_max', 0):.4f}]  "
@@ -2142,14 +2115,6 @@ class ArnoldTrainer:
                         f"im_contrib={ctx.obc_imitation_weight * l_im:.4f}"
                     )
 
-                # BC diagnostics
-                l_bc = d.get('bc_loss', 0)
-                if l_bc > 0:
-                    logger.info(
-                        f"  [{expert_name}] BC: "
-                        f"train_loss={l_bc:.4f}  "
-                        f"bc_contrib={ctx.bc_imitation_weight * l_bc:.4f}"
-                    )
                 if "gate_entropy" in d:
                     n_experts = self.policy_module.num_experts if hasattr(self.policy_module, 'num_experts') else 0
                     fracs = " ".join(f"{d.get(f'gate_frac_{i}', 0):.3f}" for i in range(n_experts))
@@ -2247,29 +2212,6 @@ class ArnoldTrainer:
                 all_eval[expert_name] = self.evaluate_expert(
                     expert_name, ctx, valid_wrapper,
                 )
-
-            # BC test loss
-            if ctx.bc_imitation_weight > 0 and hasattr(ctx.wrapper, '_bc_test') and ctx.wrapper._bc_test is not None:
-                bc_test_losses = []
-                with torch.no_grad():
-                    for t_obs, t_act in ctx.wrapper.iter_test_bc_batches(
-                        self.batch_size, self.device,
-                    ):
-                        t_obs_ts = t_obs.unsqueeze(-1).expand(-1, -1, self.history_len)
-                        t_pred, _, _ = self.policy_module.get_action(
-                            t_obs_ts,
-                            ctx.parser.obs_signatures,
-                            ctx.action_parser.action_signatures,
-                            expert_name=expert_name,
-                            deterministic=True,
-                            return_std=False,
-                            return_value=False,
-                        )
-                        bl = ctx.wrapper.compute_bc_loss(t_pred, t_act, self.device)
-                        bc_test_losses.append(bl.item())
-                bc_test_loss = float(np.mean(bc_test_losses))
-                all_eval[expert_name]["eval/bc_test_loss"] = bc_test_loss
-                logger.info(f"  [{expert_name}] BC test_loss={bc_test_loss:.4f}")
 
         return all_eval
 
@@ -2393,7 +2335,7 @@ class ArnoldTrainer:
                 act_sigs = valid_action_parser.action_signatures
 
                 with torch.no_grad():
-                    action, _, _ = self.policy_module.get_action(
+                    action, _, _, _ = self.policy_module.get_action(
                         obs_ts, obs_sigs, act_sigs,
                         expert_name=expert_name,
                         deterministic=True,
@@ -2738,7 +2680,7 @@ class ArnoldTrainer:
                     dtype=torch.bfloat16,
                     enabled=use_amp,
                 ):
-                    actions, _, _ = self.policy_module.get_action(
+                    actions, _, _, _ = self.policy_module.get_action(
                         batch_obs_dev,
                         obs_sigs, act_sigs,
                         expert_name=expert_name,

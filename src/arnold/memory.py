@@ -13,7 +13,7 @@ class OBCMemory:
     states: List[torch.Tensor] = field(default_factory=list)       # [n_obs, history_len]
     obs_signatures: List[List[Tuple[str, ...]]] = field(default_factory=list)
     action_signatures: List[List[Tuple[str, ...]]] = field(default_factory=list)
-    student_actions: List[torch.Tensor] = field(default_factory=list)
+    policy_actions: List[torch.Tensor] = field(default_factory=list)
     expert_actions: List[torch.Tensor] = field(default_factory=list)
     rewards: List[float] = field(default_factory=list)
     values: List[torch.Tensor] = field(default_factory=list)
@@ -24,7 +24,7 @@ class OBCMemory:
         self.states.clear()
         self.obs_signatures.clear()
         self.action_signatures.clear()
-        self.student_actions.clear()
+        self.policy_actions.clear()
         self.expert_actions.clear()
         self.rewards.clear()
         self.values.clear()
@@ -36,7 +36,7 @@ class OBCMemory:
         self.states.extend(other.states)
         self.obs_signatures.extend(other.obs_signatures)
         self.action_signatures.extend(other.action_signatures)
-        self.student_actions.extend(other.student_actions)
+        self.policy_actions.extend(other.policy_actions)
         self.expert_actions.extend(other.expert_actions)
         self.rewards.extend(other.rewards)
         self.values.extend(other.values)
@@ -56,7 +56,7 @@ class OBCMemory:
         return {
             "n": len(self.states),
             "states": torch.stack(self.states, dim=0),
-            "student_actions": torch.stack(self.student_actions, dim=0),
+            "policy_actions": torch.stack(self.policy_actions, dim=0),
             "expert_actions": torch.stack(self.expert_actions, dim=0),
             "values": torch.stack(self.values, dim=0),
             "log_probs": torch.stack(self.log_probs, dim=0),
@@ -73,7 +73,7 @@ class OBCMemory:
             return OBCMemory()
         m = OBCMemory()
         m.states = list(d["states"].unbind(0))
-        m.student_actions = list(d["student_actions"].unbind(0))
+        m.policy_actions = list(d["policy_actions"].unbind(0))
         m.expert_actions = list(d["expert_actions"].unbind(0))
         m.values = list(d["values"].unbind(0))
         m.log_probs = list(d["log_probs"].unbind(0))
@@ -106,7 +106,7 @@ class OBCMemory:
 
         # Stack tensors
         states = torch.stack(self.states, dim=0)
-        student_actions = torch.stack(self.student_actions, dim=0)
+        policy_actions = torch.stack(self.policy_actions, dim=0)
         expert_actions = torch.stack(self.expert_actions, dim=0)
         rewards = torch.tensor(self.rewards, dtype=torch.float32)
         values = torch.stack(self.values, dim=0)
@@ -141,7 +141,7 @@ class OBCMemory:
 
         if device is not None:
             states = states.to(device)
-            student_actions = student_actions.to(device)
+            policy_actions = policy_actions.to(device)
             expert_actions = expert_actions.to(device)
             rewards = rewards.to(device)
             values = values.to(device)
@@ -154,7 +154,7 @@ class OBCMemory:
             states=states,
             obs_signatures=obs_signatures,
             action_signatures=action_signatures,
-            student_actions=student_actions,
+            policy_actions=policy_actions,
             expert_actions=expert_actions,
             rewards=rewards,
             values=values,
@@ -171,7 +171,7 @@ class OBCBatch:
     states: torch.Tensor           # [batch, n_obs, history_len]
     obs_signatures: List[Tuple[str, ...]]
     action_signatures: List[Tuple[str, ...]]
-    student_actions: torch.Tensor  # [batch, n_actions]
+    policy_actions: torch.Tensor  # [batch, n_actions]
     expert_actions: torch.Tensor   # [batch, n_actions]
     rewards: torch.Tensor          # [batch]
     values: torch.Tensor           # [batch, 1]

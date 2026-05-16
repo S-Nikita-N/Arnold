@@ -496,7 +496,8 @@ class MoELatticePolicy(nn.Module):
                 action = dist.rsample()
                 log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
 
-        return action, log_prob, value
+        # env_action and store_action coincide for continuous-action policies.
+        return action, action, log_prob, value
 
     # ------------------------------------------------------------------
     #  Distribution helpers
@@ -525,3 +526,10 @@ class MoELatticePolicy(nn.Module):
                     cov_factor=cov_factor_f,
                     cov_diag=cov_diag,
                 )
+
+    # Generic distribution interface used by trainer (polymorphic across policies).
+    def dist_log_prob(self, dist, actions: torch.Tensor) -> torch.Tensor:
+        return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)
+
+    def dist_entropy(self, dist) -> torch.Tensor:
+        return dist.entropy().mean()

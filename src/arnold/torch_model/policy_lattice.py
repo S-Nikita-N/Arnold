@@ -58,9 +58,6 @@ class LatticePolicy(nn.Module):
         fix_std: bool = False,
         log_std_init: float = 0.0,
         min_diag_std: float = 1e-4,
-        tanh_mean_squash: bool = False,
-        tanh_mean_a: float = 1.2,
-        tanh_mean_b: float = 0.1,
     ):
         super().__init__()
 
@@ -68,11 +65,6 @@ class LatticePolicy(nn.Module):
         self.action_dim = action_dim
         self.latent_dim = mlp_units[-1]
         self.min_diag_std = min_diag_std
-
-        # Soft mean squashing: μ ← a·tanh(μ) + b·μ
-        self.tanh_mean_squash = tanh_mean_squash
-        self.tanh_mean_a = tanh_mean_a
-        self.tanh_mean_b = tanh_mean_b
 
         # ── Normalizer ────────────────────────────────────────────────
         self.obs_normalizer = SignatureNormalizerModule()
@@ -155,14 +147,6 @@ class LatticePolicy(nn.Module):
         # ── 2. Action head ───────────────────────────────────────────
         with p.section("action_head"):
             action_mean = self.action_mean(latent)
-            if self.tanh_mean_squash:
-                self._last_raw_mean = action_mean.detach()
-                action_mean = (
-                    self.tanh_mean_a * torch.tanh(action_mean)
-                    + self.tanh_mean_b * action_mean
-                )
-            else:
-                self._last_raw_mean = None
 
         # ── 3. Covariance ────────────────────────────────────────────
         cov_factor = None
@@ -219,7 +203,8 @@ class LatticePolicy(nn.Module):
                 action = dist.rsample()
                 log_prob = safe_lrmvn_log_prob(dist, action).unsqueeze(-1)
 
-        return action, log_prob, value
+        # env_action and store_action coincide for continuous-action policies.
+        return action, action, log_prob, value
 
     # ------------------------------------------------------------------
     #  Distribution helpers
@@ -256,6 +241,15 @@ class LatticePolicy(nn.Module):
         diag_std: torch.Tensor,
     ) -> torch.Tensor:
         dist = self.build_action_dist(mean, cov_factor, diag_std)
+        return dist.entropy().mean()
+
+    # Generic distribution interface used by trainer (polymorphic across policies).
+    def dist_log_prob(self, dist, actions: torch.Tensor) -> torch.Tensor:
+        """Log-prob of actions under dist; returns shape [B, 1]."""
+        return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)
+
+    def dist_entropy(self, dist) -> torch.Tensor:
+        """Mean entropy of dist over the batch."""
         return dist.entropy().mean()
 
     def _compute_log_prob(

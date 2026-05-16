@@ -287,36 +287,3 @@ class MyoHumanWrapper:
         """Пересэмплирует движения из библиотеки."""
         if hasattr(self._env, "sample_motions"):
             self._env.sample_motions()
-
-    def sample_train_bc_batch(
-        self, device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample a random batch from the train BC dataset.
-
-        Returns (obs, actions) tensors on *device*.
-        """
-        ds = self._bc_train
-        n = ds["obs"].shape[0]
-        idx = torch.randint(n, (self._bc_batch_size,))
-        return ds["obs"][idx].to(device), ds["actions"][idx].to(device)
-
-    def iter_test_bc_batches(
-        self, batch_size: int, device: torch.device,
-    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        """Yield (obs, actions) batches over the full test BC dataset."""
-        ds = self._bc_test
-        n = ds["obs"].shape[0]
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            yield (
-                ds["obs"][start:end].to(device),
-                ds["actions"][start:end].to(device),
-            )
-
-    def compute_bc_loss(
-        self, pred: torch.Tensor, target: torch.Tensor, device: torch.device,
-    ) -> torch.Tensor:
-        """Masked MSE: only legs/back actuators, arms excluded."""
-        mask = self._bc_train["action_mask"].to(device)
-        diff = (pred - target) ** 2
-        return (diff * mask).sum(dim=1).mean() / mask.sum()
