@@ -60,20 +60,18 @@ def validate_vectorized(cfg: DictConfig) -> dict:
     """
     Vectorized validation: создаёт ArnoldTrainer (он загружает чекпоинт
     и поднимает valid_experts) и вызывает trainer._evaluate_expert_vectorized.
+
+    Дефолты trainer-полей лежат в cfg/run/validate.yaml.
     """
+    from omegaconf import OmegaConf
     from arnold.trainer import ArnoldTrainer
 
-    run = cfg.run
-
-    # ArnoldTrainer ожидает cfg.resume_checkpoint и cfg.run.eval_frequency > 0,
-    # чтобы создать valid_experts. Подменяем эти ключи под нужды validate.
-    cfg.resume_checkpoint = str(run.checkpoint)
+    OmegaConf.set_struct(cfg, False)
+    cfg.resume_checkpoint = str(cfg.run.checkpoint)
     cfg.use_wandb = False
     cfg.no_log = True
-    if cfg.run.eval_frequency <= 0:
-        cfg.run.eval_frequency = 1
-    # Disable train-eval to avoid swapping wrappers under us.
-    cfg.run.train_eval_frequency = 0
+    if "exp_name" not in cfg:
+        cfg.exp_name = "validate_run"
 
     trainer = ArnoldTrainer(cfg, device=cfg.device)
 

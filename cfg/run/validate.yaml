@@ -16,6 +16,22 @@ num_threads: 1
 #       "train" = train config (random_start, heading randomization)
 mode: valid
 experts: {}
+
 # ==================== Performance ====================
 # При true: не считать std head и value decoder в get_action (быстрее при eval)
 fast_eval: true
+
+# ==================== ArnoldTrainer defaults (нужны для headless vectorized режима) ====================
+# В headless режиме validate_policy создаёт ArnoldTrainer, который ожидает эти поля.
+# Меняем большие числа на huge — чтобы периодические события (save, log, resample)
+# никогда не сработали в течение валидации.
+save_frequency: 1000000000
+save_curr_frequency: 1000000000
+log_frequency: 1000000000
+output_dir: /tmp/arnold_validate
+eval_frequency: 1            # > 0 чтобы создались valid_experts
+train_eval_frequency: 0       # 0 = не делать train eval
+skip_initial_eval: true
+resampling_interval: 1000000000
+finish_episodes: false
+vectorized_eval: true
