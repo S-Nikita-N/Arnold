@@ -228,8 +228,11 @@ class GateMoEPolicy(nn.Module):
         # ── Forward через выбранных экспертов ──────────────────────
         with p.section("experts_forward"):
             env_action = self._run_selected_experts(
-                obs_timeseries, obs_signatures, action_signatures,
-                expert_name, expert_idx,
+                obs_timeseries,
+                obs_signatures,
+                action_signatures,
+                expert_name,
+                expert_idx,
             )
 
         return env_action, expert_idx, log_prob, value
