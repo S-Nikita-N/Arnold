@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from arnold.torch_model.mlp import MLP
@@ -183,6 +184,35 @@ class GateMoEPolicy(nn.Module):
 
     def dist_entropy(self, dist: Categorical) -> torch.Tensor:
         return dist.entropy().mean()
+
+    @torch.no_grad()
+    def get_gate_stats(self, x: torch.Tensor) -> dict:
+        """
+        Per-expert routing fractions (argmax) и средние softmax-вероятности по батчу.
+
+        Args:
+            x: (B, state_dim) — нормализованный последний timestep obs.
+
+        Returns:
+            routing_fracs: (N,) — доля сэмплов, где аргмакс == i (детерм. выбор)
+            mean_probs:    (N,) — среднее значение softmax(gate(x))[:, i]
+            gate_entropy:  скаляр — средняя энтропия Categorical(softmax(gate(x)))
+            balance_entropy: скаляр — энтропия среднего распределения (uniform → log N)
+        """
+        gate_logits = self.gate_head(self.gate_net(x))
+        gate_probs = F.softmax(gate_logits, dim=-1)               # [B, N]
+        argmax_idx = gate_probs.argmax(dim=-1)                    # [B]
+        one_hot = F.one_hot(argmax_idx, self.num_experts).float()  # [B, N]
+        routing_fracs = one_hot.mean(dim=0)                       # [N]
+        mean_probs = gate_probs.mean(dim=0)                       # [N]
+        gate_entropy = -(gate_probs * (gate_probs + 1e-8).log()).sum(dim=-1).mean()
+        balance_entropy = -(mean_probs * (mean_probs + 1e-8).log()).sum()
+        return {
+            "routing_fracs": routing_fracs.detach(),
+            "mean_probs": mean_probs.detach(),
+            "gate_entropy": gate_entropy.item(),
+            "balance_entropy": balance_entropy.item(),
+        }
 
     # ------------------------------------------------------------------
     #  Action sampling
