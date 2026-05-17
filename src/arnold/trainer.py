@@ -992,9 +992,7 @@ class ArnoldTrainer:
                 obc_logger = OBCLogger()
 
                 # Reset env at epoch start
-                print(f"[W{worker_id}] epoch={current_epoch} reset_start", flush=True)
                 obs, info = wrapper.reset()
-                print(f"[W{worker_id}] reset_done obs_shape={obs.shape if hasattr(obs, 'shape') else len(obs)}", flush=True)
                 parser.reset(obs)
                 obs_ts, obs_sigs = parser.get_observation(torch.device("cpu"))
                 act_sigs = action_parser.action_signatures
@@ -1013,19 +1011,13 @@ class ArnoldTrainer:
                 done_val.value = 0
                 reward_val.value = 0.0
                 step_counter.value = 0
-                print(f"[W{worker_id}] initial obs_ready.set()", flush=True)
                 obs_ready.set()
 
                 # Inner sampling loop (identical to ephemeral)
-                _step_count = 0
                 try:
                     while True:
-                        if _step_count < 3:
-                            print(f"[W{worker_id}] waiting action_ready (step {_step_count})", flush=True)
                         action_ready.wait()
                         action_ready.clear()
-                        if _step_count < 3:
-                            print(f"[W{worker_id}] got action_ready (step {_step_count})", flush=True)
 
                         if stop_flag.value:
                             break
@@ -1033,9 +1025,6 @@ class ArnoldTrainer:
                         action_np = action_buf.numpy().copy()
                         next_obs, reward, terminated, truncated, info = wrapper.step(action_np)
                         done = terminated or truncated
-                        if _step_count < 3:
-                            print(f"[W{worker_id}] env.step done (step {_step_count}) done={done}", flush=True)
-                        _step_count += 1
 
                         reward_val.value = float(reward)
                         done_val.value = 1 if done else 0
@@ -1254,28 +1243,17 @@ class ArnoldTrainer:
         )
 
         # Wait for initial obs from all workers
-        _iter_no = [0]
         def _wait_obs_active():
-            _iter_no[0] += 1
-            for i, wh in enumerate(all_workers):
+            for wh in all_workers:
                 if not wh.active:
                     continue
-                waited = 0
                 while not wh.obs_ready.wait(timeout=2.0):
-                    waited += 2
-                    print(
-                        f"[MAIN iter={_iter_no[0]}] worker {i} ({wh.expert_name}) "
-                        f"obs_ready not set after {waited}s, alive={wh.proc.is_alive()}",
-                        flush=True,
-                    )
                     if not wh.proc.is_alive():
                         raise RuntimeError(
                             f"PersistentWorker [{wh.expert_name}] died "
                             f"(exit code {wh.proc.exitcode})"
                         )
                 wh.obs_ready.clear()
-            if _iter_no[0] <= 3:
-                print(f"[MAIN iter={_iter_no[0]}] all obs collected", flush=True)
 
         _wait_obs_active()
 
@@ -1351,7 +1329,6 @@ class ArnoldTrainer:
                             if not any(wh.active for wh in all_workers):
                                 break
 
-                _dbg = _iter_no[0] <= 3
                 with prof.section("inference"):
                     for expert_name, workers in workers_by_expert.items():
                         obs_sigs, act_sigs = sigs_by_expert[expert_name]
@@ -1365,14 +1342,10 @@ class ArnoldTrainer:
                             batch_obs = torch.stack(
                                 [wh.obs_buf.clone() for wh in active_workers]
                             )
-                        if _dbg:
-                            print(f"[MAIN iter={_iter_no[0]}] stacked batch shape={tuple(batch_obs.shape)}, expert={expert_name}", flush=True)
 
                         with prof.section("gpu_forward"):
                             with prof.section("to_device"):
                                 batch_obs_dev = batch_obs.to(device)
-                            if _dbg:
-                                print(f"[MAIN iter={_iter_no[0]}] obs on device, calling get_action...", flush=True)
                             with prof.section("policy_forward"):
                                 with torch.autocast(
                                     device_type=device_type,
@@ -1385,8 +1358,6 @@ class ArnoldTrainer:
                                         expert_name=expert_name,
                                         deterministic=False,
                                     )
-                            if _dbg:
-                                print(f"[MAIN iter={_iter_no[0]}] get_action returned, env_actions shape={tuple(env_actions.shape)}", flush=True)
                             teacher_actions_cpu = None
                             if ctx.gpu_teacher is not None and ctx.use_expert:
                                 with prof.section("teacher_forward"):
@@ -1429,13 +1400,9 @@ class ArnoldTrainer:
                 has_prev = True
 
                 with prof.section("signal_workers"):
-                    n_signaled = 0
                     for wh in all_workers:
                         if wh.active:
                             wh.action_ready.set()
-                            n_signaled += 1
-                    if _dbg:
-                        print(f"[MAIN iter={_iter_no[0]}] signaled action_ready to {n_signaled} workers", flush=True)
 
                 with prof.section("wait_env_step"):
                     _wait_obs_active()
