@@ -5,15 +5,14 @@
 
 import os
 import sys
-from pathlib import Path
-
-import numpy as np
 import torch
+import numpy as np
 
-from typing import Tuple, Iterator
+from pathlib import Path
 from omegaconf import DictConfig
-from hydra import compose, initialize_config_dir
+from collections.abc import Iterator
 from hydra.core.global_hydra import GlobalHydra
+from hydra import compose, initialize_config_dir
 
 
 # Добавляем путь к Kinesis src для корректных импортов
@@ -29,6 +28,11 @@ if str(KINESIS_SRC) not in sys.path:
     sys.path.insert(0, str(KINESIS_SRC))
 
 
+########################################
+#                Config                #
+########################################
+
+
 def load_kinesis_config(
     config_dir: str = None,
     overrides: list = None,
@@ -38,9 +42,11 @@ def load_kinesis_config(
     Загружает полный конфиг Kinesis через Hydra.
 
     Args:
-        config_dir: Путь к директории cfg Kinesis (по умолчанию - из submodule)
+        config_dir: Путь к директории cfg Kinesis
+                    (по умолчанию - из submodule)
         overrides: Список Hydra overrides
-        config_name: Имя конфига (config_legs | config_legs_abs | config_legs_back)
+        config_name: Имя конфига
+                     (config_legs | config_legs_abs | config_legs_back)
 
     Returns:
         DictConfig с полным конфигом
@@ -62,11 +68,17 @@ def load_kinesis_config(
     return cfg
 
 
+########################################
+#               Wrapper                #
+########################################
+
+
 class KinesisWrapper:
     """
     Простой интерфейс к эксперту Kinesis (MyoLegs imitation).
     - Загружает агент из подмодуля Kinesis с указанным конфигом/чекпоинтом.
-    - Предоставляет get_expert_action(flat_obs) → np.ndarray (в порядке ctrl env).
+    - Предоставляет get_expert_action(flat_obs) → np.ndarray
+      (в порядке ctrl env).
     """
 
     def __init__(
@@ -75,18 +87,20 @@ class KinesisWrapper:
         expert_cfg: DictConfig = None,
         checkpoint_epoch: int = -1,
         device: str = "cpu",
-        overrides: list = [],
+        overrides: list = [],  # noqa: B006
         mode: str = "train",
         model_type: str = "legs",
     ):
         """
         Args:
             cfg_path: Путь к директории cfg Kinesis (None для default)
-            expert_cfg: Готовый DictConfig (для multiprocessing, вместо cfg_path)
+            expert_cfg: Готовый DictConfig
+                        (для multiprocessing, вместо cfg_path)
             checkpoint_epoch: Эпоха чекпоинта (-1 для latest)
             device: Устройство ("cpu" или "cuda")
             overrides: Hydra overrides (e.g., ["run=eval_run_legs"])
-            mode: "train" или "valid" — определяет какой motion_file использовать
+            mode: "train" или "valid" — определяет какой
+                  motion_file использовать
                   train: kit_train_motion_dict.pkl
                   valid: kit_test_motion_dict.pkl
             model_type: "legs" | "legs_abs" | "legs_back"
@@ -119,14 +133,20 @@ class KinesisWrapper:
                 default_overrides = [
                     run_config,
                     "no_log=True",
-                    "epoch=-1",  # Важно! Пропускаем загрузку expert_path в PolicyMOE.__init__
+                    # Важно! Пропускаем загрузку expert_path в
+                    # PolicyMOE.__init__
+                    "epoch=-1",
                     "run.test=True",  # Но ставим test=True для eval mode
-                    "run.im_eval=False",  # Это триггерит sample_motions в load_checkpoint
+                    # Это триггерит sample_motions в load_checkpoint
+                    "run.im_eval=False",
                 ]
                 if overrides:
                     default_overrides.extend(overrides)
 
-                if not any(override.startswith("run.headless=") for override in overrides):
+                if not any(
+                    override.startswith("run.headless=")
+                    for override in overrides
+                ):
                     default_overrides.append("run.headless=True")
 
                 cfg_dir = cfg_path if cfg_path else str(KINESIS_CFG)
@@ -140,9 +160,14 @@ class KinesisWrapper:
             self.device = torch.device(device)
 
             # Устанавливаем output_dir для загрузки модели
-            models_dir = KINESIS_DATA / "trained_models" / model_type / "kinesis-moe-imitation"
+            models_dir = (
+                KINESIS_DATA
+                / "trained_models"
+                / model_type
+                / "kinesis-moe-imitation"
+            )
             self.cfg.output_dir = str(models_dir)
-            
+
             # Инициализируем агента (он сам поднимет env внутри)
             self.agent = AgentIM(
                 cfg=self.cfg,
@@ -159,24 +184,24 @@ class KinesisWrapper:
             # Границы action_space для preprocess (clip+rescale) как у эксперта
             self.actions_low = self.agent.env.action_space.low.copy()
             self.actions_high = self.agent.env.action_space.high.copy()
-        
+
         finally:
             # Восстанавливаем директорию
             os.chdir(original_cwd)
 
-    def reset(self) -> Tuple[np.ndarray, dict]:
+    def reset(self) -> tuple[np.ndarray, dict]:
         """
         Сброс среды эксперта и возврат obs.
         """
         obs, info = self.agent.env.reset()
         return obs, info
-    
+
     def forward_motions(self) -> Iterator[int]:
         """
         Итератор по всем движениям в библиотеке.
         Каждая итерация загружает следующее движение.
         После yield нужно вызвать reset() для инициализации эпизода.
-        
+
         Yields:
             int: Индекс текущего движения.
         """
@@ -184,35 +209,47 @@ class KinesisWrapper:
 
     def get_expert_action(self, flat_obs: np.ndarray) -> np.ndarray:
         """
-        Получить действие эксперта по плоскому obs (в порядке env observation_space).
+        Получить действие эксперта по плоскому obs
+        (в порядке env observation_space).
         """
         with torch.no_grad():
             obs_t = torch.from_numpy(flat_obs).to(self.device).float()
             if obs_t.dim() == 1:
                 obs_t = obs_t.unsqueeze(0)
-            action = self.agent.policy_net.select_action(obs_t, mean_action=True)[0]
+            action = self.agent.policy_net.select_action(
+                obs_t, mean_action=True
+            )[0]
             return action.cpu().numpy().squeeze()
 
     def preprocess_actions(self, action: np.ndarray) -> np.ndarray:
         """
-        Clip и rescale действий как в Kinesis Agent.preprocess_actions (clip_actions=True).
-        Среда ожидает действия в [actions_low, actions_high]; политика студента (Arnold)
-        выдаёт неограниченный Gaussian — без clip в env уходят невалидные значения.
+        Clip и rescale действий как в Kinesis
+        Agent.preprocess_actions (clip_actions=True).
+        Среда ожидает действия в [actions_low, actions_high];
+        политика студента (Arnold)
+        выдаёт неограниченный Gaussian — без clip в env уходят
+        невалидные значения.
         """
-        action = np.clip(action.astype(np.float32), self.actions_low, self.actions_high)
-        # rescale_actions(low, high, x): x * (high-low)/2 + (high+low)/2 — для [-1,1] это id
+        action = np.clip(
+            action.astype(np.float32), self.actions_low, self.actions_high
+        )
+        # rescale_actions(low, high, x): x * (high-low)/2 +
+        # (high+low)/2 — для [-1,1] это id
         d = (self.actions_high - self.actions_low) / 2.0
         m = (self.actions_low + self.actions_high) / 2.0
         return action * d + m
 
     def step(self, action: np.ndarray):
-        """Проброс шага в среду эксперта. Действия предварительно clip+rescale как у эксперта."""
+        """Проброс шага в среду эксперта.
+        Действия предварительно clip+rescale как у эксперта."""
         action = self.preprocess_actions(action)
-        next_obs, reward, terminated, truncated, info = self.agent.env.step(action)
-        info['r_body_pos'] = info['r_body_pos'][0]
-        info['r_vel'] = info['r_vel'][0]
+        next_obs, reward, terminated, truncated, info = self.agent.env.step(
+            action
+        )
+        info["r_body_pos"] = info["r_body_pos"][0]
+        info["r_vel"] = info["r_vel"][0]
         return next_obs, reward, terminated, truncated, info
-    
+
     @property
     def has_expert(self) -> bool:
         """Kinesis всегда загружается с экспертом."""
@@ -222,18 +259,18 @@ class KinesisWrapper:
     def env(self):
         """Доступ к среде эксперта."""
         return self.agent.env
-    
+
     @property
     def num_motions(self) -> int:
         """Количество загруженных движений."""
         return self.agent.env.motion_lib.num_all_motions()
-    
+
     def sample_motions(self, num_motions: int = None) -> None:
         """
         Пересэмплирует движения из библиотеки.
-        
+
         Args:
             num_motions: Количество движений для загрузки (None = все)
         """
-        if hasattr(self.agent.env, 'sample_motions'):
+        if hasattr(self.agent.env, "sample_motions"):
             self.agent.env.sample_motions()

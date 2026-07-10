@@ -1,0 +1,71 @@
+# Local quality gate: runs before every commit (`pre-commit install`).
+# Mirrors the CI checks so problems surface on your machine, not in CI.
+
+# Never touch the expert git submodules or data blobs with ANY hook — they are
+# third-party / not ours to reformat.
+exclude: |
+  (?x)^(
+    src/arnold/experts/Kinesis/
+    | src/arnold/experts/myochallenge-lattice/
+    | src/arnold/experts/Myohuman/
+    | data/
+  )
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=4096]
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.43.5
+    hooks:
+      - id: typos
+        args: [--force-exclude]
+
+  - repo: https://github.com/asottile/add-trailing-comma
+    rev: v3.1.0
+    hooks:
+      - id: add-trailing-comma
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.17
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      # Style-guide rules encoded as checks (code-style §6 and §1).
+      - id: check-imports
+        name: Import hygiene — absolute, block order, ladders (code-style §6)
+        entry: uv run python tools/pre_commit/check_imports.py
+        language: system
+        types: [python]
+
+      - id: check-banners
+        name: Banners — Tier-1 width/indent/presence + Tier-2 intro spacing (code-style §1-§2)
+        entry: uv run python tools/pre_commit/check_banners.py
+        language: system
+        types: [python]
+
+      # Keep the library/training code device-agnostic (CPU / CUDA / MPS):
+      # no hard-coded cuda in src/ (append `# device-ok` for exceptions).
+      - id: check-device
+        name: No hard-coded CUDA device (device-agnostic)
+        entry: uv run python tools/pre_commit/check_device.py
+        language: system
+        files: ^src/arnold/.*\.py$

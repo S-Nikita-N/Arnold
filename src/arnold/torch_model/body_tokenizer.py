@@ -16,13 +16,19 @@ Body Tokenizer — универсальная проекция наблюден�
 
 import torch
 import torch.nn as nn
-from typing import List, Tuple, Dict, Union, Optional
+
 from arnold.observation_parser import BodyGroup
+
+
+########################################
+#            Body tokenizer            #
+########################################
 
 
 class BodyTokenizer(nn.Module):
     """
-    Преобразует flat observations [B, n_obs, history_len] в токены [B, n_groups, embed_dim].
+    Преобразует flat observations [B, n_obs, history_len]
+    в токены [B, n_groups, embed_dim].
 
     Для каждого type создаётся отдельный Linear проектор (группы
     одного типа имеют одинаковую входную размерность).
@@ -34,14 +40,15 @@ class BodyTokenizer(nn.Module):
 
     def __init__(
         self,
-        groups: Union[List[BodyGroup], Dict[str, List[BodyGroup]]],
+        groups: dict[str, list[BodyGroup]],
         history_len: int,
         embed_dim: int,
     ):
         """
         Args:
-            groups: List[BodyGroup] (single-expert, backward compat) или
-                    Dict[expert_name → List[BodyGroup]] (multi-expert)
+            groups: Dict[expert_name → List[BodyGroup]] (multi-expert).
+                    Даже для одного эксперта передавайте dict {name: groups};
+                    голый List[BodyGroup] не поддерживается.
             history_len: длина истории наблюдений
             embed_dim: размерность эмбеддинга
         """
@@ -51,18 +58,22 @@ class BodyTokenizer(nn.Module):
 
         groups_by_expert = groups
 
-        self.expert_names: List[str] = sorted(groups_by_expert.keys())
+        self.expert_names: list[str] = sorted(groups_by_expert.keys())
 
-        type_features: Dict[str, int] = {}
-        self._expert_group_signatures: Dict[str, List[Tuple[str, ...]]] = {}
-        self._expert_type_orders: Dict[str, List[str]] = {}
+        type_features: dict[str, int] = {}
+        self._expert_group_signatures: dict[str, list[tuple[str, ...]]] = {}
+        self._expert_type_orders: dict[str, list[str]] = {}
 
         for expert_name in self.expert_names:
             expert_groups = groups_by_expert[expert_name]
-            sorted_groups = sorted(expert_groups, key=lambda g: (g.type, g.name, g.side))
-            self._expert_group_signatures[expert_name] = [g.signature for g in sorted_groups]
+            sorted_groups = sorted(
+                expert_groups, key=lambda g: (g.type, g.name, g.side)
+            )
+            self._expert_group_signatures[expert_name] = [
+                g.signature for g in sorted_groups
+            ]
 
-            type_to_indices: Dict[str, List[List[int]]] = {}
+            type_to_indices: dict[str, list[list[int]]] = {}
             for g in sorted_groups:
                 type_to_indices.setdefault(g.type, []).append(g.indices)
 
@@ -77,9 +88,11 @@ class BodyTokenizer(nn.Module):
                     if type_features[gtype] != n_features:
                         raise ValueError(
                             f"Feature count mismatch for type '{gtype}': "
-                            f"expected {type_features[gtype]}, got {n_features} "
+                            f"expected {type_features[gtype]}, "
+                            f"got {n_features} "
                             f"(expert '{expert_name}'). "
-                            f"Experts must share the same observation structure per type."
+                            f"Experts must share the same observation "
+                            f"structure per type."
                         )
                 else:
                     type_features[gtype] = n_features
@@ -97,7 +110,7 @@ class BodyTokenizer(nn.Module):
     def encode(
         self,
         obs_timeseries: torch.Tensor,
-        expert_name: Optional[str] = None,
+        expert_name: str | None = None,
     ) -> torch.Tensor:
         """
         Кодирует raw observations в body-level tokens.
@@ -114,11 +127,13 @@ class BodyTokenizer(nn.Module):
         for gtype in self._expert_type_orders[expert_name]:
             idx = getattr(self, f"idx_{expert_name}_{gtype}")
             n_g, n_f = idx.shape
-            gathered = obs_timeseries[:, idx, :]          # [B, n_g, n_f, H]
+            gathered = obs_timeseries[:, idx, :]  # [B, n_g, n_f, H]
             gathered = gathered.reshape(B, n_g, n_f * self.history_len)
             parts.append(self.projectors[gtype](gathered))
 
-        return torch.cat(parts, dim=1)                    # [B, n_groups, embed_dim]
+        return torch.cat(parts, dim=1)  # [B, n_groups, embed_dim]
 
-    def get_group_signatures(self, expert_name: Optional[str] = None) -> List[Tuple[str, ...]]:
+    def get_group_signatures(
+        self, expert_name: str | None = None
+    ) -> list[tuple[str, ...]]:
         return self._expert_group_signatures[expert_name]

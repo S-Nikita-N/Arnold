@@ -11,7 +11,7 @@ Render режим (headless=false) — последовательный single-e
 
 Использование:
     # Headless (vectorized, быстро):
-    poetry run python -m arnold.validate_policy \
+    uv run python -m arnold.validate_policy \
         device=cuda \
         run=validate \
         run.checkpoint=/path/to/model.pth \
@@ -19,7 +19,7 @@ Render режим (headless=false) — последовательный single-e
         learning.policy=lattice
 
     # Render (single env):
-    poetry run mjpython -m arnold.validate_policy \
+    uv run mjpython -m arnold.validate_policy \
         run=validate \
         run.checkpoint=/path/to/model.pth \
         run.headless=false \
@@ -32,29 +32,32 @@ Render режим (headless=false) — последовательный single-e
     run.num_motions:     количество движений (-1 = все, только render-режим)
     run.sleep_per_step:  задержка между шагами, сек (только render-режим)
     run.fast_eval:       true — не считать std/value в get_action (render-режим)
-    run.mode:            "valid" (default) | "train" — какой набор motions использовать
+    run.mode:            "valid" (default) | "train" — какой
+                         набор motions использовать
 """
 
-import logging
 import time
+import logging
 
 import hydra
-import numpy as np
 import torch
-from omegaconf import DictConfig
-from tqdm import tqdm
+import numpy as np
 
-from arnold.observation_parser import ObservationParser
-from arnold.action_parser import ActionParser
+from tqdm import tqdm
+from omegaconf import DictConfig
+
 from arnold.profiler import Profiler
+from arnold.action_parser import ActionParser
+from arnold.observation_parser import ObservationParser
 
 
 logger = logging.getLogger(__name__)
 
 
-# ------------------------------------------------------------------
-#  Vectorized eval — reuse trainer.
-# ------------------------------------------------------------------
+########################################
+#           Vectorized eval            #
+########################################
+
 
 def validate_vectorized(cfg: DictConfig) -> dict:
     """
@@ -95,7 +98,10 @@ def validate_vectorized(cfg: DictConfig) -> dict:
                     f"Is run.eval_frequency > 0?"
                 )
             metrics = trainer._evaluate_expert_vectorized(
-                expert_name, ctx, wrapper, return_per_motion=False,
+                expert_name,
+                ctx,
+                wrapper,
+                return_per_motion=False,
             )
             all_metrics[expert_name] = metrics
     finally:
@@ -114,13 +120,18 @@ def _print_summary(all_metrics: dict) -> None:
     for expert_name, m in all_metrics.items():
         print(f"  [{expert_name}]")
         for k, v in m.items():
-            print(f"    {k:30s} = {v:.4f}" if isinstance(v, float) else f"    {k:30s} = {v}")
+            print(
+                f"    {k:30s} = {v:.4f}"
+                if isinstance(v, float)
+                else f"    {k:30s} = {v}"
+            )
     print("=" * 60)
 
 
-# ------------------------------------------------------------------
-#  Sequential render eval — used when headless=false.
-# ------------------------------------------------------------------
+########################################
+#           Sequential eval            #
+########################################
+
 
 def _create_policy(cfg, expert, parser):
     """Build policy by type (mirrors ArnoldTrainer.setup_policy dispatch)."""
@@ -131,12 +142,18 @@ def _create_policy(cfg, expert, parser):
     tokenizer_granularity = cfg.learning.tokenizer_granularity
 
     if policy_type == "transformer":
-        from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
+        from arnold.torch_model.sensorimotor_vocabulary import (
+            SensorimotorVocabulary,
+        )
         from arnold.torch_model.transformer_policy import TransformerPolicy
 
-        transformer_cfg = OmegaConf.to_container(cfg.learning.transformer, resolve=True)
+        transformer_cfg = OmegaConf.to_container(
+            cfg.learning.transformer, resolve=True
+        )
         action_granulation = transformer_cfg.pop("action_granulation", "none")
-        action_decoder_layers = transformer_cfg.pop("action_decoder_layers", None)
+        action_decoder_layers = transformer_cfg.pop(
+            "action_decoder_layers", None
+        )
 
         expert_config = list(cfg.run.experts.values())[0]
         expert_name = expert_config.type
@@ -147,7 +164,9 @@ def _create_policy(cfg, expert, parser):
         action_sigs_by_expert = None
         if action_granulation != "none":
             ap = ActionParser.from_env(expert.env)
-            action_groupings = {expert_name: ap.get_muscle_grouping(strategy=action_granulation)}
+            action_groupings = {
+                expert_name: ap.get_muscle_grouping(strategy=action_granulation)
+            }
             action_sigs_by_expert = {expert_name: ap.action_signatures}
 
         return TransformerPolicy(
@@ -164,6 +183,7 @@ def _create_policy(cfg, expert, parser):
 
     if policy_type == "lattice":
         from arnold.torch_model.policy_lattice import LatticePolicy
+
         lattice_cfg = OmegaConf.to_container(cfg.learning.lattice, resolve=True)
         return LatticePolicy(
             state_dim=parser.n_obs_elements,
@@ -173,6 +193,7 @@ def _create_policy(cfg, expert, parser):
 
     if policy_type == "moe":
         from arnold.torch_model.policy_moe import MoELatticePolicy
+
         moe_cfg = OmegaConf.to_container(cfg.learning.moe, resolve=True)
         return MoELatticePolicy(
             state_dim=parser.n_obs_elements,
@@ -182,6 +203,7 @@ def _create_policy(cfg, expert, parser):
 
     if policy_type == "gate_moe":
         from arnold.torch_model.policy_gate_moe import GateMoEPolicy
+
         gate_cfg = OmegaConf.to_container(cfg.learning.gate_moe, resolve=True)
         return GateMoEPolicy(
             state_dim=parser.n_obs_elements,
@@ -199,25 +221,33 @@ def _create_policy(cfg, expert, parser):
 
 def _load_policy(cfg, checkpoint_path, device, expert, parser):
     logger.info(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device, weights_only=False
+    )
 
     policy = _create_policy(cfg, expert, parser)
 
     policy_state = checkpoint["policy"]
-    if policy_state and next(iter(policy_state.keys()), "").startswith("module."):
-        policy_state = {k.replace("module.", "", 1): v for k, v in policy_state.items()}
+    if policy_state and next(iter(policy_state.keys()), "").startswith(
+        "module."
+    ):
+        policy_state = {
+            k.replace("module.", "", 1): v for k, v in policy_state.items()
+        }
 
     try:
         policy.load_state_dict(policy_state)
     except RuntimeError as e:
-        logger.warning(f"Strict load failed: {e}; retrying without size-mismatched keys")
+        logger.warning(
+            f"Strict load failed: {e}; retrying without size-mismatched keys"
+        )
         model_state = policy.state_dict()
         filtered = {}
         for k, v in policy_state.items():
             if (
                 k in model_state
-                and hasattr(model_state[k], 'shape')
-                and hasattr(v, 'shape')
+                and hasattr(model_state[k], "shape")
+                and hasattr(v, "shape")
                 and model_state[k].shape != v.shape
             ):
                 continue
@@ -228,7 +258,10 @@ def _load_policy(cfg, checkpoint_path, device, expert, parser):
     policy.eval()
     n_params = sum(p.numel() for p in policy.parameters())
     epoch = checkpoint.get("epoch", "?")
-    logger.info(f"Policy loaded ({cfg.learning.policy}). Epoch: {epoch}, parameters: {n_params:,}")
+    logger.info(
+        f"Policy loaded ({cfg.learning.policy}). "
+        f"Epoch: {epoch}, parameters: {n_params:,}"
+    )
     return policy
 
 
@@ -249,11 +282,18 @@ def validate_sequential(cfg: DictConfig) -> dict:
     expert_name = expert_config.type
 
     env_mode = run.get("mode", "valid")
-    logger.info(f"Loading expert environment (mode={env_mode}, headless=False)...")
-    expert = create_expert_wrapper(
-        expert_config, mode=env_mode, overrides=["run.headless=false"],
+    logger.info(
+        f"Loading expert environment (mode={env_mode}, headless=False)..."
     )
-    logger.info(f"Expert loaded. Obs dim: {expert.obs_dim}, Action dim: {expert.action_dim}")
+    expert = create_expert_wrapper(
+        expert_config,
+        mode=env_mode,
+        overrides=["run.headless=false"],
+    )
+    logger.info(
+        f"Expert loaded. Obs dim: {expert.obs_dim}, "
+        f"Action dim: {expert.action_dim}"
+    )
 
     parser = ObservationParser.from_env(expert.env, history_len=history_len)
     action_parser = ActionParser.from_env(expert.env)
@@ -283,7 +323,7 @@ def validate_sequential(cfg: DictConfig) -> dict:
         motion_iter = expert.forward_motions()
         pbar = tqdm(motion_iter, total=total_motions, desc="Evaluating")
 
-        for motion_idx, motion_id in enumerate(pbar):
+        for motion_idx, _motion_id in enumerate(pbar):
             if num_motions > 0 and motion_idx >= num_motions:
                 break
 
@@ -293,27 +333,32 @@ def validate_sequential(cfg: DictConfig) -> dict:
             ep_length = 0
             step_im_losses: list = []
 
-            for t in range(10000):
+            for _t in range(10000):
                 obs_ts, obs_sigs = parser.get_observation(device)
                 act_sigs = action_parser.action_signatures
 
-                with profiler.section("get_action"):
-                    with torch.no_grad():
-                        action, _, _, _ = policy.get_action(
-                            obs_ts, obs_sigs, act_sigs,
-                            expert_name=expert_name,
-                            deterministic=True,
-                            return_std=not fast_eval,
-                            return_value=not fast_eval,
-                        )
+                with profiler.section("get_action"), torch.no_grad():
+                    action, _, _, _ = policy.get_action(
+                        obs_ts,
+                        obs_sigs,
+                        act_sigs,
+                        expert_name=expert_name,
+                        deterministic=True,
+                        return_std=not fast_eval,
+                        return_value=not fast_eval,
+                    )
                 action_np = action.squeeze(0).cpu().numpy()
 
                 if expert.has_expert:
                     expert_action = expert.get_expert_action(obs)
-                    step_im_losses.append(float(((action_np - expert_action) ** 2).mean()))
+                    step_im_losses.append(
+                        float(((action_np - expert_action) ** 2).mean())
+                    )
 
                 with profiler.section("env_step"):
-                    next_obs, reward, terminated, truncated, info = expert.step(action_np)
+                    next_obs, reward, terminated, truncated, info = expert.step(
+                        action_np
+                    )
                 done = terminated or truncated
 
                 ep_reward += reward
@@ -329,7 +374,9 @@ def validate_sequential(cfg: DictConfig) -> dict:
                     if "mpjpe" in info:
                         episode_mpjpes.append(float(info["mpjpe"]))
                     if "frame_coverage" in info:
-                        episode_frame_coverages.append(float(info["frame_coverage"]))
+                        episode_frame_coverages.append(
+                            float(info["frame_coverage"])
+                        )
                     if "success" in info:
                         episode_successes.append(float(info["success"]))
                     if not profile_done:
@@ -353,27 +400,40 @@ def validate_sequential(cfg: DictConfig) -> dict:
 
     metrics = {
         expert_name: {
-            "eval/mean_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
-            "eval/std_reward": float(np.std(episode_rewards)) if episode_rewards else 0.0,
-            "eval/mean_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
+            "eval/mean_reward": float(np.mean(episode_rewards))
+            if episode_rewards
+            else 0.0,
+            "eval/std_reward": float(np.std(episode_rewards))
+            if episode_rewards
+            else 0.0,
+            "eval/mean_length": float(np.mean(episode_lengths))
+            if episode_lengths
+            else 0.0,
         }
     }
     if episode_imitation_losses:
-        metrics[expert_name]["eval/imitation_loss"] = float(np.mean(episode_imitation_losses))
+        metrics[expert_name]["eval/imitation_loss"] = float(
+            np.mean(episode_imitation_losses)
+        )
     if episode_mpjpes:
         metrics[expert_name]["eval/mpjpe"] = float(np.mean(episode_mpjpes))
     if episode_frame_coverages:
-        metrics[expert_name]["eval/frame_coverage"] = float(np.mean(episode_frame_coverages))
+        metrics[expert_name]["eval/frame_coverage"] = float(
+            np.mean(episode_frame_coverages)
+        )
     if episode_successes:
-        metrics[expert_name]["eval/success_rate"] = float(np.mean(episode_successes))
+        metrics[expert_name]["eval/success_rate"] = float(
+            np.mean(episode_successes)
+        )
 
     _print_summary(metrics)
     return metrics
 
 
-# ------------------------------------------------------------------
-#  Entry point
-# ------------------------------------------------------------------
+########################################
+#             Entry point              #
+########################################
+
 
 def validate(cfg: DictConfig) -> dict:
     """Dispatch: vectorized (headless) or sequential (render)."""
@@ -381,7 +441,8 @@ def validate(cfg: DictConfig) -> dict:
     if not str(run.checkpoint or "").strip():
         raise ValueError(
             "run.checkpoint is required: "
-            "python -m arnold.validate_policy run=validate run.checkpoint=path/to/model.pth"
+            "python -m arnold.validate_policy run=validate "
+            "run.checkpoint=path/to/model.pth"
         )
 
     headless = bool(run.headless)

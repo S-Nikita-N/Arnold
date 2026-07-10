@@ -10,28 +10,41 @@ ones = torch.ones
 zeros = torch.zeros
 
 
-class to_cpu:
+########################################
+#        Device & mode contexts        #
+########################################
 
+
+class to_cpu:
     def __init__(self, *models):
         self.models = list(filter(lambda x: x is not None, models))
-        self.prev_devices = [x.device if hasattr(x, 'device') else next(x.parameters()).device for x in self.models]
+        self.prev_devices = [
+            x.device if hasattr(x, "device") else next(x.parameters()).device
+            for x in self.models
+        ]
         for x in self.models:
-            x.to(torch.device('cpu'))
+            x.to(torch.device("cpu"))
 
     def __enter__(self):
         pass
 
     def __exit__(self, *args):
-        for x, device in zip(self.models, self.prev_devices):
+        for x, device in zip(
+            self.models,
+            self.prev_devices,
+            strict=False,
+        ):
             x.to(device)
         return False
 
 
 class to_device:
-
     def __init__(self, device, *models):
         self.models = list(filter(lambda x: x is not None, models))
-        self.prev_devices = [x.device if hasattr(x, 'device') else next(x.parameters()).device for x in self.models]
+        self.prev_devices = [
+            x.device if hasattr(x, "device") else next(x.parameters()).device
+            for x in self.models
+        ]
         for x in self.models:
             x.to(device)
 
@@ -39,13 +52,16 @@ class to_device:
         pass
 
     def __exit__(self, *args):
-        for x, device in zip(self.models, self.prev_devices):
+        for x, device in zip(
+            self.models,
+            self.prev_devices,
+            strict=False,
+        ):
             x.to(device)
         return False
 
 
 class to_test:
-
     def __init__(self, *models):
         self.models = list(filter(lambda x: x is not None, models))
         self.prev_modes = [x.training for x in self.models]
@@ -56,13 +72,12 @@ class to_test:
         pass
 
     def __exit__(self, *args):
-        for x, mode in zip(self.models, self.prev_modes):
+        for x, mode in zip(self.models, self.prev_modes, strict=False):
             x.train(mode)
         return False
 
 
 class to_train:
-
     def __init__(self, *models):
         self.models = list(filter(lambda x: x is not None, models))
         self.prev_modes = [x.training for x in self.models]
@@ -73,9 +88,14 @@ class to_train:
         pass
 
     def __exit__(self, *args):
-        for x, mode in zip(self.models, self.prev_modes):
+        for x, mode in zip(self.models, self.prev_modes, strict=False):
             x.train(mode)
         return False
+
+
+########################################
+#      Optimizer & batch helpers       #
+########################################
 
 
 def batch_to(dst, *args):
@@ -92,8 +112,16 @@ def optimizer_to(optimizer, device):
 
 def get_optimizer(net, lr, weight_decay, optimizer_type="adam", **kwargs):
     if optimizer_type == "adam":
-        return torch.optim.Adam(net.parameters(), eps=1e-08, lr=lr, weight_decay=weight_decay, **kwargs)
+        return torch.optim.Adam(
+            net.parameters(),
+            eps=1e-08,
+            lr=lr,
+            weight_decay=weight_decay,
+            **kwargs,
+        )
     elif optimizer_type == "sgd":
-        return torch.optim.SGD(net.parameters(), lr=lr, weight_decay=weight_decay, **kwargs)
+        return torch.optim.SGD(
+            net.parameters(), lr=lr, weight_decay=weight_decay, **kwargs
+        )
     else:
-        raise ValueError("Unknown optimizer type: {}".format(optimizer_type))
+        raise ValueError(f"Unknown optimizer type: {optimizer_type}")

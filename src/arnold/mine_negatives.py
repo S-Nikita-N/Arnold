@@ -7,8 +7,10 @@ Hard Negative Mining — оценка политики на всех motion и �
   2. refilter — пересчитать фильтр из существующего JSON без повторного eval
 
 Результат (split = train | valid — valid соответствует eval/val):
-  - {output_name}_{split}.json — meta + ключ \"frames\": все мотии eval (и «хорошие», и «плохие»)
-  - {output_name}_{split}_negatives.txt — motion_id негативов (для motion_ids_file и т.п.)
+  - {output_name}_{split}.json — meta + ключ \"frames\": все мотии
+    eval (и «хорошие», и «плохие»)
+  - {output_name}_{split}_negatives.txt — motion_id негативов
+    (для motion_ids_file и т.п.)
   - {output_name}_{split}_positives.txt — комплемент по тем же порогам
 
   По умолчанию output_name=eval → eval_train.json, eval_valid.json и пары txt.
@@ -20,13 +22,14 @@ Hard Negative Mining — оценка политики на всех motion и �
 Использование:
 
     # Mine (eval + filter)
-    poetry run python -m arnold.mine_negatives \
+    uv run python -m arnold.mine_negatives \
         run=mine_negatives \
         '+run/experts@run.experts.myo=myohuman' \
         resume_checkpoint=runs/exp/model.pth
 
-    # Refilter: JSON с ключом "frames", перезапись того же .json и *_negatives/_positives.txt
-    poetry run python -m arnold.mine_negatives refilter \
+    # Refilter: JSON с ключом "frames", перезапись того же
+    #           .json и *_negatives/_positives.txt
+    uv run python -m arnold.mine_negatives refilter \
         --json data/trained_models/exp/eval_valid.json \
         --mean-mpjpe 0.06 --not-success
 """
@@ -48,9 +51,10 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Filter
-# ─────────────────────────────────────────────────────────────────────
+########################################
+#                Filter                #
+########################################
+
 
 def filter_negatives(
     results: list,
@@ -67,12 +71,18 @@ def filter_negatives(
 
         if not_success and not r.get("success", True):
             is_negative = True
-        if mean_mpjpe is not None and r.get("mpjpe") is not None:
-            if r["mpjpe"] > mean_mpjpe:
-                is_negative = True
-        if max_mpjpe is not None and r.get("max_mpjpe") is not None:
-            if r["max_mpjpe"] > max_mpjpe:
-                is_negative = True
+        if (
+            mean_mpjpe is not None
+            and r.get("mpjpe") is not None
+            and r["mpjpe"] > mean_mpjpe
+        ):
+            is_negative = True
+        if (
+            max_mpjpe is not None
+            and r.get("max_mpjpe") is not None
+            and r["max_mpjpe"] > max_mpjpe
+        ):
+            is_negative = True
 
         if is_negative:
             negatives.append(r)
@@ -86,12 +96,14 @@ def derive_positives(per_motion: list, negatives: list) -> list:
     return [r for r in per_motion if int(r["motion_id"]) not in neg_ids]
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Save
-# ─────────────────────────────────────────────────────────────────────
+########################################
+#                 Save                 #
+########################################
+
 
 def save_motion_id_txt(items: list, total: int, path: str, label: str) -> None:
-    """Построчно motion_id; первая строка — счётчик (label: negatives | positives)."""
+    """Построчно motion_id; первая строка — счётчик
+    (label: negatives | positives)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     ids_ = sorted(int(r["motion_id"]) for r in items)
     with open(path, "w") as f:
@@ -148,17 +160,24 @@ def save_results(
     return neg_path, pos_path, json_path
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Logging
-# ─────────────────────────────────────────────────────────────────────
+########################################
+#               Logging                #
+########################################
+
 
 def log_group_stats(items: list, label: str) -> None:
     if not items:
         logger.info(f"  {label}: (empty)")
         return
     mpjpes = [r["mpjpe"] for r in items if r.get("mpjpe") is not None]
-    max_mpjpes = [r["max_mpjpe"] for r in items if r.get("max_mpjpe") is not None]
-    coverages = [r["frame_coverage"] for r in items if r.get("frame_coverage") is not None]
+    max_mpjpes = [
+        r["max_mpjpe"] for r in items if r.get("max_mpjpe") is not None
+    ]
+    coverages = [
+        r["frame_coverage"]
+        for r in items
+        if r.get("frame_coverage") is not None
+    ]
     rewards = [r["reward"] for r in items if r.get("reward") is not None]
     successes = [r["success"] for r in items if r.get("success") is not None]
 
@@ -176,7 +195,9 @@ def log_group_stats(items: list, label: str) -> None:
     logger.info(f"  {' | '.join(parts)}")
 
 
-def log_summary(expert_name: str, split: str, per_motion: list, negatives: list) -> None:
+def log_summary(
+    expert_name: str, split: str, per_motion: list, negatives: list
+) -> None:
     total = len(per_motion)
     n_neg = len(negatives)
     positives = derive_positives(per_motion, negatives)
@@ -189,9 +210,10 @@ def log_summary(expert_name: str, split: str, per_motion: list, negatives: list)
     log_group_stats(positives, "positives")
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Mine (eval + filter)
-# ─────────────────────────────────────────────────────────────────────
+########################################
+#         Mine (eval + filter)         #
+########################################
+
 
 def _evaluate_all_experts(trainer, split):
     """
@@ -223,13 +245,22 @@ def _evaluate_all_experts(trainer, split):
                     f"Set eval_frequency > 0 in config."
                 )
 
-            if trainer.vectorized_eval and trainer.device.type in ('cuda', 'mps'):
+            if trainer.vectorized_eval and trainer.device.type in (
+                "cuda",
+                "mps",
+            ):
                 metrics, per_motion = trainer._evaluate_expert_vectorized(
-                    expert_name, ctx, wrapper, return_per_motion=True,
+                    expert_name,
+                    ctx,
+                    wrapper,
+                    return_per_motion=True,
                 )
             else:
                 metrics, per_motion = trainer.evaluate_expert(
-                    expert_name, ctx, wrapper, return_per_motion=True,
+                    expert_name,
+                    ctx,
+                    wrapper,
+                    return_per_motion=True,
                 )
             results[expert_name] = (metrics, per_motion)
     finally:
@@ -249,12 +280,15 @@ def mine_split(trainer, split, split_cfg, run_cfg, checkpoint_path):
 
     logger.info(f"{'=' * 60}")
     logger.info(f"Mining: {split}")
-    logger.info(f"  mean_mpjpe={mean_mpjpe}, max_mpjpe={max_mpjpe}, not_success={not_success}")
+    logger.info(
+        f"  mean_mpjpe={mean_mpjpe}, max_mpjpe={max_mpjpe}, "
+        f"not_success={not_success}"
+    )
     logger.info(f"{'=' * 60}")
 
     detailed = _evaluate_all_experts(trainer, split)
 
-    for expert_name, (metrics, per_motion) in detailed.items():
+    for expert_name, (_metrics, per_motion) in detailed.items():
         negatives = filter_negatives(
             per_motion,
             mean_mpjpe=mean_mpjpe,
@@ -291,7 +325,9 @@ def hydra_main():
     import hydra
     from omegaconf import DictConfig
 
-    @hydra.main(config_path="../../cfg", config_name="config", version_base=None)
+    @hydra.main(
+        config_path="../../cfg", config_name="config", version_base=None
+    )
     def _main(cfg: DictConfig) -> None:
         logging.basicConfig(
             level=logging.INFO,
@@ -325,19 +361,23 @@ def hydra_main():
         if run_cfg.mine_test:
             mine_split(trainer, "valid", run_cfg.test, run_cfg, checkpoint_path)
         if run_cfg.mine_train:
-            mine_split(trainer, "train", run_cfg.train, run_cfg, checkpoint_path)
+            mine_split(
+                trainer, "train", run_cfg.train, run_cfg, checkpoint_path
+            )
 
         logger.info("Done!")
 
     _main()
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Refilter (no eval, just re-apply thresholds to existing JSON)
-# ─────────────────────────────────────────────────────────────────────
+########################################
+#               Refilter               #
+########################################
+
 
 def refilter_main():
-    """Перефильтрация порогами без eval: JSON с ключом \"frames\" → тот же json + txt."""
+    """Перефильтрация порогами без eval:
+    JSON с ключом \"frames\" → тот же json + txt."""
     parser = argparse.ArgumentParser(
         description="Refilter from eval JSON (required key: frames)",
     )
@@ -353,7 +393,10 @@ def refilter_main():
     parser.add_argument(
         "--output",
         default=None,
-        help="Явный путь к *_negatives.txt (позитивы — *_positives.txt рядом; json по умолчанию всё равно --json)",
+        help=(
+            "Явный путь к *_negatives.txt (позитивы — "
+            "*_positives.txt рядом; json по умолчанию всё равно --json)"
+        ),
     )
     args = parser.parse_args(sys.argv[2:])  # skip "refilter"
 
@@ -363,7 +406,7 @@ def refilter_main():
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    with open(args.json_path, "r") as f:
+    with open(args.json_path) as f:
         data = json.load(f)
 
     if "frames" not in data:
@@ -394,7 +437,9 @@ def refilter_main():
         dire = os.path.dirname(neg_path)
         base = os.path.basename(neg_path)
         if base.endswith("_negatives.txt"):
-            pos_path = os.path.join(dire, base.replace("_negatives.txt", "_positives.txt"))
+            pos_path = os.path.join(
+                dire, base.replace("_negatives.txt", "_positives.txt")
+            )
         else:
             stem, _ext = os.path.splitext(neg_path)
             pos_path = f"{stem}_positives.txt"
@@ -405,14 +450,16 @@ def refilter_main():
     save_motion_id_txt(positives, total, pos_path, "positives")
 
     meta = dict(meta)
-    meta.update({
-        "mean_mpjpe": args.mean_mpjpe,
-        "max_mpjpe": args.max_mpjpe,
-        "not_success": args.not_success,
-        "negatives_count": len(negatives),
-        "positives_count": len(positives),
-        "total_motions": total,
-    })
+    meta.update(
+        {
+            "mean_mpjpe": args.mean_mpjpe,
+            "max_mpjpe": args.max_mpjpe,
+            "not_success": args.not_success,
+            "negatives_count": len(negatives),
+            "positives_count": len(positives),
+            "total_motions": total,
+        }
+    )
     save_eval_json(frames, meta, json_out)
 
     logger.info(f"  → {neg_path}")
@@ -420,9 +467,9 @@ def refilter_main():
     logger.info(f"  → {json_out}")
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  Entry point
-# ─────────────────────────────────────────────────────────────────────
+########################################
+#             Entry point              #
+########################################
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "refilter":

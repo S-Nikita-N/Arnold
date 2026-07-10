@@ -25,18 +25,19 @@ Lattice Policy — MLP с low-rank ковариацией (латентные ф
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from torch.distributions import LowRankMultivariateNormal
-from typing import List, Tuple, Optional
 
-from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-from arnold.torch_model.mlp import MLP
-from arnold.torch_model.normalization import SignatureNormalizerModule
 from arnold.profiler import Profiler
+from arnold.torch_model.mlp import MLP
+from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
+from arnold.torch_model.normalization import SignatureNormalizerModule
 
 
-# ---------------------------------------------------------------------------
-#  LatticePolicy
-# ---------------------------------------------------------------------------
+########################################
+#            LatticePolicy             #
+########################################
+
 
 class LatticePolicy(nn.Module):
     """
@@ -46,14 +47,15 @@ class LatticePolicy(nn.Module):
     без истории. obs_timeseries [batch, n_obs, history_len] → [:, :, -1].
 
     Профилирование:
-        self.profiler — Profiler (time + mem), настраивается через set_profiler()
+        self.profiler — Profiler (time + mem),
+        настраивается через set_profiler()
     """
 
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
-        mlp_units: Tuple[int, ...] = (2048, 1536, 1024, 1024, 512, 512),
+        mlp_units: tuple[int, ...] = (2048, 1536, 1024, 1024, 512, 512),
         mlp_activation: str = "silu",
         fix_std: bool = False,
         log_std_init: float = 0.0,
@@ -93,9 +95,9 @@ class LatticePolicy(nn.Module):
         # ── Profiler ──────────────────────────────────────────────────
         self.profiler = Profiler()
 
-    # ------------------------------------------------------------------
-    #  Profiler management
-    # ------------------------------------------------------------------
+    ########################################
+    #         Profiler management          #
+    ########################################
 
     def value_parameters(self):
         yield from self.value_net.parameters()
@@ -110,24 +112,24 @@ class LatticePolicy(nn.Module):
     def set_profiler(self, profiler: Profiler) -> None:
         self.profiler = profiler
 
-    # ------------------------------------------------------------------
-    #  Forward
-    # ------------------------------------------------------------------
+    ########################################
+    #               Forward                #
+    ########################################
 
     def forward(
         self,
         obs_timeseries: torch.Tensor,
-        obs_signatures: List[Tuple[str, ...]],
-        action_signatures: List[Tuple[str, ...]],
+        obs_signatures: list[tuple[str, ...]],
+        action_signatures: list[tuple[str, ...]],
         expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[
-        torch.Tensor,           # mean       [batch, action_dim]
-        Optional[torch.Tensor], # cov_factor [batch, action_dim, latent_dim]
-        Optional[torch.Tensor], # diag_std   [batch, action_dim]
-        Optional[torch.Tensor], # value      [batch, 1]
-        Optional[torch.Tensor], # latent_std [latent_dim]
+    ) -> tuple[
+        torch.Tensor,  # mean       [batch, action_dim]
+        torch.Tensor | None,  # cov_factor [batch, action_dim, latent_dim]
+        torch.Tensor | None,  # diag_std   [batch, action_dim]
+        torch.Tensor | None,  # value      [batch, 1]
+        torch.Tensor | None,  # latent_std [latent_dim]
     ]:
         """
         Returns:
@@ -155,9 +157,9 @@ class LatticePolicy(nn.Module):
         if return_std:
             with p.section("cov_factor"):
                 std = F.softplus(self.log_std) + self.min_diag_std
-                diag_std = std[:, :self.action_dim]       # [1, A]
-                latent_std = std[:, self.action_dim:].squeeze(0)  # [L]
-                W = self.action_mean.weight               # [A, L]
+                diag_std = std[:, : self.action_dim]  # [1, A]
+                latent_std = std[:, self.action_dim :].squeeze(0)  # [L]
+                W = self.action_mean.weight  # [A, L]
                 cov_factor = W * latent_std.unsqueeze(0)  # [A, L]
 
         # ── 4. Value network ─────────────────────────────────────────
@@ -168,24 +170,26 @@ class LatticePolicy(nn.Module):
 
         return action_mean, cov_factor, diag_std, value, latent_std
 
-    # ------------------------------------------------------------------
-    #  Action sampling
-    # ------------------------------------------------------------------
+    ########################################
+    #           Action sampling            #
+    ########################################
 
     def get_action(
         self,
         obs_timeseries: torch.Tensor,
-        obs_signatures: List[Tuple[str, ...]],
-        action_signatures: List[Tuple[str, ...]],
+        obs_signatures: list[tuple[str, ...]],
+        action_signatures: list[tuple[str, ...]],
         expert_name: str,
         deterministic: bool = False,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         p = self.profiler
 
         mean, cov_factor, diag_std, value, latent_std = self.forward(
-            obs_timeseries, obs_signatures, action_signatures,
+            obs_timeseries,
+            obs_signatures,
+            action_signatures,
             expert_name=expert_name,
             return_std=return_std,
             return_value=return_value,
@@ -193,10 +197,16 @@ class LatticePolicy(nn.Module):
 
         if deterministic:
             action = mean
-            log_prob = None if return_std else torch.zeros(mean.shape[0], 1, device=mean.device)
+            log_prob = (
+                None
+                if return_std
+                else torch.zeros(mean.shape[0], 1, device=mean.device)
+            )
         else:
             if cov_factor is None:
-                raise ValueError("return_std=False допустим только при deterministic=True")
+                raise ValueError(
+                    "return_std=False допустим только при deterministic=True"
+                )
             with p.section("dist_build"):
                 dist = self.build_action_dist(mean, cov_factor, diag_std)
             with p.section("dist_sample"):
@@ -206,9 +216,9 @@ class LatticePolicy(nn.Module):
         # env_action and store_action coincide for continuous-action policies.
         return action, action, log_prob, value
 
-    # ------------------------------------------------------------------
-    #  Distribution helpers
-    # ------------------------------------------------------------------
+    ########################################
+    #         Distribution helpers         #
+    ########################################
 
     def build_action_dist(
         self,
@@ -243,7 +253,8 @@ class LatticePolicy(nn.Module):
         dist = self.build_action_dist(mean, cov_factor, diag_std)
         return dist.entropy().mean()
 
-    # Generic distribution interface used by trainer (polymorphic across policies).
+    # Generic distribution interface used by trainer (polymorphic across
+    # policies).
     def dist_log_prob(self, dist, actions: torch.Tensor) -> torch.Tensor:
         """Log-prob of actions under dist; returns shape [B, 1]."""
         return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)

@@ -9,16 +9,15 @@
 
 import os
 import sys
-import logging
-from pathlib import Path
-
-import numpy as np
 import torch
+import logging
+import numpy as np
 
-from typing import Tuple, Iterator
+from pathlib import Path
 from omegaconf import DictConfig
-from hydra import compose, initialize_config_dir
+from collections.abc import Iterator
 from hydra.core.global_hydra import GlobalHydra
+from hydra import compose, initialize_config_dir
 
 
 # Пути к подмодулю Myohuman
@@ -35,6 +34,11 @@ if str(MYOHUMAN_SRC) not in sys.path:
 
 
 logger = logging.getLogger(__name__)
+
+
+########################################
+#                Config                #
+########################################
 
 
 def load_myohuman_config(
@@ -67,6 +71,11 @@ def load_myohuman_config(
     return cfg
 
 
+########################################
+#               Wrapper                #
+########################################
+
+
 class MyoHumanWrapper:
     """
     Интерфейс к среде MyoHuman (полнотелая модель).
@@ -89,15 +98,17 @@ class MyoHumanWrapper:
         expert_cfg: DictConfig = None,
         checkpoint_epoch: int = 0,
         device: str = "cpu",
-        overrides: list = [],
+        overrides: list = [],  # noqa: B006
         mode: str = "train",
         simple: bool = False,
     ):
         """
         Args:
             cfg_path: Путь к директории cfg MyoHuman (None для default)
-            expert_cfg: Готовый DictConfig (для multiprocessing, вместо cfg_path)
-            checkpoint_epoch: Эпоха чекпоинта эксперта (0 = без эксперта, -1 = latest)
+            expert_cfg: Готовый DictConfig
+                        (для multiprocessing, вместо cfg_path)
+            checkpoint_epoch: Эпоха чекпоинта эксперта
+                              (0 = без эксперта, -1 = latest)
             device: Устройство ("cpu" или "cuda")
             overrides: Hydra overrides
             mode: "train" или "valid" — определяет motion file и настройки
@@ -112,7 +123,7 @@ class MyoHumanWrapper:
         os.chdir(MYOHUMAN_ROOT)
 
         try:
-            from myohuman.env.myolegs_im import MyoLegsIm
+            from myohuman.env.myohuman_im import MyoHumanIm
 
             if expert_cfg is not None:
                 self.cfg = expert_cfg
@@ -129,16 +140,32 @@ class MyoHumanWrapper:
                 ]
 
                 if simple:
-                    xml_path = MYOHUMAN_ROOT / "xml" / "myohuman_simpletorso.xml"
-                    pose_file = "ik_test_simpletorso.pkl" if mode == "valid" else "ik_train_simpletorso.pkl"
-                    pose_path = MYOHUMAN_ROOT / "data" / "inverse_kinematics" / pose_file
+                    xml_path = (
+                        MYOHUMAN_ROOT / "xml" / "myohuman_simpletorso.xml"
+                    )
+                    pose_file = (
+                        "ik_test_simpletorso.pkl"
+                        if mode == "valid"
+                        else "ik_train_simpletorso.pkl"
+                    )
+                    pose_path = (
+                        MYOHUMAN_ROOT
+                        / "data"
+                        / "inverse_kinematics"
+                        / pose_file
+                    )
                     default_overrides.append(f"run.xml_path={xml_path}")
-                    default_overrides.append(f"run.initial_pose_file={pose_path}")
+                    default_overrides.append(
+                        f"run.initial_pose_file={pose_path}"
+                    )
 
                 if overrides:
                     default_overrides.extend(overrides)
 
-                if not any(override.startswith("run.headless=") for override in overrides):
+                if not any(
+                    override.startswith("run.headless=")
+                    for override in overrides
+                ):
                     default_overrides.append("run.headless=True")
 
                 cfg_dir = cfg_path if cfg_path else str(MYOHUMAN_CFG)
@@ -150,7 +177,7 @@ class MyoHumanWrapper:
             self.cfg.project_root = str(MYOHUMAN_ROOT)
 
             # Создаём среду напрямую (без полного AgentIM)
-            self._env = MyoLegsIm(self.cfg)
+            self._env = MyoHumanIm(self.cfg)
 
             # Параметры среды
             self.action_dim = self._env.action_space.shape[0]
@@ -171,54 +198,28 @@ class MyoHumanWrapper:
 
     def _load_expert(self, checkpoint_epoch: int) -> None:
         """
-        Загружает обученную policy эксперта из checkpoint.
+        Legacy path — no longer supported.
 
-        Args:
-            checkpoint_epoch: -1 для latest, >0 для конкретной эпохи
+        This used to load a Myohuman-native PolicyLattice/PolicyGaussian
+        checkpoint (produced by Myohuman's own PPO training loop, which has
+        been removed). Experts are now trained through Arnold, so the teacher
+        is an Arnold LatticePolicy checkpoint loaded via the GPU-teacher path
+        (set ``teacher_checkpoint`` in the expert config); it does not go
+        through this wrapper.
         """
-        from myohuman.learning.policy_lattice import PolicyLattice
-        from myohuman.learning.policy_gaussian import PolicyGaussian
-
-        state_dim = self._env.observation_space.shape[0]
-        action_dim = self._env.action_space.shape[0]
-
-        # Создаём policy сеть по конфигу
-        actor_type = self.cfg.learning.actor_type
-        if actor_type == "lattice":
-            self._expert_policy = PolicyLattice(
-                self.cfg, action_dim=action_dim, latent_dim=512, state_dim=state_dim
-            )
-        elif actor_type == "gauss":
-            self._expert_policy = PolicyGaussian(
-                self.cfg, action_dim=action_dim, state_dim=state_dim
-            )
-        else:
-            raise ValueError(f"Unknown actor_type: {actor_type}")
-
-        # Загружаем чекпоинт
-        if checkpoint_epoch == -1:
-            ckpt_path = os.path.join(self.cfg.output_dir, "model.pth")
-        else:
-            ckpt_path = os.path.join(
-                self.cfg.output_dir, f"model_epoch_{checkpoint_epoch}.pth"
-            )
-
-        if os.path.exists(ckpt_path):
-            state = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-            self._expert_policy.load_state_dict(state["policy"])
-            self._expert_policy.to(self.device)
-            self._expert_policy.eval()
-            logger.info(f"MyoHuman expert loaded from {ckpt_path}")
-        else:
-            logger.warning(f"Expert checkpoint not found: {ckpt_path}")
-            self._expert_policy = None
+        raise NotImplementedError(
+            "Myohuman-native expert checkpoints are no longer supported "
+            "(checkpoint_epoch must stay 0). Train the expert through Arnold "
+            "and point the expert config's `teacher_checkpoint` at the "
+            "resulting Arnold LatticePolicy .pth for OBC distillation."
+        )
 
     @property
     def has_expert(self) -> bool:
         """Есть ли загруженный эксперт."""
         return self._expert_policy is not None
 
-    def reset(self) -> Tuple[np.ndarray, dict]:
+    def reset(self) -> tuple[np.ndarray, dict]:
         """Сброс среды и возврат obs."""
         obs, info = self._env.reset()
         return obs, info
@@ -235,7 +236,8 @@ class MyoHumanWrapper:
         return self._env.forward_motions()
 
     def get_expert_action(self, flat_obs: np.ndarray) -> np.ndarray:
-        """Получить действие эксперта по плоскому obs (MyoHuman-native policy)."""
+        """Получить действие эксперта по плоскому obs
+        (MyoHuman-native policy)."""
         if self._expert_policy is None:
             raise RuntimeError(
                 "Expert policy not loaded. Use checkpoint_epoch != 0."
@@ -245,7 +247,9 @@ class MyoHumanWrapper:
             obs_t = torch.from_numpy(flat_obs).to(self.device).float()
             if obs_t.dim() == 1:
                 obs_t = obs_t.unsqueeze(0)
-            action = self._expert_policy.select_action(obs_t, mean_action=True)[0]
+            action = self._expert_policy.select_action(obs_t, mean_action=True)[
+                0
+            ]
             return action.cpu().numpy().squeeze()
 
     def preprocess_actions(self, action: np.ndarray) -> np.ndarray:
@@ -253,7 +257,9 @@ class MyoHumanWrapper:
         Clip и rescale действий (аналогично KinesisWrapper).
         Среда ожидает действия в [actions_low, actions_high].
         """
-        action = np.clip(action.astype(np.float32), self.actions_low, self.actions_high)
+        action = np.clip(
+            action.astype(np.float32), self.actions_low, self.actions_high
+        )
         d = (self.actions_high - self.actions_low) / 2.0
         m = (self.actions_low + self.actions_high) / 2.0
         return action * d + m
@@ -267,9 +273,15 @@ class MyoHumanWrapper:
 
         # Стандартизируем формат info
         if "r_body_pos" in info and isinstance(info["r_body_pos"], np.ndarray):
-            info["r_body_pos"] = info["r_body_pos"][0] if info["r_body_pos"].ndim > 0 else info["r_body_pos"]
+            info["r_body_pos"] = (
+                info["r_body_pos"][0]
+                if info["r_body_pos"].ndim > 0
+                else info["r_body_pos"]
+            )
         if "r_vel" in info and isinstance(info["r_vel"], np.ndarray):
-            info["r_vel"] = info["r_vel"][0] if info["r_vel"].ndim > 0 else info["r_vel"]
+            info["r_vel"] = (
+                info["r_vel"][0] if info["r_vel"].ndim > 0 else info["r_vel"]
+            )
 
         return next_obs, reward, terminated, truncated, info
 

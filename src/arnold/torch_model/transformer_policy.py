@@ -22,30 +22,33 @@ Multi-expert: поддерживает forward с expert_name для корре�
 """
 
 import torch
+import logging
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import LowRankMultivariateNormal
-from typing import Any, List, Dict, Optional, Tuple, Union
-import logging
 
-from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
-from arnold.torch_model.normalization import SignatureNormalizerModule
-from arnold.torch_model.body_tokenizer import BodyTokenizer
-from arnold.torch_model.action_tokenizer import ActionTokenizer, GroupMuscleMap
+from typing import Any
+from torch.distributions import LowRankMultivariateNormal
+
+from arnold.profiler import Profiler
 from arnold.action_parser import MuscleGrouping
 from arnold.observation_parser import BodyGroup
-from arnold.profiler import Profiler
+from arnold.torch_model.body_tokenizer import BodyTokenizer
+from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
+from arnold.torch_model.normalization import SignatureNormalizerModule
+from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
+from arnold.torch_model.action_tokenizer import GroupMuscleMap, ActionTokenizer
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Hierarchical Action Decoder layers
-# ---------------------------------------------------------------------------
+########################################
+#        Action decoder layers         #
+########################################
+
 
 class GroupToGroupLayer(nn.Module):
-    """Pre-norm transformer layer для group tokens с optional cross-attention."""
+    """Pre-norm transformer layer для group tokens с optional
+    cross-attention."""
 
     def __init__(
         self,
@@ -90,40 +93,37 @@ class GroupToGroupLayer(nn.Module):
     def forward(
         self,
         group_tokens: torch.Tensor,
-        encoder_out: Optional[torch.Tensor] = None,
+        encoder_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Self-attention (pre-norm)
         x = self.sa_norm(group_tokens)
         group_tokens = (
-            group_tokens + 
-            self.sa(x, x, x, need_weights=False)[0]
+            group_tokens + self.sa(x, x, x, need_weights=False)[0]
         )  # [B, G, D]
 
         # Cross-attention (pre-norm)
         if self.cross_attention and encoder_out is not None:
             group_tokens = (
-                group_tokens + 
-                self.ca(
+                group_tokens
+                + self.ca(
                     self.ca_norm(group_tokens),
                     encoder_out,
                     encoder_out,
-                    need_weights=False
+                    need_weights=False,
                 )[0]  # [B, G, D]
             )
 
         # FFN (pre-norm)
-        group_tokens = (
-            group_tokens + 
-            self.ff(self.ff_norm(group_tokens))
-        )
+        group_tokens = group_tokens + self.ff(self.ff_norm(group_tokens))
         return group_tokens
 
 
 class WithinGroupLayer(nn.Module):
     """Pre-norm transformer layer с batched SDPA внутри каждой группы.
 
-    Для каждой группы g собирается sequence [group_token_g, muscle_1, ..., muscle_k],
-    все группы паддятся до max_group_size+1 и обрабатываются как один batch через SDPA.
+    Для каждой группы g собирается sequence
+    [group_token_g, muscle_1, ..., muscle_k], все группы паддятся до
+    max_group_size+1 и обрабатываются как один batch через SDPA.
     """
 
     def __init__(
@@ -170,8 +170,8 @@ class WithinGroupLayer(nn.Module):
         group_tokens: torch.Tensor,
         muscle_tokens: torch.Tensor,
         gm_map: GroupMuscleMap,
-        encoder_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        encoder_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
 
         B, G, D = group_tokens.shape
         head_dim = D // self.num_heads
@@ -192,10 +192,7 @@ class WithinGroupLayer(nn.Module):
 
             # Assemble sequence: [group_token, muscle_1, ..., muscle_k, PAD...]
             x = torch.cat(
-                [
-                    b_group.unsqueeze(2),
-                    b_muscles
-                ],
+                [b_group.unsqueeze(2), b_muscles],
                 dim=2,
             ).reshape(B * n_b, seq_len, D)
 
@@ -208,12 +205,17 @@ class WithinGroupLayer(nn.Module):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
 
-            # Expand pre-computed mask: [n_b, 1, seq_len, seq_len] → [B*n_b, 1, seq_len, seq_len]
-            attn_mask = bucket.attn_mask.unsqueeze(0).expand(B, -1, -1, -1, -1).reshape(
-                B * n_b, 1, seq_len, seq_len
+            # Expand pre-computed mask:
+            # [n_b, 1, seq_len, seq_len] → [B*n_b, 1, seq_len, seq_len]
+            attn_mask = (
+                bucket.attn_mask.unsqueeze(0)
+                .expand(B, -1, -1, -1, -1)
+                .reshape(B * n_b, 1, seq_len, seq_len)
             )
 
-            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p
+            )
             attn_out = attn_out.transpose(1, 2).reshape(B * n_b, seq_len, D)
             x = x + self.out_proj(attn_out)
 
@@ -224,7 +226,15 @@ class WithinGroupLayer(nn.Module):
                     .expand(-1, n_b, -1, -1)
                     .reshape(B * n_b, -1, D)
                 )
-                x = x + self.ca(self.ca_norm(x), enc_expanded, enc_expanded, need_weights=False)[0]
+                x = (
+                    x
+                    + self.ca(
+                        self.ca_norm(x),
+                        enc_expanded,
+                        enc_expanded,
+                        need_weights=False,
+                    )[0]
+                )
 
             # --- FFN ---
             x = x + self.ff(self.ff_norm(x))
@@ -247,7 +257,7 @@ class HierarchicalActionDecoder(nn.Module):
 
     def __init__(
         self,
-        layer_configs: List[Dict[str, Any]],
+        layer_configs: list[dict[str, Any]],
         embed_dim: int,
         num_heads: int,
         ff_dim: int,
@@ -280,14 +290,15 @@ class HierarchicalActionDecoder(nn.Module):
                     )
                 )
             else:
-                raise ValueError(f"Unknown layer type: {layer_type!r} (use 'g2g' or 'wg')")
+                raise ValueError(
+                    f"Unknown layer type: {layer_type!r} (use 'g2g' or 'wg')"
+                )
 
         self.layers = nn.ModuleList(layers)
         self.final_norm = nn.LayerNorm(embed_dim)
 
         self.has_within_group = any(
-            isinstance(layer, WithinGroupLayer)
-            for layer in self.layers
+            isinstance(layer, WithinGroupLayer) for layer in self.layers
         )
 
         types_str = " → ".join(
@@ -296,28 +307,31 @@ class HierarchicalActionDecoder(nn.Module):
             for layer in self.layers
         )
         logger.info(
-            f"HierarchicalActionDecoder: {len(self.layers)} layers [{types_str}]"
+            f"HierarchicalActionDecoder: {len(self.layers)} layers "
+            f"[{types_str}]"
         )
 
     def forward(
         self,
         group_tokens: torch.Tensor,
         encoder_out: torch.Tensor,
-        muscle_query: Optional[torch.Tensor],
-        gm_map: Optional[GroupMuscleMap],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        muscle_query: torch.Tensor | None,
+        gm_map: GroupMuscleMap | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
             group_tokens: [B, G, D] — group query embeddings
             encoder_out: [B, S, D] — encoder output
-            muscle_query: [B, A, D] — per-muscle vocab embeddings в grouped order (None если нет within_group)
+            muscle_query: [B, A, D] — per-muscle vocab embeddings в
+                grouped order (None если нет within_group)
             gm_map: GroupMuscleMap для within_group attention
 
         Returns:
             group_out: [B, G, D]
-            muscle_out: [B, A, D] в grouped order, или None если нет within_group слоёв
+            muscle_out: [B, A, D] в grouped order, или None если нет
+                within_group слоёв
         """
-        muscle_tokens: Optional[torch.Tensor] = None
+        muscle_tokens: torch.Tensor | None = None
 
         for layer in self.layers:
             if isinstance(layer, GroupToGroupLayer):
@@ -340,18 +354,24 @@ class HierarchicalActionDecoder(nn.Module):
         return group_tokens, muscle_tokens
 
 
+########################################
+#          TransformerPolicy           #
+########################################
+
+
 class TransformerPolicy(nn.Module):
     """
     Arnold Transformer Policy с body-level tokenization.
 
     Вместо 953 скалярных токенов (один на элемент наблюдения)
-    используется ~70 body-level токенов. Self-attention: 70² vs 953² = 185x быстрее.
+    используется ~70 body-level токенов.
+    Self-attention: 70² vs 953² = 185x быстрее.
     """
 
     def __init__(
         self,
         vocab: SensorimotorVocabulary,
-        groups: Union[List[BodyGroup], Dict[str, List[BodyGroup]]],
+        groups: dict[str, list[BodyGroup]],
         history_len: int = 5,
         embed_dim: int = 128,
         ff_dim: int = 512,
@@ -368,20 +388,25 @@ class TransformerPolicy(nn.Module):
         log_std_init: float = 0.0,
         fix_std: bool = False,
         action_granulation: str = "none",
-        action_groupings: Optional[Dict[str, MuscleGrouping]] = None,
-        action_signatures_by_expert: Optional[Dict[str, List[Tuple[str, ...]]]] = None,
-        action_decoder_layers: Optional[List[Dict[str, Any]]] = None,
+        action_groupings: dict[str, MuscleGrouping] | None = None,
+        action_signatures_by_expert: dict[str, list[tuple[str, ...]]]
+        | None = None,
+        action_decoder_layers: list[dict[str, Any]] | None = None,
     ):
         """
         Args:
-            groups: List[BodyGroup] (single-expert) или
-                    Dict[expert_name → List[BodyGroup]] (multi-expert)
+            groups: Dict[expert_name → List[BodyGroup]] (multi-expert).
+                    Голый List[BodyGroup] не поддерживается — оборачивайте
+                    в dict {name: groups} даже для одного эксперта.
             cov_mode: "action_out" — W=action_out, latent_dim=embed_dim
-                      "head" — W=projection(action_out), latent_dim=action_cov_rank
+                      "head" — W=projection(action_out),
+                      latent_dim=action_cov_rank
             log_std: [1, max_action_dim + latent_dim] как в Lattice
             action_granulation: "none" | "anatomical" | "functional"
-            action_groupings: expert_name → MuscleGrouping (если granulation != "none")
-            action_signatures_by_expert: expert_name → action signatures (если granulation != "none")
+            action_groupings: expert_name → MuscleGrouping
+                (если granulation != "none")
+            action_signatures_by_expert: expert_name → action
+                signatures (если granulation != "none")
         """
         super().__init__()
 
@@ -424,12 +449,14 @@ class TransformerPolicy(nn.Module):
             nhead=num_heads,
             dim_feedforward=ff_dim,
             dropout=dropout,
-            activation='relu',
+            activation="relu",
             batch_first=True,
             norm_first=True,
         )
         encoder_norm = nn.LayerNorm(embed_dim)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_enc_layers, norm=encoder_norm)
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer, num_enc_layers, norm=encoder_norm
+        )
 
         # Action decoder: hierarchical (if configured) or legacy uniform
         if action_decoder_layers is not None:
@@ -448,13 +475,15 @@ class TransformerPolicy(nn.Module):
                 nhead=num_heads,
                 dim_feedforward=ff_dim,
                 dropout=dropout,
-                activation='relu',
+                activation="relu",
                 batch_first=True,
                 norm_first=True,
             )
             action_decoder_norm = nn.LayerNorm(embed_dim)
             self.action_decoder = nn.TransformerDecoder(
-                action_decoder_layer, num_act_dec_layers, norm=action_decoder_norm
+                action_decoder_layer,
+                num_act_dec_layers,
+                norm=action_decoder_norm,
             )
 
         value_decoder_layer = nn.TransformerDecoderLayer(
@@ -462,7 +491,7 @@ class TransformerPolicy(nn.Module):
             nhead=num_heads,
             dim_feedforward=ff_dim,
             dropout=dropout,
-            activation='relu',
+            activation="relu",
             batch_first=True,
             norm_first=True,
         )
@@ -500,9 +529,9 @@ class TransformerPolicy(nn.Module):
                 nn.init.orthogonal_(head.weight, gain=0.1)
                 nn.init.zeros_(head.bias)
 
-    # ------------------------------------------------------------------
-    #  Profiler management
-    # ------------------------------------------------------------------
+    ########################################
+    #         Profiler management          #
+    ########################################
 
     def value_parameters(self):
         yield from self.value_decoder.parameters()
@@ -525,15 +554,25 @@ class TransformerPolicy(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
+    ########################################
+    #               Forward                #
+    ########################################
+
     def forward(
         self,
         obs_timeseries: torch.Tensor,
-        obs_signatures: List[Tuple[str, ...]],
-        action_signatures: List[Tuple[str, ...]],
+        obs_signatures: list[tuple[str, ...]],
+        action_signatures: list[tuple[str, ...]],
         expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         p = self.profiler
         batch_size = obs_timeseries.shape[0]
 
@@ -543,7 +582,9 @@ class TransformerPolicy(nn.Module):
 
         # ── Body tokenizer ───────────────────────────────────────────
         with p.section("body_tokenizer"):
-            sensory_emb = self.body_tokenizer.encode(obs_timeseries, expert_name=expert_name)
+            sensory_emb = self.body_tokenizer.encode(
+                obs_timeseries, expert_name=expert_name
+            )
 
         # ── Vocab embed obs ──────────────────────────────────────────
         with p.section("vocab_embed_obs"):
@@ -559,45 +600,73 @@ class TransformerPolicy(nn.Module):
         # ── Action decoder ───────────────────────────────────────────
         if self.action_tokenizer is not None:
             with p.section("vocab_embed_act_groups"):
-                act_group_sigs = self.action_tokenizer.get_group_signatures(expert_name)
+                act_group_sigs = self.action_tokenizer.get_group_signatures(
+                    expert_name
+                )
                 group_query = self.vocab.get_embedding_batch(act_group_sigs)
-                group_query = group_query.unsqueeze(0).expand(batch_size, -1, -1)
+                group_query = group_query.unsqueeze(0).expand(
+                    batch_size, -1, -1
+                )
 
             if self.hierarchical_decoder is not None:
                 muscle_query = None
                 if self.hierarchical_decoder.has_within_group:
                     with p.section("vocab_embed_muscles"):
-                        muscle_sigs = self.action_tokenizer.get_muscle_signatures(expert_name)
-                        muscle_query = self.vocab.get_embedding_batch(muscle_sigs)
-                        muscle_query = muscle_query.unsqueeze(0).expand(batch_size, -1, -1)
+                        muscle_sigs = (
+                            self.action_tokenizer.get_muscle_signatures(
+                                expert_name
+                            )
+                        )
+                        muscle_query = self.vocab.get_embedding_batch(
+                            muscle_sigs
+                        )
+                        muscle_query = muscle_query.unsqueeze(0).expand(
+                            batch_size, -1, -1
+                        )
 
                 with p.section("action_decoder"):
-                    gm_map = self.action_tokenizer.get_group_muscle_map(expert_name)
+                    gm_map = self.action_tokenizer.get_group_muscle_map(
+                        expert_name
+                    )
                     group_out, muscle_out = self.hierarchical_decoder(
-                        group_query, encoder_out, muscle_query, gm_map,
+                        group_query,
+                        encoder_out,
+                        muscle_query,
+                        gm_map,
                     )
 
                 if muscle_out is not None:
                     with p.section("action_tokenizer"):
-                        reorder_idx = getattr(self.action_tokenizer, f"reorder_idx_{expert_name}")
+                        reorder_idx = getattr(
+                            self.action_tokenizer, f"reorder_idx_{expert_name}"
+                        )
                         D = muscle_out.shape[-1]
                         action_out = torch.gather(
-                            muscle_out, 1,
-                            reorder_idx.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, D),
+                            muscle_out,
+                            1,
+                            reorder_idx.unsqueeze(0)
+                            .unsqueeze(-1)
+                            .expand(batch_size, -1, D),
                         )
                         mean = self.action_mean_head(action_out).squeeze(-1)
                 else:
                     with p.section("action_tokenizer"):
-                        mean, action_out = self.action_tokenizer.decode(group_out, expert_name)
+                        mean, action_out = self.action_tokenizer.decode(
+                            group_out, expert_name
+                        )
             else:
                 with p.section("action_decoder"):
                     group_out = self.action_decoder(group_query, encoder_out)
                 with p.section("action_tokenizer"):
-                    mean, action_out = self.action_tokenizer.decode(group_out, expert_name)
+                    mean, action_out = self.action_tokenizer.decode(
+                        group_out, expert_name
+                    )
         else:
             with p.section("vocab_embed_act"):
                 action_query = self.vocab.get_embedding_batch(action_signatures)
-                action_query = action_query.unsqueeze(0).expand(batch_size, -1, -1)
+                action_query = action_query.unsqueeze(0).expand(
+                    batch_size, -1, -1
+                )
             with p.section("action_decoder"):
                 action_out = self.action_decoder(action_query, encoder_out)
                 mean = self.action_mean_head(action_out).squeeze(-1)
@@ -609,17 +678,32 @@ class TransformerPolicy(nn.Module):
         if return_std:
             with p.section("cov_factor"):
                 num_actions = action_out.shape[1]
-                std = torch.nn.functional.softplus(self.log_std) + self.min_diag_std
+                std = (
+                    torch.nn.functional.softplus(self.log_std)
+                    + self.min_diag_std
+                )
                 diag_std = std[:, :num_actions].expand(batch_size, -1)
 
                 if self.latent_dim == 0:
-                    cov_factor = torch.zeros(batch_size, num_actions, 1, device=mean.device, dtype=mean.dtype)
+                    cov_factor = torch.zeros(
+                        batch_size,
+                        num_actions,
+                        1,
+                        device=mean.device,
+                        dtype=mean.dtype,
+                    )
                 else:
-                    latent_std = std[:, self.max_action_dim: self.max_action_dim + self.latent_dim].squeeze(0)
+                    latent_std = std[
+                        :,
+                        self.max_action_dim : self.max_action_dim
+                        + self.latent_dim,
+                    ].squeeze(0)
 
                     if self.cov_mode == "action_out":
-                        cov_factor = action_out * latent_std.unsqueeze(0).unsqueeze(0)
-                        cov_factor = cov_factor / (self.latent_dim ** 0.5)
+                        cov_factor = action_out * latent_std.unsqueeze(
+                            0
+                        ).unsqueeze(0)
+                        cov_factor = cov_factor / (self.latent_dim**0.5)
                     else:
                         W = self.action_factor_head(action_out)
                         cov_factor = W * latent_std.unsqueeze(0).unsqueeze(0)
@@ -629,26 +713,36 @@ class TransformerPolicy(nn.Module):
         if return_value:
             with p.section("value_decoder"):
                 value_query = self.value_query.expand(batch_size, -1, -1)
-                value_encoder_out = encoder_out.detach() if self.detached_value_encoder else encoder_out
+                value_encoder_out = (
+                    encoder_out.detach()
+                    if self.detached_value_encoder
+                    else encoder_out
+                )
                 value_out = self.value_decoder(value_query, value_encoder_out)
                 value = self.value_head(value_out).squeeze(-1)
 
         return mean, cov_factor, diag_std, value, latent_std
 
+    ########################################
+    #           Action sampling            #
+    ########################################
+
     def get_action(
         self,
         obs_timeseries: torch.Tensor,
-        obs_signatures: List[Tuple[str, ...]],
-        action_signatures: List[Tuple[str, ...]],
+        obs_signatures: list[tuple[str, ...]],
+        action_signatures: list[tuple[str, ...]],
         expert_name: str,
         deterministic: bool = False,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         p = self.profiler
 
         mean, cov_factor, diag_std, value, _ = self.forward(
-            obs_timeseries, obs_signatures, action_signatures,
+            obs_timeseries,
+            obs_signatures,
+            action_signatures,
             expert_name=expert_name,
             return_std=return_std,
             return_value=return_value,
@@ -656,10 +750,16 @@ class TransformerPolicy(nn.Module):
 
         if deterministic:
             action = mean
-            log_prob = None if return_std else torch.zeros(mean.shape[0], 1, device=mean.device)
+            log_prob = (
+                None
+                if return_std
+                else torch.zeros(mean.shape[0], 1, device=mean.device)
+            )
         else:
             if cov_factor is None:
-                raise ValueError("return_std=False допустим только при deterministic=True")
+                raise ValueError(
+                    "return_std=False допустим только при deterministic=True"
+                )
             with p.section("dist_build"):
                 dist = self.build_action_dist(mean, cov_factor, diag_std)
             with p.section("dist_sample"):
@@ -669,9 +769,9 @@ class TransformerPolicy(nn.Module):
         # env_action and store_action coincide for continuous-action policies.
         return action, action, log_prob, value
 
-    # ------------------------------------------------------------------
-    #  Distribution helpers
-    # ------------------------------------------------------------------
+    ########################################
+    #         Distribution helpers         #
+    ########################################
 
     def build_action_dist(
         self,
@@ -697,7 +797,8 @@ class TransformerPolicy(nn.Module):
                     cov_diag=cov_diag,
                 )
 
-    # Generic distribution interface used by trainer (polymorphic across policies).
+    # Generic distribution interface used by trainer (polymorphic across
+    # policies).
     def dist_log_prob(self, dist, actions: torch.Tensor) -> torch.Tensor:
         return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)
 

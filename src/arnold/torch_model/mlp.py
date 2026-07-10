@@ -6,14 +6,18 @@ MLP — многослойный перцептрон.
 
 import torch
 import torch.nn as nn
-from typing import Union, Tuple
+
+
+########################################
+#                 MLP                  #
+########################################
 
 
 class MLP(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        hidden_dims: Union[Tuple[int, ...], list],
+        hidden_dims: tuple[int, ...] | list,
         activation: str = "tanh",
     ):
         super().__init__()

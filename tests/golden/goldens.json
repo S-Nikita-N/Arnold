@@ -1,0 +1,532 @@
+{
+  "action_parser": {
+    "anatomical": {
+      "granule_base_map": {
+        "BIClong_l": "BIClong",
+        "TRIlat_l": "TRIlat",
+        "TRIlong_l": "TRIlong",
+        "deltoids_l": "deltoids",
+        "gasmed_r": "gasmed",
+        "gluteus_max_l": "gluteus_max",
+        "iliacus_r": "iliacus",
+        "latissimus_r": "latissimus",
+        "pectoralis_r": "pectoralis",
+        "psoas_r": "psoas",
+        "recfem_r": "recfem",
+        "soleus_r": "soleus",
+        "tibant_r": "tibant",
+        "vasint_l": "vasint",
+        "vaslat_l": "vaslat",
+        "vasmed_l": "vasmed"
+      },
+      "group_order": [
+        "BIClong_l",
+        "TRIlat_l",
+        "TRIlong_l",
+        "deltoids_l",
+        "gasmed_r",
+        "gluteus_max_l",
+        "iliacus_r",
+        "latissimus_r",
+        "pectoralis_r",
+        "psoas_r",
+        "recfem_r",
+        "soleus_r",
+        "tibant_r",
+        "vasint_l",
+        "vaslat_l",
+        "vasmed_l"
+      ],
+      "muscle_to_group": {
+        "BIClong_l": "BIClong_l",
+        "DELT1_l": "deltoids_l",
+        "DELT2_l": "deltoids_l",
+        "DELT3_l": "deltoids_l",
+        "LAT1_r": "latissimus_r",
+        "LAT2_r": "latissimus_r",
+        "LAT3_r": "latissimus_r",
+        "PECM1_r": "pectoralis_r",
+        "PECM2_r": "pectoralis_r",
+        "PECM3_r": "pectoralis_r",
+        "TRIlat_l": "TRIlat_l",
+        "TRIlong_l": "TRIlong_l",
+        "gasmed_r": "gasmed_r",
+        "glmax1_l": "gluteus_max_l",
+        "glmax2_l": "gluteus_max_l",
+        "glmax3_l": "gluteus_max_l",
+        "iliacus_r": "iliacus_r",
+        "psoas_r": "psoas_r",
+        "recfem_r": "recfem_r",
+        "soleus_r": "soleus_r",
+        "tibant_r": "tibant_r",
+        "vasint_l": "vasint_l",
+        "vaslat_l": "vaslat_l",
+        "vasmed_l": "vasmed_l"
+      },
+      "n_groups": 16,
+      "n_muscles": 24
+    },
+    "functional": {
+      "granule_base_map": {
+        "ankle_dorsiflexors_r": "ankle_dorsiflexors",
+        "ankle_plantarflexors_r": "ankle_plantarflexors",
+        "elbow_extensors_l": "elbow_extensors",
+        "elbow_flexors_l": "elbow_flexors",
+        "hip_extensors_l": "hip_extensors",
+        "hip_flexors_r": "hip_flexors",
+        "knee_extensors_l": "knee_extensors",
+        "knee_flexors_r": "knee_flexors",
+        "shoulder_abductors_l": "shoulder_abductors",
+        "shoulder_extensors_l": "shoulder_extensors",
+        "shoulder_extensors_r": "shoulder_extensors",
+        "shoulder_flexors_l": "shoulder_flexors",
+        "shoulder_flexors_r": "shoulder_flexors"
+      },
+      "group_order": [
+        "ankle_dorsiflexors_r",
+        "ankle_plantarflexors_r",
+        "elbow_extensors_l",
+        "elbow_flexors_l",
+        "hip_extensors_l",
+        "hip_flexors_r",
+        "knee_extensors_l",
+        "knee_flexors_r",
+        "shoulder_abductors_l",
+        "shoulder_extensors_l",
+        "shoulder_extensors_r",
+        "shoulder_flexors_l",
+        "shoulder_flexors_r"
+      ],
+      "muscle_to_group": {
+        "BIClong_l": "elbow_flexors_l",
+        "DELT1_l": "shoulder_flexors_l",
+        "DELT2_l": "shoulder_abductors_l",
+        "DELT3_l": "shoulder_extensors_l",
+        "LAT1_r": "shoulder_extensors_r",
+        "LAT2_r": "shoulder_extensors_r",
+        "LAT3_r": "shoulder_extensors_r",
+        "PECM1_r": "shoulder_flexors_r",
+        "PECM2_r": "shoulder_flexors_r",
+        "PECM3_r": "shoulder_flexors_r",
+        "TRIlat_l": "elbow_extensors_l",
+        "TRIlong_l": "elbow_extensors_l",
+        "gasmed_r": "knee_flexors_r",
+        "glmax1_l": "hip_extensors_l",
+        "glmax2_l": "hip_extensors_l",
+        "glmax3_l": "hip_extensors_l",
+        "iliacus_r": "hip_flexors_r",
+        "psoas_r": "hip_flexors_r",
+        "recfem_r": "hip_flexors_r",
+        "soleus_r": "ankle_plantarflexors_r",
+        "tibant_r": "ankle_dorsiflexors_r",
+        "vasint_l": "knee_extensors_l",
+        "vaslat_l": "knee_extensors_l",
+        "vasmed_l": "knee_extensors_l"
+      },
+      "n_groups": 13,
+      "n_muscles": 24
+    },
+    "hybrid": {
+      "granule_base_map": {
+        "ankle_dorsiflexors_r": "ankle_dorsiflexors",
+        "ankle_plantarflexors_r": "ankle_plantarflexors",
+        "deltoids_l": "deltoids",
+        "elbow_extensors_l": "elbow_extensors",
+        "elbow_flexors_l": "elbow_flexors",
+        "gluteus_max_l": "gluteus_max",
+        "hip_flexors_r": "hip_flexors",
+        "knee_extensors_l": "knee_extensors",
+        "latissimus_r": "latissimus",
+        "pectoralis_r": "pectoralis"
+      },
+      "group_order": [
+        "ankle_dorsiflexors_r",
+        "ankle_plantarflexors_r",
+        "deltoids_l",
+        "elbow_extensors_l",
+        "elbow_flexors_l",
+        "gluteus_max_l",
+        "hip_flexors_r",
+        "knee_extensors_l",
+        "latissimus_r",
+        "pectoralis_r"
+      ],
+      "muscle_to_group": {
+        "BIClong_l": "elbow_flexors_l",
+        "DELT1_l": "deltoids_l",
+        "DELT2_l": "deltoids_l",
+        "DELT3_l": "deltoids_l",
+        "LAT1_r": "latissimus_r",
+        "LAT2_r": "latissimus_r",
+        "LAT3_r": "latissimus_r",
+        "PECM1_r": "pectoralis_r",
+        "PECM2_r": "pectoralis_r",
+        "PECM3_r": "pectoralis_r",
+        "TRIlat_l": "elbow_extensors_l",
+        "TRIlong_l": "elbow_extensors_l",
+        "gasmed_r": "ankle_plantarflexors_r",
+        "glmax1_l": "gluteus_max_l",
+        "glmax2_l": "gluteus_max_l",
+        "glmax3_l": "gluteus_max_l",
+        "iliacus_r": "hip_flexors_r",
+        "psoas_r": "hip_flexors_r",
+        "recfem_r": "hip_flexors_r",
+        "soleus_r": "ankle_plantarflexors_r",
+        "tibant_r": "ankle_dorsiflexors_r",
+        "vasint_l": "knee_extensors_l",
+        "vaslat_l": "knee_extensors_l",
+        "vasmed_l": "knee_extensors_l"
+      },
+      "n_groups": 10,
+      "n_muscles": 24
+    }
+  },
+  "atok_group_signatures": [
+    [
+      "ankle_dorsiflexors",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "ankle_plantarflexors",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "deltoids",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "elbow_extensors",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "elbow_flexors",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "gluteus_max",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "hip_flexors",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "knee_extensors",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "latissimus",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "pectoralis",
+      "r",
+      "muscle",
+      "activation"
+    ]
+  ],
+  "atok_group_sizes": [
+    1,
+    2,
+    3,
+    2,
+    1,
+    3,
+    3,
+    3,
+    3,
+    3
+  ],
+  "atok_hidden_shape": [
+    2,
+    24,
+    16
+  ],
+  "atok_mean_shape": [
+    2,
+    24
+  ],
+  "atok_muscle_sigs": [
+    [
+      "tibant",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "soleus",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "gasmed",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "DELT1",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "DELT2",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "DELT3",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "TRIlong",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "TRIlat",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "BIClong",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "glmax1",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "glmax2",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "glmax3",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "psoas",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "iliacus",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "recfem",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "vaslat",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "vasmed",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "vasint",
+      "l",
+      "muscle",
+      "activation"
+    ],
+    [
+      "LAT1",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "LAT2",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "LAT3",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "PECM1",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "PECM2",
+      "r",
+      "muscle",
+      "activation"
+    ],
+    [
+      "PECM3",
+      "r",
+      "muscle",
+      "activation"
+    ]
+  ],
+  "atok_n_groups": 10,
+  "body_tok_n_groups": 62,
+  "body_tok_out_shape": [
+    2,
+    62,
+    16
+  ],
+  "body_tok_types": [
+    "body",
+    "feet",
+    "muscle",
+    "root",
+    "task",
+    "task_muscle"
+  ],
+  "moe_cov_persample_shape": [
+    3,
+    6,
+    4
+  ],
+  "moe_cov_shared_shape": [
+    6,
+    4
+  ],
+  "moe_soft_lb": 0.05595046654343605,
+  "moe_soft_stats": {
+    "lb_batch_entropy": 1.3613682985305786,
+    "lb_ind_entropy": 1.2866119146347046,
+    "lb_l_batch": 0.024926066398620605,
+    "lb_l_ind": 0.6204879879951477,
+    "lb_total": 0.05595046654343605
+  },
+  "moe_sparse_lb": 1.0336973667144775,
+  "norm_stats": {
+    "a|b": {
+      "M2": 3.609205484390259,
+      "count": 8,
+      "mean": -0.5872409343719482
+    },
+    "c|d": {
+      "M2": 13.071648597717285,
+      "count": 8,
+      "mean": -0.23767322301864624
+    },
+    "e|f": {
+      "M2": 7.123703956604004,
+      "count": 8,
+      "mean": 0.10397490859031677
+    }
+  },
+  "obs_groups_per_body": 62,
+  "obs_groups_per_spec": 174,
+  "obs_groups_scalar": 303,
+  "obs_n_elements": 303,
+  "obs_n_signatures": 303,
+  "obs_n_specs": 15,
+  "obs_spec_names_sizes": [
+    [
+      "root_height",
+      1
+    ],
+    [
+      "root_tilt",
+      4
+    ],
+    [
+      "local_body_pos",
+      27
+    ],
+    [
+      "local_body_rot",
+      60
+    ],
+    [
+      "local_body_vel",
+      30
+    ],
+    [
+      "local_body_ang_vel",
+      30
+    ],
+    [
+      "muscle_len",
+      24
+    ],
+    [
+      "muscle_vel",
+      24
+    ],
+    [
+      "muscle_force",
+      24
+    ],
+    [
+      "feet_contacts",
+      4
+    ],
+    [
+      "diff_local_body_pos",
+      9
+    ],
+    [
+      "diff_local_vel",
+      9
+    ],
+    [
+      "local_ref_body_pos",
+      9
+    ],
+    [
+      "diff_muscle_len",
+      24
+    ],
+    [
+      "diff_muscle_vel",
+      24
+    ]
+  ],
+  "vocab_size": 362
+}

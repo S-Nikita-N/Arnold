@@ -8,12 +8,12 @@ Per-expert режим определяется по loss-весам каждог
 Примеры:
 
     # Single expert — OBC дистилляция из Kinesis
-    poetry run python -m arnold.train_arnold \
+    uv run python -m arnold.train_arnold \
         '+run/experts@run.experts.kin=kinesis' \
         exp_name=obc_kinesis
 
     # Single expert — PPO на MyoHuman
-    poetry run python -m arnold.train_arnold \
+    uv run python -m arnold.train_arnold \
         '+run/experts@run.experts.myo=myohuman' \
         run.experts.myo.simple=true \
         run.experts.myo.learning.ppo_weight=1.0 \
@@ -23,13 +23,13 @@ Per-expert режим определяется по loss-весам каждог
         exp_name=ppo_myohuman
 
     # DataParallel — обучение на 2 GPU
-    poetry run python -m arnold.train_arnold \
+    uv run python -m arnold.train_arnold \
         device_ids=[0,1] \
         '+run/experts@run.experts.kin=kinesis' \
         exp_name=obc_2gpu
 
     # Multi-expert — MyoHuman (PPO) + Kinesis (OBC)
-    poetry run python -m arnold.train_arnold \
+    uv run python -m arnold.train_arnold \
         device=cuda \
         '+run/experts@run.experts.myo=myohuman' \
         '+run/experts@run.experts.kin=kinesis' \
@@ -64,7 +64,7 @@ import logging
 import warnings
 
 from pathlib import Path
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf, DictConfig
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -74,7 +74,14 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 from arnold.trainer import ArnoldTrainer
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
-warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
+warnings.filterwarnings(
+    "ignore", category=SyntaxWarning, message="invalid escape sequence"
+)
+
+
+########################################
+#               Training               #
+########################################
 
 
 def setup_logging(output_dir: str) -> logging.Logger:
@@ -87,7 +94,7 @@ def setup_logging(output_dir: str) -> logging.Logger:
         handlers=[
             logging.StreamHandler(sys.stdout),
             logging.FileHandler(os.path.join(output_dir, "training.log")),
-        ]
+        ],
     )
     return logging.getLogger(__name__)
 

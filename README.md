@@ -17,7 +17,7 @@
 
 ## Клонирование на новом компьютере
 
-Нужны: **Git**, **Git LFS**, **Python 3.12+**, **Poetry**.
+Нужны: **Git**, **Git LFS**, **uv** (поставит Python 3.12+ сам; `install.sh` установит uv при отсутствии).
 
 ### 1. Установить Git LFS (один раз на системе)
 
@@ -55,8 +55,9 @@ git lfs pull
 
 ```bash
 ./scripts/install.sh
-poetry shell
 ```
+
+Окружение создаётся в `.venv`; команды запускаются через `uv run python ...` (или `source .venv/bin/activate`).
 
 ### 4. Настроить экспертов (патчи + копирование ассетов + загрузка модели)
 
@@ -82,7 +83,7 @@ poetry shell
 | 1 | `git lfs install` (один раз) |
 | 2 | `git clone --recurse-submodules <url> arnold && cd arnold` |
 | 3 | `git lfs pull` |
-| 4 | `./scripts/install.sh` → `poetry shell` |
+| 4 | `./scripts/install.sh` |
 | 5 | `./scripts/setup_experts.sh` |
 
 ---
@@ -92,7 +93,7 @@ poetry shell
 - `cfg/` — конфиги Hydra (env, learning, run).
 - `src/arnold/` — код Arnold (policy, trainer, experts).
 - `downloads/Kinesis_assets/` — ассеты для Kinesis (Git LFS).
-- `scripts/install.sh` — установка Poetry и зависимостей.
+- `scripts/install.sh` — установка uv и зависимостей.
 - `scripts/setup_experts.sh` — патчи и подготовка данных экспертов.
 
 Подробнее по экспертам: [src/arnold/experts/README.md](src/arnold/experts/README.md).

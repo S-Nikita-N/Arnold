@@ -20,13 +20,18 @@ MoE-Lattice Policy — Shared Expert + N Routed Experts, Low-Rank Covariance.
   Требуется: shared_expert_units[-1] == expert_units[-1] (общий latent_dim).
 
 Параметры:
-  shared_units        — слои shared_trunk (общий для всех путей), по умолчанию (2048,1536,1024)
-  shared_expert_units — слои shared expert body, последний = latent_dim (default (256,64))
+  shared_units        — слои shared_trunk (общий для всех путей),
+                        по умолчанию (2048,1536,1024)
+  shared_expert_units — слои shared expert body,
+                        последний = latent_dim (default (256,64))
   num_experts         — размер пула routing-экспертов (default 5)
-  top_k               — сколько routing-экспертов активировать (default 1 → 1/5 пула)
-  expert_units        — слои каждого routing-эксперта, последний = latent_dim (default (512,512))
+  top_k               — сколько routing-экспертов активировать
+                        (default 1 → 1/5 пула)
+  expert_units        — слои каждого routing-эксперта,
+                        последний = latent_dim (default (512,512))
   gate_units          — слои отдельной gate MLP (input = h), default (512, 256)
-  value_units         — слои отдельной value MLP, default (2048,1536,1024,512,512)
+  value_units         — слои отдельной value MLP,
+                        default (2048,1536,1024,512,512)
   alpha               — вес shared expert (default 0.3), routing = 1-alpha
   load_balance_weight — вес Switch Transformer LB loss (default 0.01)
 """
@@ -36,18 +41,19 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from torch.distributions import LowRankMultivariateNormal
-from typing import Dict, List, Tuple, Optional
 
-from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-from arnold.torch_model.mlp import MLP
-from arnold.torch_model.normalization import SignatureNormalizerModule
 from arnold.profiler import Profiler
+from arnold.torch_model.mlp import MLP
+from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
+from arnold.torch_model.normalization import SignatureNormalizerModule
 
 
-# ---------------------------------------------------------------------------
-#  MoELatticePolicy
-# ---------------------------------------------------------------------------
+########################################
+#           MoELatticePolicy           #
+########################################
+
 
 class MoELatticePolicy(nn.Module):
     """
@@ -55,7 +61,8 @@ class MoELatticePolicy(nn.Module):
 
     Ковариация строится из ВСЕХ экспертов (shared + routed), взвешивается gate:
         cov_factor = α·W_shared + (1-α)·Σ(w_i·W_i), всё умножено на latent_std
-        shape:       [batch, action_dim, latent_dim]  — per-sample через gate weights
+        shape:       [batch, action_dim, latent_dim]  — per-sample
+                     через gate weights
 
     Требование: shared_expert_units[-1] == expert_units[-1] (единый latent_dim).
     """
@@ -64,13 +71,13 @@ class MoELatticePolicy(nn.Module):
         self,
         state_dim: int,
         action_dim: int,
-        shared_units: Tuple[int, ...],
-        shared_expert_units: Tuple[int, ...],
+        shared_units: tuple[int, ...],
+        shared_expert_units: tuple[int, ...],
         num_experts: int,
         top_k: int,
-        expert_units: Tuple[int, ...],
-        gate_units: Tuple[int, ...],
-        value_units: Tuple[int, ...],
+        expert_units: tuple[int, ...],
+        gate_units: tuple[int, ...],
+        value_units: tuple[int, ...],
         alpha: float = 0.3,
         load_balance_weight: float = 0.01,
         fix_std: bool = False,
@@ -92,7 +99,7 @@ class MoELatticePolicy(nn.Module):
         self.load_balance_weight = load_balance_weight
         self.min_diag_std = min_diag_std
         self.cov_from_experts = cov_from_experts
-        self.soft_routing = (top_k == num_experts)
+        self.soft_routing = top_k == num_experts
         self.soft_target_entropy = soft_target_entropy
         self.soft_ind_weight = soft_ind_weight
         self.soft_batch_weight = soft_batch_weight
@@ -122,7 +129,9 @@ class MoELatticePolicy(nn.Module):
 
         self.latent_dim = shared_expert_units[-1]
 
-        self.shared_expert_net = MLP(trunk_out_dim, shared_expert_units, activation)
+        self.shared_expert_net = MLP(
+            trunk_out_dim, shared_expert_units, activation
+        )
         self.shared_expert_head = nn.Linear(self.latent_dim, action_dim)
         self.shared_expert_head.weight.data.mul_(0.1)
         self.shared_expert_head.bias.data.zero_()
@@ -166,9 +175,9 @@ class MoELatticePolicy(nn.Module):
         # ── Profiler ──────────────────────────────────────────────────
         self.profiler = Profiler()
 
-    # ------------------------------------------------------------------
-    #  Profiler management
-    # ------------------------------------------------------------------
+    ########################################
+    #         Profiler management          #
+    ########################################
 
     def value_parameters(self):
         yield from self.value_net.parameters()
@@ -183,25 +192,29 @@ class MoELatticePolicy(nn.Module):
     def set_profiler(self, profiler: Profiler) -> None:
         self.profiler = profiler
 
-    # ------------------------------------------------------------------
-    #  Gate
-    # ------------------------------------------------------------------
+    ########################################
+    #                 Gate                 #
+    ########################################
 
     def gate_forward(self, h: torch.Tensor):
         logits = self.gate(h)
         gate_probs = F.softmax(logits, dim=-1)
-        tie_breaker = torch.rand_like(gate_probs) * 1e-7
-        _, top_k_indices = torch.topk(gate_probs + tie_breaker, self.top_k, dim=-1)
+        # Deterministic top-k: ties resolved by torch.topk's stable index order
+        # (previously a random tie-breaker made routing non-reproducible
+        # in eval).
+        _, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
         top_k_vals = gate_probs.gather(1, top_k_indices)
         top_k_indices = top_k_indices.long()
-        top_k_weights = top_k_vals / (top_k_vals.sum(dim=-1, keepdim=True) + 1e-8)
+        top_k_weights = top_k_vals / (
+            top_k_vals.sum(dim=-1, keepdim=True) + 1e-8
+        )
         return top_k_weights, top_k_indices, gate_probs
 
     def compute_sparse_balance_loss(
         self,
         top_k_indices: torch.Tensor,
         gate_probs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         """Switch Transformer LB loss for sparse routing (top_k < N)."""
         N = self.num_experts
         flat = top_k_indices.view(-1)
@@ -213,7 +226,7 @@ class MoELatticePolicy(nn.Module):
     def compute_soft_balance_loss(
         self,
         gate_probs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         """Targeted InfoMax for soft routing (top_k == N).
         H_ind → target_entropy per sample, H_batch → max entropy over batch."""
         eps = 1e-8
@@ -223,7 +236,9 @@ class MoELatticePolicy(nn.Module):
         l_ind = ((ind_entropy - self.soft_target_entropy) ** 2).mean()
 
         mean_probs = gate_probs.mean(dim=0)
-        batch_entropy = -(mean_probs * torch.log(mean_probs.clamp_min(eps))).sum()
+        batch_entropy = -(
+            mean_probs * torch.log(mean_probs.clamp_min(eps))
+        ).sum()
         max_batch_entropy = math.log(self.num_experts)
         l_batch = max_batch_entropy - batch_entropy
 
@@ -237,15 +252,15 @@ class MoELatticePolicy(nn.Module):
         }
         return loss.unsqueeze(0), stats
 
-    # ------------------------------------------------------------------
-    #  Covariance factor (выделено для gradient checkpointing)
-    # ------------------------------------------------------------------
+    ########################################
+    #          Covariance factor           #
+    ########################################
 
     def _compute_cov_factor(
         self,
         top_k_indices: torch.Tensor,
         top_k_weights: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Fused cov_factor computation в fp32.
 
@@ -267,8 +282,8 @@ class MoELatticePolicy(nn.Module):
 
         with torch.autocast(device_type=device_type, enabled=False):
             std = F.softplus(self.log_std.float()) + self.min_diag_std
-            diag_std = std[:, :self.action_dim]             # [1, A]
-            latent_std = std[:, self.action_dim:].squeeze(0) # [L]
+            diag_std = std[:, : self.action_dim]  # [1, A]
+            latent_std = std[:, self.action_dim :].squeeze(0)  # [L]
 
             W_shared = self.shared_expert_head.weight
 
@@ -284,12 +299,15 @@ class MoELatticePolicy(nn.Module):
             # одним matmul [B, E+1] @ [E+1, A*L] → [B, A, L].
 
             mix = torch.zeros(
-                batch_size, self.num_experts + 1,
-                dtype=torch.float32, device=device,
+                batch_size,
+                self.num_experts + 1,
+                dtype=torch.float32,
+                device=device,
             )
             mix[:, 0] = self.alpha
             mix[:, 1:].scatter_(
-                1, top_k_indices,
+                1,
+                top_k_indices,
                 ((1.0 - self.alpha) * top_k_weights).float(),
             )
 
@@ -301,34 +319,37 @@ class MoELatticePolicy(nn.Module):
                 dim=0,
             )
             W_all_flat = (W_all * latent_std[None, None, :]).view(
-                self.num_experts + 1, -1,
+                self.num_experts + 1,
+                -1,
             )
 
             cov_factor = (mix @ W_all_flat).view(
-                batch_size, self.action_dim, self.latent_dim,
+                batch_size,
+                self.action_dim,
+                self.latent_dim,
             )
 
         return cov_factor, diag_std, latent_std
 
-    # ------------------------------------------------------------------
-    #  Forward
-    # ------------------------------------------------------------------
+    ########################################
+    #               Forward                #
+    ########################################
 
     def forward(
         self,
         obs_timeseries: torch.Tensor,
-        obs_signatures: List[Tuple[str, ...]],
-        action_signatures: List[Tuple[str, ...]],
+        obs_signatures: list[tuple[str, ...]],
+        action_signatures: list[tuple[str, ...]],
         expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[
-        torch.Tensor,           # mean          [batch, action_dim]
-        Optional[torch.Tensor], # cov_factor    [batch, action_dim, latent_dim]
-        Optional[torch.Tensor], # diag_std      [batch, action_dim]
-        Optional[torch.Tensor], # value         [batch, 1]
-        Optional[torch.Tensor], # latent_std    [latent_dim]
-        torch.Tensor,           # load_balance_loss [1]
+    ) -> tuple[
+        torch.Tensor,  # mean          [batch, action_dim]
+        torch.Tensor | None,  # cov_factor    [batch, action_dim, latent_dim]
+        torch.Tensor | None,  # diag_std      [batch, action_dim]
+        torch.Tensor | None,  # value         [batch, 1]
+        torch.Tensor | None,  # latent_std    [latent_dim]
+        torch.Tensor,  # load_balance_loss [1]
     ]:
         """
         Returns:
@@ -339,7 +360,7 @@ class MoELatticePolicy(nn.Module):
         # ── Normalizer ───────────────────────────────────────────────
         with p.section("normalizer"):
             obs_norm = self.obs_normalizer(obs_signatures, obs_timeseries)
-            x = obs_norm[:, :, -1]    # [batch, state_dim] — последний timestep
+            x = obs_norm[:, :, -1]  # [batch, state_dim] — последний timestep
             batch_size = x.shape[0]
 
         if x.shape[1] != self.state_dim:
@@ -356,25 +377,34 @@ class MoELatticePolicy(nn.Module):
 
         # ── 2. Shared expert ─────────────────────────────────────────
         with p.section("shared_expert"):
-            e_shared = self.shared_expert_net(h)            # [batch, latent_dim]
-            shared_mean = self.shared_expert_head(e_shared) # [batch, action_dim]
+            e_shared = self.shared_expert_net(h)  # [batch, latent_dim]
+            shared_mean = self.shared_expert_head(
+                e_shared
+            )  # [batch, action_dim]
 
         # ── 3. Gate routing (отдельная MLP на h) ─────────────────────
         with p.section("gate_forward"):
             top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
             if self.soft_routing:
-                load_balance_loss, lb_stats = self.compute_soft_balance_loss(gate_probs)
+                load_balance_loss, lb_stats = self.compute_soft_balance_loss(
+                    gate_probs
+                )
             else:
                 load_balance_loss, lb_stats = self.compute_sparse_balance_loss(
-                    top_k_indices, gate_probs,
+                    top_k_indices,
+                    gate_probs,
                 )
 
         # ── 4. Routing experts (sparse) ──────────────────────────────
         flat_indices = top_k_indices.view(-1)
-        flat_h = h.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, h.size(-1))
+        flat_h = (
+            h.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, h.size(-1))
+        )
         flat_route_out = torch.zeros(
-            batch_size * self.top_k, self.action_dim,
-            dtype=h.dtype, device=h.device,
+            batch_size * self.top_k,
+            self.action_dim,
+            dtype=h.dtype,
+            device=h.device,
         )
 
         with p.section("routing_experts"):
@@ -388,7 +418,9 @@ class MoELatticePolicy(nn.Module):
 
         # ── 5. Combine shared + routed → mean ────────────────────────
         with p.section("mean_combine"):
-            route_means = flat_route_out.view(batch_size, self.top_k, self.action_dim)
+            route_means = flat_route_out.view(
+                batch_size, self.top_k, self.action_dim
+            )
             routed_mean = (route_means * top_k_weights.unsqueeze(-1)).sum(dim=1)
             mean = self.alpha * shared_mean + (1.0 - self.alpha) * routed_mean
 
@@ -399,7 +431,8 @@ class MoELatticePolicy(nn.Module):
         if return_std:
             with p.section("cov_factor"):
                 cov_factor, diag_std, latent_std = self._compute_cov_factor(
-                    top_k_indices, top_k_weights,
+                    top_k_indices,
+                    top_k_weights,
                 )
 
         # Кеш норм для диагностики (detach, без влияния на граф)
@@ -419,7 +452,9 @@ class MoELatticePolicy(nn.Module):
                 # Norm approximation: avoid materializing [B, A, L] routed_W
                 # by using per-expert weight norms + mean gate usage.
                 # E[||routed_W[b]||] ≈ Σ_i mean_probs[i] · ||W_i||
-                s_cov_norm = self.shared_expert_head.weight.detach().norm().item()
+                s_cov_norm = (
+                    self.shared_expert_head.weight.detach().norm().item()
+                )
                 W_exp_norms = torch.stack(
                     [eh.weight.detach().norm() for eh in self.expert_heads]
                 )
@@ -440,9 +475,9 @@ class MoELatticePolicy(nn.Module):
 
         return mean, cov_factor, diag_std, value, latent_std, load_balance_loss
 
-    # ------------------------------------------------------------------
-    #  Gate diagnostics
-    # ------------------------------------------------------------------
+    ########################################
+    #           Gate diagnostics           #
+    ########################################
 
     def get_gate_stats(self, x: torch.Tensor) -> dict:
         """Per-expert routing fractions, mean probabilities, gate entropy."""
@@ -452,7 +487,9 @@ class MoELatticePolicy(nn.Module):
         one_hot = F.one_hot(top_k_indices, N).float()
         routing_fracs = one_hot.sum(dim=1).mean(dim=0)
         mean_probs = gate_probs.mean(dim=0)
-        gate_entropy = -(gate_probs * (gate_probs + 1e-8).log()).sum(dim=-1).mean()
+        gate_entropy = (
+            -(gate_probs * (gate_probs + 1e-8).log()).sum(dim=-1).mean()
+        )
         balance_entropy = -(mean_probs * (mean_probs + 1e-8).log()).sum()
         return {
             "routing_fracs": routing_fracs.detach(),
@@ -461,24 +498,26 @@ class MoELatticePolicy(nn.Module):
             "balance_entropy": balance_entropy.item(),
         }
 
-    # ------------------------------------------------------------------
-    #  Action sampling
-    # ------------------------------------------------------------------
+    ########################################
+    #           Action sampling            #
+    ########################################
 
     def get_action(
         self,
         obs_timeseries: torch.Tensor,
-        obs_signatures: List[Tuple[str, ...]],
-        action_signatures: List[Tuple[str, ...]],
+        obs_signatures: list[tuple[str, ...]],
+        action_signatures: list[tuple[str, ...]],
         expert_name: str,
         deterministic: bool = False,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         p = self.profiler
 
         mean, cov_factor, diag_std, value, _, _lb = self.forward(
-            obs_timeseries, obs_signatures, action_signatures,
+            obs_timeseries,
+            obs_signatures,
+            action_signatures,
             expert_name=expert_name,
             return_std=return_std,
             return_value=return_value,
@@ -486,10 +525,16 @@ class MoELatticePolicy(nn.Module):
 
         if deterministic:
             action = mean
-            log_prob = None if return_std else torch.zeros(mean.shape[0], 1, device=mean.device)
+            log_prob = (
+                None
+                if return_std
+                else torch.zeros(mean.shape[0], 1, device=mean.device)
+            )
         else:
             if cov_factor is None:
-                raise ValueError("return_std=False допустим только при deterministic=True")
+                raise ValueError(
+                    "return_std=False допустим только при deterministic=True"
+                )
             with p.section("dist_build"):
                 dist = self.build_action_dist(mean, cov_factor, diag_std)
             with p.section("dist_sample"):
@@ -499,9 +544,9 @@ class MoELatticePolicy(nn.Module):
         # env_action and store_action coincide for continuous-action policies.
         return action, action, log_prob, value
 
-    # ------------------------------------------------------------------
-    #  Distribution helpers
-    # ------------------------------------------------------------------
+    ########################################
+    #         Distribution helpers         #
+    ########################################
 
     def build_action_dist(
         self,
@@ -527,7 +572,8 @@ class MoELatticePolicy(nn.Module):
                     cov_diag=cov_diag,
                 )
 
-    # Generic distribution interface used by trainer (polymorphic across policies).
+    # Generic distribution interface used by trainer (polymorphic across
+    # policies).
     def dist_log_prob(self, dist, actions: torch.Tensor) -> torch.Tensor:
         return safe_lrmvn_log_prob(dist, actions.float()).unsqueeze(-1)
 

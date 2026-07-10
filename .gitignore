@@ -5,3 +5,22 @@ docs/arnold_tex/*
 .env
 MUJOCO_LOG.TXT
 src/arnold/experts/data/*
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.json
+htmlcov/
+.hypothesis/
+.venv/
+
+# Hydra / experiment outputs
+outputs/
+multirun/
+
+# ML artifacts
+*.ckpt
+*.pt
+*.pth
+wandb/

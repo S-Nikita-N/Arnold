@@ -6,17 +6,24 @@ WandB Logger для Arnold OBC Training.
 """
 
 import os
-import logging
-import psutil
-import numpy as np
 import torch
 import wandb
-from typing import Dict, Any, Optional
-from omegaconf import DictConfig, OmegaConf
+import psutil
+import logging
+import numpy as np
+
+from typing import Any
+from omegaconf import OmegaConf, DictConfig
+
 from arnold.logger import OBCLogger
 
 
 logger = logging.getLogger(__name__)
+
+
+########################################
+#             WandbLogger              #
+########################################
 
 
 class WandbLogger:
@@ -25,9 +32,15 @@ class WandbLogger:
 
     Usage:
         wandb_logger = WandbLogger(cfg)
-        wandb_logger.log_train_multi(epoch, expert_loggers, diagnostics, total_steps)
+        wandb_logger.log_train_multi(
+            epoch, expert_loggers, diagnostics, total_steps
+        )
         wandb_logger.finish()
     """
+
+    ########################################
+    #                Setup                 #
+    ########################################
 
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
@@ -48,9 +61,13 @@ class WandbLogger:
         )
         logger.info(f"WandB initialized: {wandb.run.name} ({wandb.run.id})")
 
+    ########################################
+    #               Logging                #
+    ########################################
+
     def log(
         self,
-        metrics: Dict[str, Any],
+        metrics: dict[str, Any],
         step: int,
         prefix: str = "",
     ) -> None:
@@ -61,8 +78,8 @@ class WandbLogger:
     def log_train(
         self,
         epoch: int,
-        expert_loggers: Dict[str, OBCLogger],
-        all_diagnostics: Dict[str, Dict[str, float]],
+        expert_loggers: dict[str, OBCLogger],
+        all_diagnostics: dict[str, dict[str, float]],
         total_steps: int,
     ) -> None:
         """
@@ -85,25 +102,36 @@ class WandbLogger:
         }
 
         for expert_name, obc_logger in expert_loggers.items():
-
             # Rewards
-            log_dict[f"{expert_name}/reward/avg_episode"] = obc_logger.avg_episode_reward
+            log_dict[f"{expert_name}/reward/avg_episode"] = (
+                obc_logger.avg_episode_reward
+            )
             log_dict[f"{expert_name}/reward/avg_step"] = obc_logger.avg_reward
             log_dict[f"{expert_name}/reward/min"] = obc_logger.min_reward
             log_dict[f"{expert_name}/reward/max"] = obc_logger.max_reward
-            log_dict[f"{expert_name}/reward/min_episode"] = obc_logger.min_episode_reward
-            log_dict[f"{expert_name}/reward/max_episode"] = obc_logger.max_episode_reward
+            log_dict[f"{expert_name}/reward/min_episode"] = (
+                obc_logger.min_episode_reward
+            )
+            log_dict[f"{expert_name}/reward/max_episode"] = (
+                obc_logger.max_episode_reward
+            )
 
             # Episodes
-            log_dict[f"{expert_name}/episode/avg_length"] = obc_logger.avg_episode_len
+            log_dict[f"{expert_name}/episode/avg_length"] = (
+                obc_logger.avg_episode_len
+            )
             log_dict[f"{expert_name}/episode/count"] = obc_logger.num_episodes
 
             # Losses
             log_dict[f"{expert_name}/loss/ppo"] = obc_logger.ppo_loss
-            log_dict[f"{expert_name}/loss/imitation"] = obc_logger.imitation_loss
+            log_dict[f"{expert_name}/loss/imitation"] = (
+                obc_logger.imitation_loss
+            )
             log_dict[f"{expert_name}/loss/value"] = obc_logger.value_loss
             log_dict[f"{expert_name}/loss/entropy"] = obc_logger.entropy_loss
-            log_dict[f"{expert_name}/loss/mean_penalty"] = obc_logger.mean_penalty_loss
+            log_dict[f"{expert_name}/loss/mean_penalty"] = (
+                obc_logger.mean_penalty_loss
+            )
             log_dict[f"{expert_name}/loss/total"] = obc_logger.total_loss
 
             # Timing
@@ -111,13 +139,19 @@ class WandbLogger:
             log_dict[f"{expert_name}/time/update"] = obc_logger.update_time
 
             # Steps
-            log_dict[f"{expert_name}/progress/batch_steps"] = obc_logger.num_steps
+            log_dict[f"{expert_name}/progress/batch_steps"] = (
+                obc_logger.num_steps
+            )
 
             # Reward components & eval metrics from sampling rollouts
             eval_keys = {"mpjpe", "frame_coverage", "success"}
             for k, v in obc_logger.info_dict.items():
                 if len(v) > 0:
-                    prefix = "train_rollout" if k in eval_keys else "reward_component"
+                    prefix = (
+                        "train_rollout"
+                        if k in eval_keys
+                        else "reward_component"
+                    )
                     log_dict[f"{expert_name}/{prefix}/{k}"] = float(np.mean(v))
 
             # PPO diagnostics
@@ -127,16 +161,17 @@ class WandbLogger:
                     log_dict[f"{expert_name}/diag/{k}"] = v
 
             # Явный лог im_contrib чтобы сразу видеть баланс с PPO
-            if "imitation_loss" in diag and "imitation_loss_per_sample" in diag:
-                log_dict[f"{expert_name}/loss/imitation_batch"] = diag["imitation_loss"]
-                log_dict[f"{expert_name}/loss/imitation_per_sample"] = diag["imitation_loss_per_sample"]
+            if "imitation_loss" in diag:
+                log_dict[f"{expert_name}/loss/imitation_batch"] = diag[
+                    "imitation_loss"
+                ]
 
         wandb.log(log_dict, step=epoch)
 
     def log_eval(
         self,
         epoch: int,
-        eval_metrics: Dict[str, float],
+        eval_metrics: dict[str, float],
     ) -> None:
         wandb.log(eval_metrics, step=epoch)
 
@@ -147,6 +182,10 @@ class WandbLogger:
         artifact.add_file(config_path)
         wandb.log_artifact(artifact)
 
+    ########################################
+    #              Lifecycle               #
+    ########################################
+
     def finish(self) -> None:
         wandb.finish()
         logger.info("WandB run finished")
@@ -154,10 +193,14 @@ class WandbLogger:
     def watch(self, model: torch.nn.Module, log_freq: int = 100) -> None:
         wandb.watch(model, log="gradients", log_freq=log_freq)
 
+    ########################################
+    #              Properties              #
+    ########################################
+
     @property
-    def run_dir(self) -> Optional[str]:
+    def run_dir(self) -> str | None:
         return wandb.run.dir
 
     @property
-    def run_name(self) -> Optional[str]:
+    def run_name(self) -> str | None:
         return wandb.run.name

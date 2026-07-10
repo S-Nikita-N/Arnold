@@ -173,11 +173,10 @@ if case " $EXPERTS " in *" kinesis "*) true;; *) false;; esac; then
         KINESIS_DATA="$KINESIS_ROOT/data"
         ASSETS="$REPO_ROOT/downloads/Kinesis_assets"
 
-        # Определяем python из poetry venv
-        poetry -C "$REPO_ROOT" env use python3.12 2>/dev/null || true
-        VENV_PY="$(poetry -C "$REPO_ROOT" env info -p 2>/dev/null)/bin/python"
+        # Определяем python из uv venv
+        VENV_PY="$REPO_ROOT/.venv/bin/python"
         if [ ! -x "$VENV_PY" ]; then
-            VENV_PY="poetry -C $REPO_ROOT run python"
+            VENV_PY="uv run --project $REPO_ROOT python"
         fi
 
         # Ассеты и модели: предпочитаем локальную копию (downloads/Kinesis_assets),
