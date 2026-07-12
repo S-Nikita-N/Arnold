@@ -330,9 +330,10 @@ def main():
     npz["gae_returns"] = batch.returns.detach().numpy()
     npz["gae_advantages"] = batch.advantages.detach().numpy()
 
-    # -- write --
+    # -- write (trailing newline keeps end-of-file-fixer happy) --
     with open(GOLDEN_JSON, "w") as f:
         json.dump(goldens, f, indent=2, sort_keys=True)
+        f.write("\n")
     np.savez(GOLDEN_NPZ, **npz)
     print(f"wrote {GOLDEN_JSON}")
     print(f"wrote {GOLDEN_NPZ} with keys: {sorted(npz.keys())}")
