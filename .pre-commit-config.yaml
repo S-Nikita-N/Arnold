@@ -5,9 +5,9 @@
 # third-party / not ours to reformat.
 exclude: |
   (?x)^(
-    src/arnold/experts/Kinesis/
-    | src/arnold/experts/myochallenge-lattice/
-    | src/arnold/experts/Myohuman/
+    src/myotrainer/experts/Kinesis/
+    | src/myotrainer/experts/myochallenge-lattice/
+    | src/myotrainer/experts/Myohuman/
     | downloads/
     | docs/
     | data/
@@ -70,4 +70,4 @@ repos:
         name: No hard-coded CUDA device (device-agnostic)
         entry: uv run python tools/pre_commit/check_device.py
         language: system
-        files: ^src/arnold/.*\.py$
+        files: ^src/myotrainer/.*\.py$

@@ -1,0 +1,80 @@
+# MyoTrainer Architecture & Learning Config
+
+# ==================== Policy Type ====================
+policy: transformer  # transformer | lattice | moe
+
+# ==================== Global (parser, sampling) ====================
+history_len: 5
+tokenizer_granularity: scalar  # scalar | per_spec | per_body
+
+# ==================== Transformer (только при policy: transformer) ====================
+transformer:
+  embed_dim: 128
+  ff_dim: 512
+  num_heads: 4
+  num_enc_layers: 6
+  num_act_dec_layers: 6
+  num_val_dec_layers: 6
+  dropout: 0.0
+  detached_value_encoder: false
+  action_cov_rank: 16  # 0 = independent (diagonal), >0 = low-rank (Lattice-like)
+  cov_mode: head  # action_out | head
+  min_diag_std: 0.0001
+  log_std_init: 0
+  action_granulation: none  # none | anatomical | functional | hybrid
+  # Hierarchical decoder (optional, overrides num_act_dec_layers):
+  # Types: g2g (group_to_group) | wg (within_group). cross_attn defaults: g2g=true, wg=false.
+  # Example:
+  #   [{type: g2g, cross_attn: true}, {type: g2g, cross_attn: true}, {type: wg, cross_attn: false}]
+  action_decoder_layers: null
+
+# ==================== PPO ====================
+batch_size: 128
+learning_rate: 1.e-4
+value_learning_rate: 1.e-3
+weight_decay: 0.0
+gamma: 0.99
+tau: 0.95  # GAE lambda
+clip_epsilon: 0.2
+value_clip: true
+opt_num_epochs: 10
+grad_accum_steps: 1  # >1: accumulate gradients over N mini-batches before optimizer.step()
+grad_clip: 0.5
+value_grad_clip: 0.5
+
+# ==================== Training ====================
+max_epochs: 100000
+use_scheduler: false
+transfer_mode: true
+transfer_keep_value: true  # false = reinit value net from scratch at transfer
+use_compile: false
+use_bfloat16: false
+
+# ==================== MoE-Lattice (только при policy: moe) ====================
+moe:
+  shared_units: [2048, 1536, 1024]      # shared trunk
+  shared_expert_units: [256, 64]        # последний = latent_dim (должен совпадать с expert_units[-1])
+  num_experts: 5
+  top_k: 2                              # 2/5 пула
+  expert_units: [512, 512]
+  gate_units: [512, 256]                # отдельная gate MLP (вход = h)
+  value_units: [2048, 1536, 1024, 512, 512]  # отдельная value MLP
+  alpha: 0.3                            # вес shared expert
+  cov_from_experts: false               # true = per-sample cov из всех экспертов, false = shared-only (memory-efficient)
+  soft_target_entropy: 0.5              # таргет H_ind per sample (soft routing, top_k=N)
+  soft_ind_weight: 0.05                 # вес MSE(H_ind - target) внутри soft balance loss
+  soft_batch_weight: 1.0                # вес (max_H - H_batch) внутри soft balance loss
+
+# ==================== Lattice (только при policy_type: lattice) ====================
+lattice:
+  mlp_units: [2048, 1536, 1024, 1024, 512, 512]
+  mlp_activation: silu
+  fix_std: false
+  log_std_init: 0
+  min_diag_std: 0.0001
+
+# ==================== Gate MoE (только при policy: gate_moe) ====================
+gate_moe:
+  expert_checkpoints: []
+  gate_units: [1024, 512, 256]
+  gate_activation: silu

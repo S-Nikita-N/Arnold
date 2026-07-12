@@ -174,7 +174,7 @@ def test_get_action_and_dist_helpers(builder):
 
 
 def test_gate_moe_empty_checkpoints_raises():
-    from arnold.torch_model.policy_gate_moe import GateMoEPolicy
+    from myotrainer.torch_model.policy_gate_moe import GateMoEPolicy
 
     with pytest.raises(ValueError, match="expert_checkpoints"):
         GateMoEPolicy(state_dim=8, action_dim=4, expert_checkpoints=[])

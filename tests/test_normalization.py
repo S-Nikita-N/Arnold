@@ -1,4 +1,4 @@
-"""Characterization tests for arnold.torch_model.normalization."""
+"""Characterization tests for myotrainer.torch_model.normalization."""
 
 import torch
 import pytest
@@ -6,7 +6,7 @@ import numpy as np
 
 import helpers
 
-from arnold.torch_model.normalization import SignatureNormalizerModule
+from myotrainer.torch_model.normalization import SignatureNormalizerModule
 
 SIGS = [("a", "b"), ("c", "d"), ("e", "f")]
 

@@ -1,0 +1,304 @@
+"""
+Обёртка для среды MyoHuman (full-body musculoskeletal model).
+
+Аналогична KinesisWrapper, но работает с полнотелой моделью myohuman.xml.
+Поддерживает два режима:
+  1. С экспертом — загружает обученную Lattice/Gaussian policy (для OBC/OBC-PPO)
+  2. Без эксперта — только среда (для чистого PPO)
+"""
+
+import os
+import sys
+import torch
+import logging
+import numpy as np
+
+from pathlib import Path
+from omegaconf import DictConfig
+from collections.abc import Iterator
+from hydra.core.global_hydra import GlobalHydra
+from hydra import compose, initialize_config_dir
+
+
+# Пути к подмодулю Myohuman
+MYOHUMAN_ROOT = Path(__file__).parent / "Myohuman"
+MYOHUMAN_SRC = MYOHUMAN_ROOT / "src"
+MYOHUMAN_CFG = MYOHUMAN_ROOT / "cfg"
+MYOHUMAN_DATA = MYOHUMAN_ROOT / "data"
+
+# Добавляем в sys.path для корректных импортов
+if str(MYOHUMAN_ROOT) not in sys.path:
+    sys.path.insert(0, str(MYOHUMAN_ROOT))
+if str(MYOHUMAN_SRC) not in sys.path:
+    sys.path.insert(0, str(MYOHUMAN_SRC))
+
+
+logger = logging.getLogger(__name__)
+
+
+########################################
+#                Config                #
+########################################
+
+
+def load_myohuman_config(
+    config_dir: str = None,
+    overrides: list = None,
+) -> DictConfig:
+    """
+    Загружает полный конфиг MyoHuman через Hydra.
+
+    Args:
+        config_dir: Путь к директории cfg MyoHuman (по умолчанию — из submodule)
+        overrides: Список Hydra overrides
+
+    Returns:
+        DictConfig с полным конфигом
+    """
+    if config_dir is None:
+        config_dir = str(MYOHUMAN_CFG)
+
+    if overrides is None:
+        overrides = []
+
+    # Очищаем предыдущую инициализацию Hydra если есть
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        cfg = compose(config_name="config", overrides=overrides)
+
+    return cfg
+
+
+########################################
+#               Wrapper                #
+########################################
+
+
+class MyoHumanWrapper:
+    """
+    Интерфейс к среде MyoHuman (полнотелая модель).
+
+    Два режима работы:
+    - С экспертом: загружает обученную policy из checkpoint (для OBC/OBC-PPO)
+    - Без эксперта: только среда (для PPO), get_expert_action() недоступен
+
+    Интерфейс:
+    - reset() → (obs, info)
+    - step(action) → (obs, reward, terminated, truncated, info)
+    - get_expert_action(flat_obs) → np.ndarray
+    - forward_motions() → Iterator[int]
+    - env property → среда
+    """
+
+    def __init__(
+        self,
+        cfg_path: str = None,
+        expert_cfg: DictConfig = None,
+        checkpoint_epoch: int = 0,
+        device: str = "cpu",
+        overrides: list = [],  # noqa: B006
+        mode: str = "train",
+        simple: bool = False,
+    ):
+        """
+        Args:
+            cfg_path: Путь к директории cfg MyoHuman (None для default)
+            expert_cfg: Готовый DictConfig
+                        (для multiprocessing, вместо cfg_path)
+            checkpoint_epoch: Эпоха чекпоинта эксперта
+                              (0 = без эксперта, -1 = latest)
+            device: Устройство ("cpu" или "cuda")
+            overrides: Hydra overrides
+            mode: "train" или "valid" — определяет motion file и настройки
+            simple: Использовать упрощённую модель (simpletorso)
+        """
+        self.mode = mode
+        self.simple = simple
+        self.device = torch.device(device)
+        self._expert_policy = None
+
+        original_cwd = os.getcwd()
+        os.chdir(MYOHUMAN_ROOT)
+
+        try:
+            from myohuman.env.myohuman_im import MyoHumanIm
+
+            if expert_cfg is not None:
+                self.cfg = expert_cfg
+            else:
+                if mode == "valid":
+                    run_config = "run=eval_run"
+                else:
+                    run_config = "run=train_run"
+
+                default_overrides = [
+                    run_config,
+                    "no_log=True",
+                    "test=True" if mode == "valid" else "test=False",
+                ]
+
+                if simple:
+                    xml_path = (
+                        MYOHUMAN_ROOT / "xml" / "myohuman_simpletorso.xml"
+                    )
+                    pose_file = (
+                        "ik_test_simpletorso.pkl"
+                        if mode == "valid"
+                        else "ik_train_simpletorso.pkl"
+                    )
+                    pose_path = (
+                        MYOHUMAN_ROOT
+                        / "data"
+                        / "inverse_kinematics"
+                        / pose_file
+                    )
+                    default_overrides.append(f"run.xml_path={xml_path}")
+                    default_overrides.append(
+                        f"run.initial_pose_file={pose_path}",
+                    )
+
+                if overrides:
+                    default_overrides.extend(overrides)
+
+                if not any(
+                    override.startswith("run.headless=")
+                    for override in overrides
+                ):
+                    default_overrides.append("run.headless=True")
+
+                cfg_dir = cfg_path if cfg_path else str(MYOHUMAN_CFG)
+                self.cfg = load_myohuman_config(
+                    config_dir=cfg_dir,
+                    overrides=default_overrides,
+                )
+
+            # Устанавливаем project_root на корень Myohuman
+            self.cfg.project_root = str(MYOHUMAN_ROOT)
+
+            # Создаём среду напрямую (без полного AgentIM)
+            self._env = MyoHumanIm(self.cfg)
+
+            # Параметры среды
+            self.action_dim = self._env.action_space.shape[0]
+            self.obs_dim = self._env.observation_space.shape[0]
+            self.actions_low = self._env.action_space.low.copy()
+            self.actions_high = self._env.action_space.high.copy()
+
+            # Загружаем эксперта
+            if checkpoint_epoch != 0:
+                self._load_expert(checkpoint_epoch)
+
+            # Загружаем движения (инициализируем active set)
+            if not (mode == "valid" and self.cfg.run.im_eval):
+                self._env.sample_motions()
+
+        finally:
+            os.chdir(original_cwd)
+
+    def _load_expert(self, checkpoint_epoch: int) -> None:
+        """
+        Legacy path — no longer supported.
+
+        This used to load a Myohuman-native PolicyLattice/PolicyGaussian
+        checkpoint (produced by Myohuman's own PPO training loop, which has
+        been removed). Experts are now trained through MyoTrainer, so the
+        teacher is a MyoTrainer LatticePolicy checkpoint loaded via the
+        GPU-teacher path (set ``teacher_checkpoint`` in the expert config);
+        it does not go through this wrapper.
+        """
+        raise NotImplementedError(
+            "Myohuman-native expert checkpoints are no longer supported "
+            "(checkpoint_epoch must stay 0). Train the expert through "
+            "MyoTrainer and point the expert config's `teacher_checkpoint` at "
+            "resulting MyoTrainer LatticePolicy .pth for OBC distillation.",
+        )
+
+    @property
+    def has_expert(self) -> bool:
+        """Есть ли загруженный эксперт."""
+        return self._expert_policy is not None
+
+    def reset(self) -> tuple[np.ndarray, dict]:
+        """Сброс среды и возврат obs."""
+        obs, info = self._env.reset()
+        return obs, info
+
+    def forward_motions(self) -> Iterator[int]:
+        """
+        Итератор по всем движениям в библиотеке.
+        Каждая итерация загружает следующее движение.
+        После yield нужно вызвать reset().
+
+        Yields:
+            int: Индекс текущего движения.
+        """
+        return self._env.forward_motions()
+
+    def get_expert_action(self, flat_obs: np.ndarray) -> np.ndarray:
+        """Получить действие эксперта по плоскому obs
+        (MyoHuman-native policy)."""
+        if self._expert_policy is None:
+            raise RuntimeError(
+                "Expert policy not loaded. Use checkpoint_epoch != 0.",
+            )
+
+        with torch.no_grad():
+            obs_t = torch.from_numpy(flat_obs).to(self.device).float()
+            if obs_t.dim() == 1:
+                obs_t = obs_t.unsqueeze(0)
+            action = self._expert_policy.select_action(obs_t, mean_action=True)[
+                0
+            ]
+            return action.cpu().numpy().squeeze()
+
+    def preprocess_actions(self, action: np.ndarray) -> np.ndarray:
+        """
+        Clip и rescale действий (аналогично KinesisWrapper).
+        Среда ожидает действия в [actions_low, actions_high].
+        """
+        action = np.clip(
+            action.astype(np.float32),
+            self.actions_low,
+            self.actions_high,
+        )
+        d = (self.actions_high - self.actions_low) / 2.0
+        m = (self.actions_low + self.actions_high) / 2.0
+        return action * d + m
+
+    def step(self, action: np.ndarray):
+        """
+        Шаг в среде с предварительным clip + rescale действий.
+        """
+        action = self.preprocess_actions(action)
+        next_obs, reward, terminated, truncated, info = self._env.step(action)
+
+        # Стандартизируем формат info
+        if "r_body_pos" in info and isinstance(info["r_body_pos"], np.ndarray):
+            info["r_body_pos"] = (
+                info["r_body_pos"][0]
+                if info["r_body_pos"].ndim > 0
+                else info["r_body_pos"]
+            )
+        if "r_vel" in info and isinstance(info["r_vel"], np.ndarray):
+            info["r_vel"] = (
+                info["r_vel"][0] if info["r_vel"].ndim > 0 else info["r_vel"]
+            )
+
+        return next_obs, reward, terminated, truncated, info
+
+    @property
+    def env(self):
+        """Доступ к среде."""
+        return self._env
+
+    @property
+    def num_motions(self) -> int:
+        """Количество загруженных движений."""
+        return len(self._env._all_motion_ids)
+
+    def sample_motions(self, num_motions: int = None) -> None:
+        """Пересэмплирует движения из библиотеки."""
+        if hasattr(self._env, "sample_motions"):
+            self._env.sample_motions()

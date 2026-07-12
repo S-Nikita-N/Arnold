@@ -1,5 +1,5 @@
 """
-Shared deterministic fixtures for Arnold characterization tests.
+Shared deterministic fixtures for MyoTrainer characterization tests.
 
 These builders are imported by both the golden-generation script
 (tests/golden/generate_goldens.py) and the test modules so that the exact
@@ -101,7 +101,7 @@ EMBED_DIM = 16
 
 def make_observation_parser(history_len: int = HISTORY_LEN):
     """Builds a deterministic ObservationParser from the synthetic anatomy."""
-    from arnold.observation_parser import ObservationParser
+    from myotrainer.observation_parser import ObservationParser
 
     return ObservationParser(
         body_names=BODY_NAMES,
@@ -116,7 +116,7 @@ def make_observation_parser(history_len: int = HISTORY_LEN):
 
 
 def make_action_parser(muscle_names: list[str] = None):
-    from arnold.action_parser import ActionParser
+    from myotrainer.action_parser import ActionParser
 
     if muscle_names is None:
         muscle_names = MUSCLE_NAMES
@@ -149,7 +149,7 @@ def make_policy_io():
 def build_lattice(state_dim: int, action_dim: int):
     import torch
 
-    from arnold.torch_model.policy_lattice import LatticePolicy
+    from myotrainer.torch_model.policy_lattice import LatticePolicy
 
     torch.manual_seed(10)
     net = LatticePolicy(state_dim, action_dim, mlp_units=(16, 8))
@@ -160,7 +160,7 @@ def build_lattice(state_dim: int, action_dim: int):
 def build_moe(state_dim: int, action_dim: int):
     import torch
 
-    from arnold.torch_model.policy_moe import MoELatticePolicy
+    from myotrainer.torch_model.policy_moe import MoELatticePolicy
 
     torch.manual_seed(11)
     net = MoELatticePolicy(
@@ -181,8 +181,8 @@ def build_moe(state_dim: int, action_dim: int):
 def build_transformer(op):
     import torch
 
-    from arnold.torch_model.transformer_policy import TransformerPolicy
-    from arnold.torch_model.sensorimotor_vocabulary import (
+    from myotrainer.torch_model.transformer_policy import TransformerPolicy
+    from myotrainer.torch_model.sensorimotor_vocabulary import (
         SensorimotorVocabulary,
     )
 
@@ -208,8 +208,8 @@ def build_transformer(op):
 def build_transformer_granulated(op, ap):
     import torch
 
-    from arnold.torch_model.transformer_policy import TransformerPolicy
-    from arnold.torch_model.sensorimotor_vocabulary import (
+    from myotrainer.torch_model.transformer_policy import TransformerPolicy
+    from myotrainer.torch_model.sensorimotor_vocabulary import (
         SensorimotorVocabulary,
     )
 
@@ -242,7 +242,7 @@ def write_expert_checkpoints(ckpt_dir, state_dim: int, action_dim: int):
 
     import torch
 
-    from arnold.torch_model.policy_lattice import LatticePolicy
+    from myotrainer.torch_model.policy_lattice import LatticePolicy
 
     paths = []
     for i in range(2):
@@ -257,7 +257,7 @@ def write_expert_checkpoints(ckpt_dir, state_dim: int, action_dim: int):
 def build_gate_moe(state_dim: int, action_dim: int, ckpt_dir):
     import torch
 
-    from arnold.torch_model.policy_gate_moe import GateMoEPolicy
+    from myotrainer.torch_model.policy_gate_moe import GateMoEPolicy
 
     paths = write_expert_checkpoints(ckpt_dir, state_dim, action_dim)
     torch.manual_seed(13)

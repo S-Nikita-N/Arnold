@@ -1,12 +1,12 @@
 defaults:
   - _self_
-  - learning: arnold
+  - learning: myotrainer
   - run: train
 
 # ==================== Experiment ====================
-project: arnold
-exp_name: arnold_obc
-notes: "Arnold Training"
+project: myotrainer
+exp_name: myotrainer_obc
+notes: "MyoTrainer Training"
 
 # ==================== Hardware ====================
 device: cuda
@@ -15,7 +15,7 @@ seed: 42
 
 # ==================== Logging ====================
 use_wandb: true
-wandb_project: arnold
+wandb_project: myotrainer
 wandb_run_id: null  # ID существующего рана для продолжения логирования
 no_log: false
 
