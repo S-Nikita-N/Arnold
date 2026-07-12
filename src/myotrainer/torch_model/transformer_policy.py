@@ -1,5 +1,5 @@
 """
-Arnold Transformer Policy.
+MyoTrainer Transformer Policy.
 
 Encoder-Decoder Transformer для управления мышцами.
 - Body Tokenizer группирует наблюдения по телам (~70 токенов вместо ~953)
@@ -29,14 +29,21 @@ import torch.nn.functional as F
 from typing import Any
 from torch.distributions import LowRankMultivariateNormal
 
-from arnold.profiler import Profiler
-from arnold.action_parser import MuscleGrouping
-from arnold.observation_parser import BodyGroup
-from arnold.torch_model.body_tokenizer import BodyTokenizer
-from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-from arnold.torch_model.normalization import SignatureNormalizerModule
-from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
-from arnold.torch_model.action_tokenizer import GroupMuscleMap, ActionTokenizer
+from myotrainer.profiler import Profiler
+from myotrainer.action_parser import MuscleGrouping
+from myotrainer.observation_parser import BodyGroup
+from myotrainer.torch_model.body_tokenizer import BodyTokenizer
+from myotrainer.torch_model.dist_utils import safe_lrmvn_log_prob
+from myotrainer.torch_model.normalization import SignatureNormalizerModule
+
+from myotrainer.torch_model.sensorimotor_vocabulary import (
+    SensorimotorVocabulary,
+)
+
+from myotrainer.torch_model.action_tokenizer import (
+    GroupMuscleMap,
+    ActionTokenizer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,7 +376,7 @@ class HierarchicalActionDecoder(nn.Module):
 
 class TransformerPolicy(nn.Module):
     """
-    Arnold Transformer Policy с body-level tokenization.
+    MyoTrainer Transformer Policy с body-level tokenization.
 
     Вместо 953 скалярных токенов (один на элемент наблюдения)
     используется ~70 body-level токенов.

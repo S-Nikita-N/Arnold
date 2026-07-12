@@ -1,9 +1,9 @@
-[submodule "src/arnold/experts/Kinesis"]
-	path = src/arnold/experts/Kinesis
+[submodule "src/myotrainer/experts/Kinesis"]
+	path = src/myotrainer/experts/Kinesis
 	url = https://github.com/amathislab/Kinesis.git
-[submodule "src/arnold/experts/myochallenge-lattice"]
-	path = src/arnold/experts/myochallenge-lattice
+[submodule "src/myotrainer/experts/myochallenge-lattice"]
+	path = src/myotrainer/experts/myochallenge-lattice
 	url = https://github.com/amathislab/myochallenge-lattice.git
-[submodule "src/arnold/experts/Myohuman"]
-	path = src/arnold/experts/Myohuman
+[submodule "src/myotrainer/experts/Myohuman"]
+	path = src/myotrainer/experts/Myohuman
 	url = https://github.com/S-Nikita-N/Myohuman.git

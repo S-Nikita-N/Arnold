@@ -6,8 +6,8 @@ import numpy as np
 
 import helpers
 
-from arnold.torch_model.body_tokenizer import BodyTokenizer
-from arnold.torch_model.action_tokenizer import ActionTokenizer
+from myotrainer.torch_model.body_tokenizer import BodyTokenizer
+from myotrainer.torch_model.action_tokenizer import ActionTokenizer
 
 
 ########################################
@@ -54,7 +54,7 @@ def test_body_tokenizer_feature_mismatch_raises():
     """Two experts with differing feature counts for the same type
     -> ValueError.
     """
-    from arnold.observation_parser import BodyGroup
+    from myotrainer.observation_parser import BodyGroup
 
     g_a = [
         BodyGroup(

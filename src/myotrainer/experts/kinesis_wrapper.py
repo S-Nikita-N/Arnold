@@ -1,6 +1,6 @@
 """
 Обёртка для эксперта Kinesis (MyoLegs).
-Требует установленный подмодуль `arnold/experts/Kinesis` и рабочие модели.
+Требует установленный подмодуль `myotrainer/experts/Kinesis` и рабочие модели.
 """
 
 import os
@@ -227,7 +227,7 @@ class KinesisWrapper:
         Clip и rescale действий как в Kinesis
         Agent.preprocess_actions (clip_actions=True).
         Среда ожидает действия в [actions_low, actions_high];
-        политика студента (Arnold)
+        политика студента (MyoTrainer)
         выдаёт неограниченный Gaussian — без clip в env уходят
         невалидные значения.
         """

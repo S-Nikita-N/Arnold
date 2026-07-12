@@ -1,4 +1,4 @@
-# Эксперты для Arnold
+# Эксперты для MyoTrainer
 
 Эта директория содержит репозитории с предобученными экспертами.
 
@@ -36,7 +36,7 @@ git submodule update --init --recursive
 
 ### Установка Kinesis (MyoLegs эксперт)
 
-В репозитории Arnold всё делается одним скриптом из корня репо:
+В репозитории MyoTrainer всё делается одним скриптом из корня репо:
 
 ```bash
 ./scripts/setup_experts.sh
@@ -55,7 +55,7 @@ git submodule update --init --recursive
 
 Дополнительная модель для target goal reaching (по желанию):
 ```bash
-cd src/arnold/experts/Kinesis
+cd src/myotrainer/experts/Kinesis
 python src/utils/download_model.py --repo_id amathislab/kinesis-target-goal-reach
 ```
 
@@ -133,7 +133,7 @@ experts/
 
 ## Использование
 
-Эксперты будут использоваться через wrapper классы в `fullbody/src/myohuman/arnold/experts/`:
+Эксперты будут использоваться через wrapper классы в `fullbody/src/myohuman/myotrainer/experts/`:
 
 - `expert_wrapper.py` - базовый класс для всех экспертов
 - `kinesis_wrapper.py` - wrapper для Kinesis (MyoLegs)

@@ -1,5 +1,5 @@
 """
-Arnold Trainer — универсальный трейнер для Arnold.
+MyoTrainer Trainer — универсальный трейнер для MyoTrainer.
 
 Поддерживает три режима обучения:
 1. OBC (On-Policy Behavior Cloning):
@@ -35,15 +35,18 @@ from typing import Any
 from dataclasses import dataclass
 from omegaconf import OmegaConf, DictConfig
 
-from arnold.logger import OBCLogger
-from arnold.profiler import Profiler
-from arnold.wandb_logger import WandbLogger
-from arnold.memory import OBCBatch, OBCMemory
-from arnold.action_parser import ActionParser
-from arnold.learning_utils import to_cpu, to_test, optimizer_to
-from arnold.observation_parser import BodyGroup, ObservationParser
-from arnold.torch_model.transformer_policy import TransformerPolicy
-from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
+from myotrainer.logger import OBCLogger
+from myotrainer.profiler import Profiler
+from myotrainer.wandb_logger import WandbLogger
+from myotrainer.memory import OBCBatch, OBCMemory
+from myotrainer.action_parser import ActionParser
+from myotrainer.learning_utils import to_cpu, to_test, optimizer_to
+from myotrainer.observation_parser import BodyGroup, ObservationParser
+from myotrainer.torch_model.transformer_policy import TransformerPolicy
+
+from myotrainer.torch_model.sensorimotor_vocabulary import (
+    SensorimotorVocabulary,
+)
 
 fork_ctx = mp.get_context("fork")
 
@@ -94,8 +97,8 @@ class ExpertContext:
     # Penalty for action mean leaving [-1, 1] action box (0 = disabled).
     mean_penalty_weight: float = 0.0
 
-    # Centralized GPU teacher (Arnold LatticePolicy loaded on main process GPU
-    # for batched inference during sampling/eval). None = no centralized
+    # Centralized GPU teacher (MyoTrainer LatticePolicy loaded on the main
+    # process GPU for batched inference during sampling/eval). None = no
     # teacher.
     gpu_teacher: Any | None = None
 
@@ -143,7 +146,7 @@ def create_expert_wrapper(
         expert_overrides.extend(overrides)
 
     if expert_type == "kinesis":
-        from arnold.experts.kinesis_wrapper import KinesisWrapper
+        from myotrainer.experts.kinesis_wrapper import KinesisWrapper
 
         model_type = expert_entry.get("model_type", "legs")
         return KinesisWrapper(
@@ -156,7 +159,7 @@ def create_expert_wrapper(
         )
 
     elif expert_type == "myohuman":
-        from arnold.experts.myohuman_wrapper import MyoHumanWrapper
+        from myotrainer.experts.myohuman_wrapper import MyoHumanWrapper
 
         return MyoHumanWrapper(
             cfg_path=expert_cfg_path,
@@ -168,7 +171,7 @@ def create_expert_wrapper(
         )
 
     elif expert_type == "myokin":
-        from arnold.experts.myokin_wrapper import MyoKinWrapper
+        from myotrainer.experts.myokin_wrapper import MyoKinWrapper
 
         return MyoKinWrapper(
             cfg_path=expert_cfg_path,
@@ -187,13 +190,13 @@ def create_expert_wrapper(
 
 
 ############################################
-#              ArnoldTrainer               #
+#                MyoTrainer                #
 ############################################
 
 
-class ArnoldTrainer:
+class MyoTrainer:
     """
-    Универсальный трейнер для Arnold.
+    Универсальный трейнер для MyoTrainer.
 
     Multi-expert: каждый эксперт получает свой ExpertContext с loss-весами,
     памятью, логгером, тредами. Модель (TransformerPolicy) общая, projectors
@@ -397,7 +400,7 @@ class ArnoldTrainer:
             )
 
             teacher_ckpt = entry.get("teacher_checkpoint")
-            # GPU teacher path: only for myohuman (Arnold LatticePolicy
+            # GPU teacher path: only for myohuman (MyoTrainer LatticePolicy
             # distillation). Myokin uses its own wrapper-side Kinesis MoE
             # teacher (different format).
             if teacher_ckpt and entry.type == "myohuman":
@@ -451,12 +454,12 @@ class ArnoldTrainer:
         checkpoint_path: str,
     ) -> Any:
         """
-        Load Arnold LatticePolicy as a frozen teacher on the main process GPU.
+        Load MyoTrainer LatticePolicy as a frozen teacher on the main GPU.
 
         MLP structure is inferred from checkpoint weights (action_mean.weight
         gives latent_dim, net.affine_layers.{i} give layer sizes).
         """
-        from arnold.torch_model.policy_lattice import LatticePolicy
+        from myotrainer.torch_model.policy_lattice import LatticePolicy
 
         ckpt = torch.load(
             checkpoint_path,
@@ -500,7 +503,7 @@ class ArnoldTrainer:
 
     def setup_policy(self) -> None:
         """Создаёт policy: TransformerPolicy или LatticePolicy."""
-        logger.info("Setting up Arnold policy...")
+        logger.info("Setting up MyoTrainer policy...")
 
         if self.cfg.learning.policy == "transformer":
             self._setup_transformer_policy()
@@ -533,7 +536,7 @@ class ArnoldTrainer:
             self.policy_module = self.policy
 
         logger.info(
-            f"Arnold policy created ({self.policy}). "
+            f"MyoTrainer policy created ({self.policy}). "
             f"Parameters: {sum(p.numel() for p in self.policy.parameters()):,}",
         )
 
@@ -601,7 +604,7 @@ class ArnoldTrainer:
         """LatticePolicy — MLP с полной ковариацией (как в Kinesis).
         Только single-expert.
         """
-        from arnold.torch_model.policy_lattice import LatticePolicy
+        from myotrainer.torch_model.policy_lattice import LatticePolicy
 
         if len(self.experts) > 1:
             raise ValueError(
@@ -630,7 +633,7 @@ class ArnoldTrainer:
         """MoE-Lattice Policy — Shared Expert + N Routed Experts,
         Low-Rank Covariance.
         """
-        from arnold.torch_model.policy_moe import MoELatticePolicy
+        from myotrainer.torch_model.policy_moe import MoELatticePolicy
 
         if len(self.experts) > 1:
             raise ValueError(
@@ -674,7 +677,7 @@ class ArnoldTrainer:
 
     def _setup_gate_moe_policy(self) -> None:
         """Frozen-experts MoE + trainable Categorical gate. Single-expert."""
-        from arnold.torch_model.policy_gate_moe import GateMoEPolicy
+        from myotrainer.torch_model.policy_gate_moe import GateMoEPolicy
 
         if len(self.experts) > 1:
             raise ValueError(

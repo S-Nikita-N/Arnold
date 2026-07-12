@@ -7,8 +7,8 @@ Outputs (in data/ directory):
     {split}.npz    — BC dataset (obs, actions, masks)
 
 Usage:
-    uv run python -m arnold.experts.scripts.evaluate_kinesis_teacher \
-        --checkpoint src/arnold/experts/Kinesis/data/trained_models/\
+    uv run python -m myotrainer.experts.scripts.evaluate_kinesis_teacher \
+        --checkpoint src/myotrainer/experts/Kinesis/data/trained_models/\
 legs_back/kinesis-moe-imitation/model.pth \
         --split test \
         --num-workers 8 \
@@ -559,7 +559,7 @@ def eval_worker(
 
 
 def run_eval(args):
-    from arnold.experts.myohuman_wrapper import MyoHumanWrapper
+    from myotrainer.experts.myohuman_wrapper import MyoHumanWrapper
 
     device = torch.device(args.device)
 

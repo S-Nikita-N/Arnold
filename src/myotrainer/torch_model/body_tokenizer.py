@@ -17,7 +17,7 @@ Body Tokenizer — универсальная проекция наблюден�
 import torch
 import torch.nn as nn
 
-from arnold.observation_parser import BodyGroup
+from myotrainer.observation_parser import BodyGroup
 
 
 ########################################

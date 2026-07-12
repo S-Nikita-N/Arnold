@@ -1,4 +1,4 @@
-"""Characterization tests for arnold.torch_model.sensorimotor_vocabulary."""
+"""Characterization tests for myotrainer.torch_model.sensorimotor_vocabulary."""
 
 import torch
 import pytest
@@ -6,7 +6,9 @@ import numpy as np
 
 import helpers
 
-from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
+from myotrainer.torch_model.sensorimotor_vocabulary import (
+    SensorimotorVocabulary,
+)
 
 
 ########################################

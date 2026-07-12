@@ -69,7 +69,7 @@ git lfs pull
 - инициализирует submodules (если ещё не сделано);
 - подтягивает LFS-файлы во всех субмодулях (в т.ч. Myohuman);
 - применяет патчи к коду и XML в Kinesis;
-- копирует ассеты из `downloads/Kinesis_assets/` в `src/arnold/experts/Kinesis/data/`;
+- копирует ассеты из `downloads/Kinesis_assets/` в `src/myotrainer/experts/Kinesis/data/`;
 - скачивает модель эксперта с Hugging Face (`kinesis-moe-imitation`).
 
 После этого можно запускать обучение и оценку (см. конфиги в `cfg/`).
@@ -91,9 +91,9 @@ git lfs pull
 ## Структура
 
 - `cfg/` — конфиги Hydra (env, learning, run).
-- `src/arnold/` — код MyoTrainer (policy, trainer, experts).
+- `src/myotrainer/` — код MyoTrainer (policy, trainer, experts).
 - `downloads/Kinesis_assets/` — ассеты для Kinesis (Git LFS).
 - `scripts/install.sh` — установка uv и зависимостей.
 - `scripts/setup_experts.sh` — патчи и подготовка данных экспертов.
 
-Подробнее по экспертам: [src/arnold/experts/README.md](src/arnold/experts/README.md).
+Подробнее по экспертам: [src/myotrainer/experts/README.md](src/myotrainer/experts/README.md).

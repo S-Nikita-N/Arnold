@@ -22,14 +22,14 @@ Hard Negative Mining — оценка политики на всех motion и �
 Использование:
 
     # Mine (eval + filter)
-    uv run python -m arnold.mine_negatives \
+    uv run python -m myotrainer.mine_negatives \
         run=mine_negatives \
         '+run/experts@run.experts.myo=myohuman' \
         resume_checkpoint=runs/exp/model.pth
 
     # Refilter: JSON с ключом "frames", перезапись того же
     #           .json и *_negatives/_positives.txt
-    uv run python -m arnold.mine_negatives refilter \
+    uv run python -m myotrainer.mine_negatives refilter \
         --json data/trained_models/exp/eval_valid.json \
         --mean-mpjpe 0.06 --not-success
 """
@@ -340,7 +340,7 @@ def hydra_main():
             handlers=[logging.StreamHandler(sys.stdout)],
         )
 
-        from arnold.trainer import ArnoldTrainer
+        from myotrainer.trainer import MyoTrainer
 
         run_cfg = cfg.run
         checkpoint_path = cfg.get("resume_checkpoint", None)
@@ -361,7 +361,7 @@ def hydra_main():
         cfg.use_wandb = False
         cfg.no_log = True
 
-        trainer = ArnoldTrainer(cfg, device=cfg.device)
+        trainer = MyoTrainer(cfg, device=cfg.device)
 
         if run_cfg.mine_test:
             mine_split(trainer, "valid", run_cfg.test, run_cfg, checkpoint_path)

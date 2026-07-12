@@ -2,7 +2,7 @@
 Gate MoE Policy — Frozen experts + trainable categorical gate.
 
 Архитектура (по аналогии с Kinesis PolicyMOE):
-  - N pre-trained Arnold LatticePolicy экспертов, веса заморожены.
+  - N pre-trained MyoTrainer LatticePolicy экспертов, веса заморожены.
   - Gate: MLP(state) → Linear(N) → Softmax → Categorical распределение.
   - Value net: отдельный MLP (того же размера что gate) → Linear(1).
 
@@ -23,10 +23,10 @@ import torch.nn.functional as F
 
 from torch.distributions import Categorical
 
-from arnold.profiler import Profiler
-from arnold.torch_model.mlp import MLP
-from arnold.torch_model.policy_lattice import LatticePolicy
-from arnold.torch_model.normalization import SignatureNormalizerModule
+from myotrainer.profiler import Profiler
+from myotrainer.torch_model.mlp import MLP
+from myotrainer.torch_model.policy_lattice import LatticePolicy
+from myotrainer.torch_model.normalization import SignatureNormalizerModule
 
 
 ########################################
@@ -37,7 +37,7 @@ from arnold.torch_model.normalization import SignatureNormalizerModule
 class GateMoEPolicy(nn.Module):
     """
     Frozen-experts MoE policy:
-      - experts: List[LatticePolicy] — replicas of pre-trained Arnold lattice
+      - experts: List[LatticePolicy] — pre-trained MyoTrainer lattices
       - gate: MLP → softmax over N experts
       - value_net: separate MLP critic
 
@@ -95,7 +95,7 @@ class GateMoEPolicy(nn.Module):
         state_dim: int,
         action_dim: int,
     ) -> LatticePolicy:
-        """Load Arnold LatticePolicy from checkpoint. MLP shape inferred."""
+        """Load MyoTrainer LatticePolicy from checkpoint. MLP shape inferred."""
         ckpt = torch.load(
             checkpoint_path,
             map_location="cpu",

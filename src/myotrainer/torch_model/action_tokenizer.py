@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from dataclasses import dataclass
 
-from arnold.action_parser import MuscleGrouping, get_canonical_granules
+from myotrainer.action_parser import MuscleGrouping, get_canonical_granules
 
 logger = logging.getLogger(__name__)
 

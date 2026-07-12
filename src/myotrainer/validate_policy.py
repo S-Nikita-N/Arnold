@@ -1,8 +1,8 @@
 """
-Валидация обученной Arnold policy.
+Валидация обученной MyoTrainer policy.
 
 Headless режим (по умолчанию для CUDA/MPS) — vectorized eval через
-ArnoldTrainer: workers стэппают env на CPU, главный процесс делает
+MyoTrainer: workers стэппают env на CPU, главный процесс делает
 batched inference на GPU. Логика полностью переиспользуется
 из trainer'а (без дублирования).
 
@@ -11,7 +11,7 @@ Render режим (headless=false) — последовательный single-e
 
 Использование:
     # Headless (vectorized, быстро):
-    uv run python -m arnold.validate_policy \
+    uv run python -m myotrainer.validate_policy \
         device=cuda \
         run=validate \
         run.checkpoint=/path/to/model.pth \
@@ -19,7 +19,7 @@ Render режим (headless=false) — последовательный single-e
         learning.policy=lattice
 
     # Render (single env):
-    uv run mjpython -m arnold.validate_policy \
+    uv run mjpython -m myotrainer.validate_policy \
         run=validate \
         run.checkpoint=/path/to/model.pth \
         run.headless=false \
@@ -46,9 +46,9 @@ import numpy as np
 from tqdm import tqdm
 from omegaconf import DictConfig
 
-from arnold.profiler import Profiler
-from arnold.action_parser import ActionParser
-from arnold.observation_parser import ObservationParser
+from myotrainer.profiler import Profiler
+from myotrainer.action_parser import ActionParser
+from myotrainer.observation_parser import ObservationParser
 
 
 logger = logging.getLogger(__name__)
@@ -61,13 +61,13 @@ logger = logging.getLogger(__name__)
 
 def validate_vectorized(cfg: DictConfig) -> dict:
     """
-    Vectorized validation: создаёт ArnoldTrainer (он загружает чекпоинт
+    Vectorized validation: создаёт MyoTrainer (он загружает чекпоинт
     и поднимает valid_experts) и вызывает trainer._evaluate_expert_vectorized.
 
     Дефолты trainer-полей лежат в cfg/run/validate.yaml.
     """
     from omegaconf import OmegaConf
-    from arnold.trainer import ArnoldTrainer
+    from myotrainer.trainer import MyoTrainer
 
     OmegaConf.set_struct(cfg, False)
     cfg.resume_checkpoint = str(cfg.run.checkpoint)
@@ -76,7 +76,7 @@ def validate_vectorized(cfg: DictConfig) -> dict:
     if "exp_name" not in cfg:
         cfg.exp_name = "validate_run"
 
-    trainer = ArnoldTrainer(cfg, device=cfg.device)
+    trainer = MyoTrainer(cfg, device=cfg.device)
 
     mode = cfg.run.get("mode", "valid")
     if mode == "train":
@@ -134,7 +134,7 @@ def _print_summary(all_metrics: dict) -> None:
 
 
 def _create_policy(cfg, expert, parser):
-    """Build policy by type (mirrors ArnoldTrainer.setup_policy dispatch)."""
+    """Build policy by type (mirrors MyoTrainer.setup_policy dispatch)."""
     from omegaconf import OmegaConf
 
     policy_type = cfg.learning.policy
@@ -142,10 +142,10 @@ def _create_policy(cfg, expert, parser):
     tokenizer_granularity = cfg.learning.tokenizer_granularity
 
     if policy_type == "transformer":
-        from arnold.torch_model.sensorimotor_vocabulary import (
+        from myotrainer.torch_model.sensorimotor_vocabulary import (
             SensorimotorVocabulary,
         )
-        from arnold.torch_model.transformer_policy import TransformerPolicy
+        from myotrainer.torch_model.transformer_policy import TransformerPolicy
 
         transformer_cfg = OmegaConf.to_container(
             cfg.learning.transformer,
@@ -186,7 +186,7 @@ def _create_policy(cfg, expert, parser):
         )
 
     if policy_type == "lattice":
-        from arnold.torch_model.policy_lattice import LatticePolicy
+        from myotrainer.torch_model.policy_lattice import LatticePolicy
 
         lattice_cfg = OmegaConf.to_container(cfg.learning.lattice, resolve=True)
         return LatticePolicy(
@@ -196,7 +196,7 @@ def _create_policy(cfg, expert, parser):
         )
 
     if policy_type == "moe":
-        from arnold.torch_model.policy_moe import MoELatticePolicy
+        from myotrainer.torch_model.policy_moe import MoELatticePolicy
 
         moe_cfg = OmegaConf.to_container(cfg.learning.moe, resolve=True)
         return MoELatticePolicy(
@@ -206,7 +206,7 @@ def _create_policy(cfg, expert, parser):
         )
 
     if policy_type == "gate_moe":
-        from arnold.torch_model.policy_gate_moe import GateMoEPolicy
+        from myotrainer.torch_model.policy_gate_moe import GateMoEPolicy
 
         gate_cfg = OmegaConf.to_container(cfg.learning.gate_moe, resolve=True)
         return GateMoEPolicy(
@@ -273,7 +273,7 @@ def _load_policy(cfg, checkpoint_path, device, expert, parser):
 
 def validate_sequential(cfg: DictConfig) -> dict:
     """Single-env loop with optional MuJoCo render; used when headless=false."""
-    from arnold.trainer import create_expert_wrapper
+    from myotrainer.trainer import create_expert_wrapper
 
     run = cfg.run
     device = torch.device(cfg.device)
@@ -447,7 +447,7 @@ def validate(cfg: DictConfig) -> dict:
     if not str(run.checkpoint or "").strip():
         raise ValueError(
             "run.checkpoint is required: "
-            "python -m arnold.validate_policy run=validate "
+            "python -m myotrainer.validate_policy run=validate "
             "run.checkpoint=path/to/model.pth",
         )
 

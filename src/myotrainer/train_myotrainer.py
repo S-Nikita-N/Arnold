@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Скрипт обучения Arnold.
+Скрипт обучения MyoTrainer.
 
 Поддерживает single- и multi-expert обучение.
 Per-expert режим определяется по loss-весам каждого эксперта.
@@ -8,12 +8,12 @@ Per-expert режим определяется по loss-весам каждог
 Примеры:
 
     # Single expert — OBC дистилляция из Kinesis
-    uv run python -m arnold.train_arnold \
+    uv run python -m myotrainer.train_myotrainer \
         '+run/experts@run.experts.kin=kinesis' \
         exp_name=obc_kinesis
 
     # Single expert — PPO на MyoHuman
-    uv run python -m arnold.train_arnold \
+    uv run python -m myotrainer.train_myotrainer \
         '+run/experts@run.experts.myo=myohuman' \
         run.experts.myo.simple=true \
         run.experts.myo.learning.ppo_weight=1.0 \
@@ -23,13 +23,13 @@ Per-expert режим определяется по loss-весам каждог
         exp_name=ppo_myohuman
 
     # DataParallel — обучение на 2 GPU
-    uv run python -m arnold.train_arnold \
+    uv run python -m myotrainer.train_myotrainer \
         device_ids=[0,1] \
         '+run/experts@run.experts.kin=kinesis' \
         exp_name=obc_2gpu
 
     # Multi-expert — MyoHuman (PPO) + Kinesis (OBC)
-    uv run python -m arnold.train_arnold \
+    uv run python -m myotrainer.train_myotrainer \
         device=cuda \
         '+run/experts@run.experts.myo=myohuman' \
         '+run/experts@run.experts.kin=kinesis' \
@@ -71,7 +71,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-from arnold.trainer import ArnoldTrainer
+from myotrainer.trainer import MyoTrainer
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
 warnings.filterwarnings(
@@ -114,7 +114,7 @@ def main(cfg: DictConfig) -> None:
     config_path = os.path.join(output_dir, "config.yaml")
     OmegaConf.save(cfg, config_path)
 
-    trainer = ArnoldTrainer(cfg, device=cfg.device)
+    trainer = MyoTrainer(cfg, device=cfg.device)
     trainer.optimize_policy()
 
     logger.info("Training completed!")

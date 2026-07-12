@@ -1,4 +1,4 @@
-"""Characterization tests for arnold.memory (OBCMemory / OBCBatch GAE)."""
+"""Characterization tests for myotrainer.memory (OBCMemory / OBCBatch GAE)."""
 
 import torch
 import pytest
@@ -6,7 +6,7 @@ import numpy as np
 
 import helpers
 
-from arnold.memory import OBCMemory
+from myotrainer.memory import OBCMemory
 
 
 ########################################

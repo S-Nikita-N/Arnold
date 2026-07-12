@@ -44,10 +44,10 @@ import torch.nn.functional as F
 
 from torch.distributions import LowRankMultivariateNormal
 
-from arnold.profiler import Profiler
-from arnold.torch_model.mlp import MLP
-from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-from arnold.torch_model.normalization import SignatureNormalizerModule
+from myotrainer.profiler import Profiler
+from myotrainer.torch_model.mlp import MLP
+from myotrainer.torch_model.dist_utils import safe_lrmvn_log_prob
+from myotrainer.torch_model.normalization import SignatureNormalizerModule
 
 
 ########################################

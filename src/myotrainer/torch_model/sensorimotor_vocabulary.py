@@ -1,5 +1,5 @@
 """
-Sensorimotor Vocabulary для Arnold архитектуры.
+Sensorimotor Vocabulary для MyoTrainer архитектуры.
 
 Все токены хранятся в едином плоском Embedding слое.
 Функция get_embedding принимает кортеж строк и возвращает сумму эмбеддингов.
@@ -406,7 +406,7 @@ PROPRIOCEPTIVE_TOKENS: list[str] = [
 
 class SensorimotorVocabulary(nn.Module):
     """
-    Сенсомоторный словарь для Arnold архитектуры.
+    Сенсомоторный словарь для MyoTrainer архитектуры.
 
     Все токены хранятся в едином плоском nn.Embedding.
     Функция get_embedding принимает кортеж строк и возвращает сумму

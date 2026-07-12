@@ -1,7 +1,7 @@
 """
 MyoKin Wrapper — MyoHuman env + Kinesis teacher.
 
-Используется для обучения Arnold policy в среде MyoHuman (338 actuators)
+Используется для обучения MyoTrainer policy в среде MyoHuman (338 actuators)
 с учителем Kinesis (290 actuators, legs/back). Руки (48 actuators)
 перезаписываются фиксированным значением при step().
 
@@ -37,7 +37,7 @@ if str(_MYOHUMAN_ROOT) not in sys.path:
 if str(_MYOHUMAN_SRC) not in sys.path:
     sys.path.insert(0, str(_MYOHUMAN_SRC))
 
-from arnold.experts.myohuman_wrapper import load_myohuman_config  # noqa: E402
+from myotrainer.experts.myohuman_wrapper import load_myohuman_config  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ class MyoKinWrapper:
 
     def _load_teacher(self, checkpoint_path: str) -> None:
         """Load frozen Kinesis MoE teacher."""
-        from arnold.experts.scripts.evaluate_kinesis_teacher import (
+        from myotrainer.experts.scripts.evaluate_kinesis_teacher import (
             KinesisTeacher,
             KinesisObservationAdapter,
         )

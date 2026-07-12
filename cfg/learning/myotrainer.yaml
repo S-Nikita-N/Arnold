@@ -1,4 +1,4 @@
-# Arnold Architecture & Learning Config
+# MyoTrainer Architecture & Learning Config
 
 # ==================== Policy Type ====================
 policy: transformer  # transformer | lattice | moe

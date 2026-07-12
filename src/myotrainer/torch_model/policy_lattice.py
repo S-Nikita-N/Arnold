@@ -28,10 +28,10 @@ import torch.nn.functional as F
 
 from torch.distributions import LowRankMultivariateNormal
 
-from arnold.profiler import Profiler
-from arnold.torch_model.mlp import MLP
-from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-from arnold.torch_model.normalization import SignatureNormalizerModule
+from myotrainer.profiler import Profiler
+from myotrainer.torch_model.mlp import MLP
+from myotrainer.torch_model.dist_utils import safe_lrmvn_log_prob
+from myotrainer.torch_model.normalization import SignatureNormalizerModule
 
 
 ########################################
@@ -41,7 +41,7 @@ from arnold.torch_model.normalization import SignatureNormalizerModule
 
 class LatticePolicy(nn.Module):
     """
-    Lattice Policy для Arnold. Только single-expert.
+    Lattice Policy для MyoTrainer. Только single-expert.
 
     Использует только текущий state (последний timestep),
     без истории. obs_timeseries [batch, n_obs, history_len] → [:, :, -1].

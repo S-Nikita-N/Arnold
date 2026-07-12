@@ -1,5 +1,5 @@
 """
-WandB Logger для Arnold OBC Training.
+WandB Logger для MyoTrainer OBC Training.
 
 Поддерживает multi-expert режим: метрики логируются с per-expert префиксами.
 Пример: myohuman/reward/avg_episode, kinesis/loss/imitation
@@ -15,7 +15,7 @@ import numpy as np
 from typing import Any
 from omegaconf import OmegaConf, DictConfig
 
-from arnold.logger import OBCLogger
+from myotrainer.logger import OBCLogger
 
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 class WandbLogger:
     """
-    Обёртка над wandb для Arnold training.
+    Обёртка над wandb для MyoTrainer training.
 
     Usage:
         wandb_logger = WandbLogger(cfg)

@@ -81,9 +81,9 @@ echo "Platform: $(uname -s)"
 echo "Initializing submodules..."
 for ex in $EXPERTS; do
     case "$ex" in
-        kinesis)            path="src/arnold/experts/Kinesis" ;;
-        myochallenge-lattice) path="src/arnold/experts/myochallenge-lattice" ;;
-        myohuman)           path="src/arnold/experts/Myohuman" ;;
+        kinesis)            path="src/myotrainer/experts/Kinesis" ;;
+        myochallenge-lattice) path="src/myotrainer/experts/myochallenge-lattice" ;;
+        myohuman)           path="src/myotrainer/experts/Myohuman" ;;
         *)                  path="" ;;
     esac
     [ -n "$path" ] && git submodule update --init --recursive "$path" && echo "  Inited $ex"
@@ -91,9 +91,9 @@ done
 echo "Pulling LFS files in selected submodules..."
 for ex in $EXPERTS; do
     case "$ex" in
-        kinesis)            path="src/arnold/experts/Kinesis" ;;
-        myochallenge-lattice) path="src/arnold/experts/myochallenge-lattice" ;;
-        myohuman)           path="src/arnold/experts/Myohuman" ;;
+        kinesis)            path="src/myotrainer/experts/Kinesis" ;;
+        myochallenge-lattice) path="src/myotrainer/experts/myochallenge-lattice" ;;
+        myohuman)           path="src/myotrainer/experts/Myohuman" ;;
         *)                  path="" ;;
     esac
     if [ -n "$path" ] && [ -d "$REPO_ROOT/$path/.git" ]; then
@@ -103,7 +103,7 @@ done
 
 # ========== Kinesis ==========
 if case " $EXPERTS " in *" kinesis "*) true;; *) false;; esac; then
-    KINESIS_ROOT="$REPO_ROOT/src/arnold/experts/Kinesis"
+    KINESIS_ROOT="$REPO_ROOT/src/myotrainer/experts/Kinesis"
     if [ ! -d "$KINESIS_ROOT" ]; then
         echo "Kinesis submodule not found at $KINESIS_ROOT; skip Kinesis patches"
     else

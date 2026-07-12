@@ -1,4 +1,4 @@
-"""Characterization tests for arnold.torch_model.policy_moe.
+"""Characterization tests for myotrainer.torch_model.policy_moe.
 
 We only pin the three DETERMINISTIC helper methods
 (compute_sparse_balance_loss, compute_soft_balance_loss, _compute_cov_factor)
@@ -10,7 +10,7 @@ import torch
 import pytest
 import numpy as np
 
-from arnold.torch_model.policy_moe import MoELatticePolicy
+from myotrainer.torch_model.policy_moe import MoELatticePolicy
 
 
 ACTION_DIM = 6

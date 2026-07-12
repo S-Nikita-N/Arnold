@@ -1,10 +1,10 @@
 """
-Golden fixture generator for Arnold characterization tests.
+Golden fixture generator for MyoTrainer characterization tests.
 
 Run ONCE (already run) to (re)create the JSON/NPZ golden files that the tests
 compare against:
 
-    cd /home/agent/work/Arnold && uv run python tests/golden/generate_goldens.py
+    uv run python tests/golden/generate_goldens.py
 
 The tests reconstruct the same seeded modules and assert their fresh outputs
 match these stored goldens.  A refactor that silently changes behavior will
@@ -37,7 +37,7 @@ GOLDEN_NPZ = os.path.join(HERE, "goldens.npz")
 
 
 def build_vocab():
-    from arnold.torch_model.sensorimotor_vocabulary import (
+    from myotrainer.torch_model.sensorimotor_vocabulary import (
         SensorimotorVocabulary,
     )
 
@@ -46,7 +46,7 @@ def build_vocab():
 
 
 def build_sensory_encoder():
-    from arnold.torch_model.sensory_encoder import SensoryEncoder
+    from myotrainer.torch_model.sensory_encoder import SensoryEncoder
 
     torch.manual_seed(1)
     return SensoryEncoder(
@@ -56,14 +56,14 @@ def build_sensory_encoder():
 
 
 def build_mlp():
-    from arnold.torch_model.mlp import MLP
+    from myotrainer.torch_model.mlp import MLP
 
     torch.manual_seed(2)
     return MLP(input_dim=8, hidden_dims=(16, 4), activation="silu")
 
 
 def build_body_tokenizer(op):
-    from arnold.torch_model.body_tokenizer import BodyTokenizer
+    from myotrainer.torch_model.body_tokenizer import BodyTokenizer
 
     groups = op.get_body_groups("per_body")
     torch.manual_seed(3)
@@ -76,7 +76,7 @@ def build_body_tokenizer(op):
 
 
 def build_action_tokenizer(ap):
-    from arnold.torch_model.action_tokenizer import ActionTokenizer
+    from myotrainer.torch_model.action_tokenizer import ActionTokenizer
 
     grouping = ap.get_muscle_grouping("hybrid")
     torch.manual_seed(4)
@@ -90,7 +90,7 @@ def build_action_tokenizer(ap):
 
 
 def build_normalizer():
-    from arnold.torch_model.normalization import SignatureNormalizerModule
+    from myotrainer.torch_model.normalization import SignatureNormalizerModule
 
     return SignatureNormalizerModule()
 
@@ -206,7 +206,7 @@ def main():
 
     # -- policy_moe deterministic helpers --
     # Build a tiny MoE policy purely to call its pure helper methods.
-    from arnold.torch_model.policy_moe import MoELatticePolicy
+    from myotrainer.torch_model.policy_moe import MoELatticePolicy
 
     torch.manual_seed(5)
     action_dim = 6
@@ -311,7 +311,7 @@ def main():
     _dump("gm", gm(obs, obs_sigs, act_sigs, "legs"))
 
     # -- OBCMemory GAE --
-    from arnold.memory import OBCMemory
+    from myotrainer.memory import OBCMemory
 
     m = OBCMemory()
     torch.manual_seed(107)

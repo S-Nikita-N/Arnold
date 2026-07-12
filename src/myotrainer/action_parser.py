@@ -1,5 +1,5 @@
 """
-Action Parser для Arnold.
+Action Parser для MyoTrainer.
 
 Стратегии грануляции:
   "anatomical"  — чистая Strategy 1: только фасции одной мышцы сливаются,
@@ -669,7 +669,7 @@ def get_canonical_granules(strategy: str) -> dict[str, list[str]]:
 
 class ActionParser:
     """
-    Парсит action space для Arnold.
+    Парсит action space для MyoTrainer.
 
     Зеркало ObservationParser: строит action_signatures для vocabulary lookup
     и предоставляет грануляцию мышц для ActionTokenizer.

@@ -8,10 +8,10 @@ import numpy as np
 
 import helpers
 
-from arnold import learning_utils
-from arnold.torch_model.mlp import MLP
-from arnold.torch_model.dist_utils import safe_lrmvn_log_prob
-from arnold.torch_model.sensory_encoder import SensoryEncoder
+from myotrainer import learning_utils
+from myotrainer.torch_model.mlp import MLP
+from myotrainer.torch_model.dist_utils import safe_lrmvn_log_prob
+from myotrainer.torch_model.sensory_encoder import SensoryEncoder
 
 
 ########################################

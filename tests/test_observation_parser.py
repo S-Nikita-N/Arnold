@@ -1,4 +1,4 @@
-"""Characterization tests for arnold.observation_parser."""
+"""Characterization tests for myotrainer.observation_parser."""
 
 import torch
 import pytest
@@ -6,7 +6,7 @@ import numpy as np
 
 import helpers
 
-from arnold.observation_parser import BodyGroup, ObservationParser
+from myotrainer.observation_parser import BodyGroup, ObservationParser
 
 
 ########################################

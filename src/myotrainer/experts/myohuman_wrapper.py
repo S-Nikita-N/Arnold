@@ -203,16 +203,16 @@ class MyoHumanWrapper:
 
         This used to load a Myohuman-native PolicyLattice/PolicyGaussian
         checkpoint (produced by Myohuman's own PPO training loop, which has
-        been removed). Experts are now trained through Arnold, so the teacher
-        is an Arnold LatticePolicy checkpoint loaded via the GPU-teacher path
-        (set ``teacher_checkpoint`` in the expert config); it does not go
-        through this wrapper.
+        been removed). Experts are now trained through MyoTrainer, so the
+        teacher is a MyoTrainer LatticePolicy checkpoint loaded via the
+        GPU-teacher path (set ``teacher_checkpoint`` in the expert config);
+        it does not go through this wrapper.
         """
         raise NotImplementedError(
             "Myohuman-native expert checkpoints are no longer supported "
-            "(checkpoint_epoch must stay 0). Train the expert through Arnold "
-            "and point the expert config's `teacher_checkpoint` at the "
-            "resulting Arnold LatticePolicy .pth for OBC distillation.",
+            "(checkpoint_epoch must stay 0). Train the expert through "
+            "MyoTrainer and point the expert config's `teacher_checkpoint` at "
+            "resulting MyoTrainer LatticePolicy .pth for OBC distillation.",
         )
 
     @property

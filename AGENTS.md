@@ -18,7 +18,7 @@ Repo-specific commands (how to run things) live in the README.
 
 ## Expert submodules are third-party
 
-`src/arnold/experts/{Kinesis, myochallenge-lattice, Myohuman}` are git
+`src/myotrainer/experts/{Kinesis, myochallenge-lattice, Myohuman}` are git
 submodules. **They are excluded from every hook, lint, format and type check**
 (a global `exclude` in `.pre-commit-config.yaml` plus `extend-exclude` in
 pyproject). Never reformat them here; the Myohuman submodule is edited only in
@@ -33,7 +33,7 @@ its own standalone clone and pulled in via git.
 | lint gate       | `uv run pre-commit run --all-files` |
 | tests           | `uv run pytest`                     |
 | coverage        | `uv run pytest --cov`               |
-| train           | `uv run python -m arnold.train_arnold` |
+| train           | `uv run python -m myotrainer.train_myotrainer` |
 
 The `pre-commit` gate stays the single source of truth for lint/format/types.
 

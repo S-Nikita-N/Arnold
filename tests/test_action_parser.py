@@ -1,10 +1,10 @@
-"""Characterization tests for arnold.action_parser (pure, no torch/env)."""
+"""Characterization tests for myotrainer.action_parser (pure, no torch/env)."""
 
 import pytest
 
 import helpers
 
-from arnold.action_parser import (
+from myotrainer.action_parser import (
     ActionParser,
     MuscleGrouping,
     HYBRID_LIMB_MAP,

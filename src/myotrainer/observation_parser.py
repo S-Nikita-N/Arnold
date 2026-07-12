@@ -1,5 +1,5 @@
 """
-Observation Parser для Arnold.
+Observation Parser для MyoTrainer.
 
 Конвертирует flat observation из среды Kinesis/MyoHumanIm в structured формат
 для TransformerPolicy:
@@ -55,7 +55,7 @@ class BodyGroup:
 class ObservationParser:
     """
     Парсит flat observation из среды Kinesis/MyoHumanIm в structured
-    формат для Arnold. Отслеживает историю наблюдений и генерирует
+    формат для MyoTrainer. Отслеживает историю наблюдений и генерирует
     signatures для vocabulary lookup.
     """
 
@@ -436,7 +436,7 @@ class ObservationParser:
         device: torch.device = torch.device("cpu"),  # noqa: B008
     ) -> tuple[torch.Tensor, list[tuple[str, ...]]]:
         """
-        Возвращает observation для Arnold.
+        Возвращает observation для MyoTrainer.
 
         Returns:
             obs_timeseries: [1, n_obs_elements, history_len] - tensor

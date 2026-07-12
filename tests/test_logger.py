@@ -1,4 +1,4 @@
-"""Characterization tests for arnold.logger.OBCLogger.
+"""Characterization tests for myotrainer.logger.OBCLogger.
 
 Note: per the task constraints we always call reset_losses()/set_update_losses()
 before get_log_str, and do not pin total_loss composition wrt load_balance /
@@ -7,7 +7,7 @@ mean_penalty omission.
 
 import math
 
-from arnold.logger import OBCLogger
+from myotrainer.logger import OBCLogger
 
 
 ########################################
