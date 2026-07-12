@@ -17,17 +17,21 @@ Gate MoE Policy — Frozen experts + trainable categorical gate.
 PPO применяется к Categorical (over expert_idx), как в Kinesis.
 """
 
-from typing import List, Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from torch.distributions import Categorical
 
+from arnold.profiler import Profiler
 from arnold.torch_model.mlp import MLP
 from arnold.torch_model.policy_lattice import LatticePolicy
 from arnold.torch_model.normalization import SignatureNormalizerModule
-from arnold.profiler import Profiler
+
+
+########################################
+#            GateMoEPolicy             #
+########################################
 
 
 class GateMoEPolicy(nn.Module):
@@ -44,8 +48,8 @@ class GateMoEPolicy(nn.Module):
         self,
         state_dim: int,
         action_dim: int,
-        expert_checkpoints: List[str],
-        gate_units: Tuple[int, ...] = (1024, 512, 256),
+        expert_checkpoints: list[str],
+        gate_units: tuple[int, ...] = (1024, 512, 256),
         gate_activation: str = "silu",
         device: str = "cpu",
     ):
@@ -60,7 +64,7 @@ class GateMoEPolicy(nn.Module):
 
         # ── Frozen experts ───────────────────────────────────────────
         self.experts = nn.ModuleList()
-        for i, ckpt_path in enumerate(expert_checkpoints):
+        for ckpt_path in expert_checkpoints:
             expert = self._load_expert(ckpt_path, state_dim, action_dim)
             for p in expert.parameters():
                 p.requires_grad_(False)
@@ -87,21 +91,29 @@ class GateMoEPolicy(nn.Module):
 
     @staticmethod
     def _load_expert(
-        checkpoint_path: str, state_dim: int, action_dim: int,
+        checkpoint_path: str,
+        state_dim: int,
+        action_dim: int,
     ) -> LatticePolicy:
         """Load Arnold LatticePolicy from checkpoint. MLP shape inferred."""
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        ckpt = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
         policy_state = ckpt["policy"]
 
         layer_dims = []
         i = 0
         while f"net.affine_layers.{i}.weight" in policy_state:
-            layer_dims.append(policy_state[f"net.affine_layers.{i}.weight"].shape[0])
+            layer_dims.append(
+                policy_state[f"net.affine_layers.{i}.weight"].shape[0],
+            )
             i += 1
         if not layer_dims:
             raise ValueError(
                 f"Cannot infer MLP from {checkpoint_path}: "
-                f"no 'net.affine_layers.*.weight' keys"
+                f"no 'net.affine_layers.*.weight' keys",
             )
 
         expert = LatticePolicy(
@@ -124,21 +136,22 @@ class GateMoEPolicy(nn.Module):
     def set_profiler(self, profiler: Profiler) -> None:
         self.profiler = profiler
 
-    # ------------------------------------------------------------------
-    #  Forward — общий формат для trainer
-    # ------------------------------------------------------------------
+    ########################################
+    #               Forward                #
+    ########################################
 
     def forward(
         self,
         obs_timeseries: torch.Tensor,
-        obs_signatures: List,
-        action_signatures: List,
+        obs_signatures: list,
+        action_signatures: list,
         expert_name: str,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple:
+    ) -> tuple:
         """
-        Returns (gate_logits, None, None, value, None) — формат как у LatticePolicy
+        Returns (gate_logits, None, None, value, None) — формат как
+        у LatticePolicy
         но cov_factor/diag_std/latent_std не определены (Categorical).
 
         gate_logits размерности (B, num_experts).
@@ -164,20 +177,24 @@ class GateMoEPolicy(nn.Module):
         # Возвращаем placeholder'ы для совместимости с интерфейсом
         return gate_logits, None, None, value, None
 
-    # ------------------------------------------------------------------
-    #  Distribution helpers
-    # ------------------------------------------------------------------
+    ########################################
+    #         Distribution helpers         #
+    ########################################
 
     def build_action_dist(
         self,
         gate_logits: torch.Tensor,
-        cov_factor: Optional[torch.Tensor] = None,
-        diag_std: Optional[torch.Tensor] = None,
+        cov_factor: torch.Tensor | None = None,
+        diag_std: torch.Tensor | None = None,
     ) -> Categorical:
         """Categorical over expert indices. cov_factor/diag_std игнорируются."""
         return Categorical(logits=gate_logits)
 
-    def dist_log_prob(self, dist: Categorical, actions: torch.Tensor) -> torch.Tensor:
+    def dist_log_prob(
+        self,
+        dist: Categorical,
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
         """log_prob дискретного expert_idx. actions: (B,) или (B, 1) long."""
         idx = actions.squeeze(-1) if actions.dim() > 1 else actions
         return dist.log_prob(idx.long()).unsqueeze(-1)
@@ -188,7 +205,8 @@ class GateMoEPolicy(nn.Module):
     @torch.no_grad()
     def get_gate_stats(self, x: torch.Tensor) -> dict:
         """
-        Per-expert routing fractions (argmax) и средние softmax-вероятности по батчу.
+        Per-expert routing fractions (argmax) и средние
+        softmax-вероятности по батчу.
 
         Args:
             x: (B, state_dim) — нормализованный последний timestep obs.
@@ -196,16 +214,20 @@ class GateMoEPolicy(nn.Module):
         Returns:
             routing_fracs: (N,) — доля сэмплов, где аргмакс == i (детерм. выбор)
             mean_probs:    (N,) — среднее значение softmax(gate(x))[:, i]
-            gate_entropy:  скаляр — средняя энтропия Categorical(softmax(gate(x)))
-            balance_entropy: скаляр — энтропия среднего распределения (uniform → log N)
+            gate_entropy:  скаляр — средняя энтропия
+                           Categorical(softmax(gate(x)))
+            balance_entropy: скаляр — энтропия среднего распределения
+                             (uniform → log N)
         """
         gate_logits = self.gate_head(self.gate_net(x))
-        gate_probs = F.softmax(gate_logits, dim=-1)               # [B, N]
-        argmax_idx = gate_probs.argmax(dim=-1)                    # [B]
+        gate_probs = F.softmax(gate_logits, dim=-1)  # [B, N]
+        argmax_idx = gate_probs.argmax(dim=-1)  # [B]
         one_hot = F.one_hot(argmax_idx, self.num_experts).float()  # [B, N]
-        routing_fracs = one_hot.mean(dim=0)                       # [N]
-        mean_probs = gate_probs.mean(dim=0)                       # [N]
-        gate_entropy = -(gate_probs * (gate_probs + 1e-8).log()).sum(dim=-1).mean()
+        routing_fracs = one_hot.mean(dim=0)  # [N]
+        mean_probs = gate_probs.mean(dim=0)  # [N]
+        gate_entropy = (
+            -(gate_probs * (gate_probs + 1e-8).log()).sum(dim=-1).mean()
+        )
         balance_entropy = -(mean_probs * (mean_probs + 1e-8).log()).sum()
         return {
             "routing_fracs": routing_fracs.detach(),
@@ -214,24 +236,31 @@ class GateMoEPolicy(nn.Module):
             "balance_entropy": balance_entropy.item(),
         }
 
-    # ------------------------------------------------------------------
-    #  Action sampling
-    # ------------------------------------------------------------------
+    ########################################
+    #           Action sampling            #
+    ########################################
 
     def get_action(
         self,
         obs_timeseries: torch.Tensor,
-        obs_signatures: List,
-        action_signatures: List,
+        obs_signatures: list,
+        action_signatures: list,
         expert_name: str,
         deterministic: bool = False,
         return_std: bool = True,
         return_value: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         p = self.profiler
 
         gate_logits, _, _, value, _ = self.forward(
-            obs_timeseries, obs_signatures, action_signatures,
+            obs_timeseries,
+            obs_signatures,
+            action_signatures,
             expert_name=expert_name,
             return_std=return_std,
             return_value=return_value,
@@ -262,8 +291,8 @@ class GateMoEPolicy(nn.Module):
     def _run_selected_experts(
         self,
         obs_timeseries: torch.Tensor,
-        obs_signatures: List,
-        action_signatures: List,
+        obs_signatures: list,
+        action_signatures: list,
         expert_name: str,
         expert_idx: torch.Tensor,
     ) -> torch.Tensor:
@@ -274,7 +303,8 @@ class GateMoEPolicy(nn.Module):
         """
         B = obs_timeseries.shape[0]
         env_action = torch.zeros(
-            B, self.action_dim,
+            B,
+            self.action_dim,
             device=obs_timeseries.device,
             dtype=obs_timeseries.dtype,
         )
@@ -288,7 +318,9 @@ class GateMoEPolicy(nn.Module):
             expert = self.experts[idx_val]
             with torch.no_grad():
                 mean, _, _, _, _ = expert.forward(
-                    sub_obs, obs_signatures, action_signatures,
+                    sub_obs,
+                    obs_signatures,
+                    action_signatures,
                     expert_name=expert_name,
                     return_std=False,
                     return_value=False,

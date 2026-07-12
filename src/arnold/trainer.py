@@ -15,38 +15,43 @@ Arnold Trainer — универсальный трейнер для Arnold.
    → Чистый PPO без эксперта (не нужен загруженный эксперт).
 
 Multi-expert: каждый эксперт автономен — свои loss-веса, память, логгер, треды.
-Модель (TransformerPolicy) общая. Градиенты суммируются через interleaved mini-batches.
+Модель (TransformerPolicy) общая. Градиенты суммируются через interleaved
+mini-batches.
 """
 
 import os
 import math
 import time
+import torch
 import random
 import logging
+import warnings
 import numpy as np
-import torch
 import torch.nn as nn
 import multiprocessing as mp
-import warnings
 
-fork_ctx = mp.get_context('fork')
-
-from dataclasses import dataclass
-from omegaconf import DictConfig, OmegaConf
-from typing import Dict, List, Tuple, Optional, Any
 from tqdm import tqdm
+from typing import Any
+from dataclasses import dataclass
+from omegaconf import OmegaConf, DictConfig
 
+from arnold.logger import OBCLogger
+from arnold.profiler import Profiler
+from arnold.wandb_logger import WandbLogger
+from arnold.memory import OBCBatch, OBCMemory
+from arnold.action_parser import ActionParser
+from arnold.learning_utils import to_cpu, to_test, optimizer_to
+from arnold.observation_parser import BodyGroup, ObservationParser
 from arnold.torch_model.transformer_policy import TransformerPolicy
 from arnold.torch_model.sensorimotor_vocabulary import SensorimotorVocabulary
-from arnold.observation_parser import ObservationParser, BodyGroup
-from arnold.action_parser import ActionParser
-from arnold.memory import OBCMemory, OBCBatch
-from arnold.logger import OBCLogger
-from arnold.wandb_logger import WandbLogger
-from arnold.learning_utils import to_test, to_cpu, optimizer_to
-from arnold.profiler import Profiler
 
-warnings.filterwarnings("ignore", category=SyntaxWarning, message="invalid escape sequence")
+fork_ctx = mp.get_context("fork")
+
+warnings.filterwarnings(
+    "ignore",
+    category=SyntaxWarning,
+    message="invalid escape sequence",
+)
 
 os.environ["OMP_NUM_THREADS"] = "1"
 
@@ -54,19 +59,20 @@ os.environ["OMP_NUM_THREADS"] = "1"
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-#  ExpertContext — всё, что нужно знать про одного эксперта
-# ---------------------------------------------------------------------------
+############################################
+#              ExpertContext               #
+############################################
+
 
 @dataclass
 class ExpertContext:
     """Контекст одного эксперта: обёртка, парсер, loss-веса, parallelism."""
 
     name: str
-    wrapper: Any                    # KinesisWrapper | MyoHumanWrapper
+    wrapper: Any  # KinesisWrapper | MyoHumanWrapper
     parser: ObservationParser
     action_parser: ActionParser
-    groups: List[BodyGroup]
+    groups: list[BodyGroup]
 
     # Per-expert loss weights
     ppo_weight: float = 0.0
@@ -77,20 +83,21 @@ class ExpertContext:
     # Per-expert parallelism
     num_threads: int = 1
     min_batch_size: int = 10240
-    vec_batch_size: Optional[int] = None
+    vec_batch_size: int | None = None
 
     # Per-expert loss scale (multiplier applied to all losses)
     loss_scale: float = 1.0
 
     # Action granulation (опционально)
-    muscle_grouping: Optional[Any] = None
+    muscle_grouping: Any | None = None
 
     # Penalty for action mean leaving [-1, 1] action box (0 = disabled).
     mean_penalty_weight: float = 0.0
 
     # Centralized GPU teacher (Arnold LatticePolicy loaded on main process GPU
-    # for batched inference during sampling/eval). None = no centralized teacher.
-    gpu_teacher: Optional[Any] = None
+    # for batched inference during sampling/eval). None = no centralized
+    # teacher.
+    gpu_teacher: Any | None = None
 
     @property
     def use_expert(self) -> bool:
@@ -106,9 +113,10 @@ class ExpertContext:
             return "ppo"
 
 
-# ---------------------------------------------------------------------------
-#  Фабрика expert wrappers
-# ---------------------------------------------------------------------------
+############################################
+#          Expert wrapper factory          #
+############################################
+
 
 def create_expert_wrapper(
     expert_entry: DictConfig,
@@ -136,6 +144,7 @@ def create_expert_wrapper(
 
     if expert_type == "kinesis":
         from arnold.experts.kinesis_wrapper import KinesisWrapper
+
         model_type = expert_entry.get("model_type", "legs")
         return KinesisWrapper(
             cfg_path=expert_cfg_path,
@@ -148,6 +157,7 @@ def create_expert_wrapper(
 
     elif expert_type == "myohuman":
         from arnold.experts.myohuman_wrapper import MyoHumanWrapper
+
         return MyoHumanWrapper(
             cfg_path=expert_cfg_path,
             checkpoint_epoch=checkpoint_epoch,
@@ -159,6 +169,7 @@ def create_expert_wrapper(
 
     elif expert_type == "myokin":
         from arnold.experts.myokin_wrapper import MyoKinWrapper
+
         return MyoKinWrapper(
             cfg_path=expert_cfg_path,
             device="cpu",
@@ -171,8 +182,13 @@ def create_expert_wrapper(
     else:
         raise ValueError(
             f"Unknown expert type: '{expert_type}'. "
-            f"Supported: 'kinesis', 'myohuman', 'myokin'"
+            f"Supported: 'kinesis', 'myohuman', 'myokin'",
         )
+
+
+############################################
+#              ArnoldTrainer               #
+############################################
 
 
 class ArnoldTrainer:
@@ -197,7 +213,11 @@ class ArnoldTrainer:
         # DataParallel: device_ids=[0, 1] → обучение на 2 GPU
         device_ids = cfg.get("device_ids", None)
         base_device = str(device if device else cfg.device)
-        if device_ids is not None and len(device_ids) >= 2 and "cuda" in base_device:
+        if (
+            device_ids is not None
+            and len(device_ids) >= 2
+            and "cuda" in base_device
+        ):
             self.device_ids = list(device_ids)
             self.device = torch.device(f"cuda:{self.device_ids[0]}")
         else:
@@ -254,28 +274,33 @@ class ArnoldTrainer:
         self.resume_checkpoint = cfg.get("resume_checkpoint", None)
 
         # Debug
-        self.debug_checkpoints = getattr(cfg.learning, 'debug_checkpoints', False)
+        self.debug_checkpoints = getattr(
+            cfg.learning,
+            "debug_checkpoints",
+            False,
+        )
 
         # State
         self.epoch = 0
         self.num_steps = 0
 
         # Best model tracking
-        self.best_eval_episode_avg_length: Dict[str, float] = {}
-        self.best_eval_imitation_loss: Dict[str, float] = {}
-        self.best_eval_mpjpe: Dict[str, float] = {}
+        self.best_eval_episode_avg_length: dict[str, float] = {}
+        self.best_eval_imitation_loss: dict[str, float] = {}
+        self.best_eval_mpjpe: dict[str, float] = {}
 
         # Multiprocessing Event
         self.mp_done = fork_ctx.Event()
 
         # Persistent workers state (lazy init in _ensure_persistent_workers)
-        self._persistent_state: Optional[dict] = None
+        self._persistent_state: dict | None = None
 
         # Per-expert profiler reports (заполняется на epoch 0)
-        self.profiler_reports: Dict[str, Profiler] = {}
+        self.profiler_reports: dict[str, Profiler] = {}
 
-        # Memory profiler report — собирается в update_params, печатается в log_train
-        self._mem_profile_report: Optional[str] = None
+        # Memory profiler report — собирается в update_params,
+        # печатается в log_train
+        self._mem_profile_report: str | None = None
 
         # ==================== Setup ====================
         self.setup_experts()
@@ -298,27 +323,31 @@ class ArnoldTrainer:
 
         self.log_training_config()
 
-    # ------------------------------------------------------------------
-    #  Setup
-    # ------------------------------------------------------------------
-
+    ############################################
+    #                  Setup                   #
+    ############################################
     def setup_experts(self) -> None:
         """Загружает экспертов и создаёт ExpertContext для каждого."""
         experts_cfg = self.cfg.run.experts
         if not experts_cfg:
-            raise ValueError("cfg.run.experts is empty — нужна хотя бы одна среда.")
+            raise ValueError(
+                "cfg.run.experts is empty — нужна хотя бы одна среда.",
+            )
 
-        self.experts: Dict[str, ExpertContext] = {}
-        self.valid_experts: Dict[str, Any] = {}
+        self.experts: dict[str, ExpertContext] = {}
+        self.valid_experts: dict[str, Any] = {}
 
         for name, entry in experts_cfg.items():
-            logger.info(self._section_header(
-                f"Expert: {name!r} (type: {entry.type})"
-            ))
+            logger.info(
+                self._section_header(f"Expert: {name!r} (type: {entry.type})"),
+            )
 
             wrapper = create_expert_wrapper(entry, mode="train")
 
-            parser = ObservationParser.from_env(wrapper.env, history_len=self.history_len)
+            parser = ObservationParser.from_env(
+                wrapper.env,
+                history_len=self.history_len,
+            )
             action_parser = ActionParser.from_env(wrapper.env)
             groups = parser.get_body_groups(self.tokenizer_granularity)
 
@@ -337,10 +366,13 @@ class ArnoldTrainer:
             muscle_grouping = None
             action_gran = self._get_action_granulation()
             if action_gran != "none":
-                muscle_grouping = action_parser.get_muscle_grouping(strategy=action_gran)
+                muscle_grouping = action_parser.get_muscle_grouping(
+                    strategy=action_gran,
+                )
                 logger.info(
                     f"  action granulation [{action_gran}]: "
-                    f"{muscle_grouping.n_muscles} muscles -> {muscle_grouping.n_groups} groups"
+                    f"{muscle_grouping.n_muscles} muscles -> "
+                    f"{muscle_grouping.n_groups} groups",
                 )
                 for gid in muscle_grouping.group_order:
                     n_in_group = len(muscle_grouping.groups[gid])
@@ -365,34 +397,41 @@ class ArnoldTrainer:
             )
 
             teacher_ckpt = entry.get("teacher_checkpoint")
-            # GPU teacher path: only for myohuman (Arnold LatticePolicy distillation).
-            # Myokin uses its own wrapper-side Kinesis MoE teacher (different format).
+            # GPU teacher path: only for myohuman (Arnold LatticePolicy
+            # distillation). Myokin uses its own wrapper-side Kinesis MoE
+            # teacher (different format).
             if teacher_ckpt and entry.type == "myohuman":
-                ctx.gpu_teacher = self._load_gpu_teacher(name, wrapper, teacher_ckpt)
+                ctx.gpu_teacher = self._load_gpu_teacher(
+                    name,
+                    wrapper,
+                    teacher_ckpt,
+                )
 
             self.experts[name] = ctx
 
             if ctx.use_expert and ctx.gpu_teacher is None:
                 wrapper_has_expert = (
-                    hasattr(wrapper, 'has_expert') and wrapper.has_expert
+                    hasattr(wrapper, "has_expert") and wrapper.has_expert
                 )
                 if not wrapper_has_expert:
                     logger.warning(
-                        f"Expert '{name}': obc_imitation_weight > 0 but no teacher loaded "
-                        f"(neither GPU teacher_checkpoint nor wrapper-side expert)."
+                        f"Expert '{name}': obc_imitation_weight > 0 "
+                        f"but no teacher loaded (neither GPU "
+                        f"teacher_checkpoint nor wrapper-side expert).",
                     )
 
             logger.info(
                 f"  mode={ctx.training_mode}  "
-                f"obs_dim={wrapper.obs_dim}  act_dim={wrapper.action_dim}"
+                f"obs_dim={wrapper.obs_dim}  act_dim={wrapper.action_dim}",
             )
             logger.info(
                 f"  threads={n_threads}  min_batch={mbs}  "
-                f"ppo={ppo_w}  im={im_w}  ent={ent_w}  lb={lb_w}  scale={loss_scale}"
+                f"ppo={ppo_w}  im={im_w}  ent={ent_w}  "
+                f"lb={lb_w}  scale={loss_scale}",
             )
             logger.info(
                 f"  parser: {parser.n_obs_elements} obs elements, "
-                f"{len(groups)} tokens [{self.tokenizer_granularity}]"
+                f"{len(groups)} tokens [{self.tokenizer_granularity}]",
             )
 
             if self.eval_frequency > 0:
@@ -402,11 +441,14 @@ class ArnoldTrainer:
                 logger.info("  validation env: ready")
 
             self.best_eval_episode_avg_length[name] = 0.0
-            self.best_eval_imitation_loss[name] = float('inf')
-            self.best_eval_mpjpe[name] = float('inf')
+            self.best_eval_imitation_loss[name] = float("inf")
+            self.best_eval_mpjpe[name] = float("inf")
 
     def _load_gpu_teacher(
-        self, expert_name: str, wrapper: Any, checkpoint_path: str,
+        self,
+        expert_name: str,
+        wrapper: Any,
+        checkpoint_path: str,
     ) -> Any:
         """
         Load Arnold LatticePolicy as a frozen teacher on the main process GPU.
@@ -417,7 +459,9 @@ class ArnoldTrainer:
         from arnold.torch_model.policy_lattice import LatticePolicy
 
         ckpt = torch.load(
-            checkpoint_path, map_location=self.device, weights_only=True,
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=True,
         )
         policy_state = ckpt["policy"]
 
@@ -428,13 +472,13 @@ class ArnoldTrainer:
         i = 0
         while f"net.affine_layers.{i}.weight" in policy_state:
             layer_dims.append(
-                policy_state[f"net.affine_layers.{i}.weight"].shape[0]
+                policy_state[f"net.affine_layers.{i}.weight"].shape[0],
             )
             i += 1
         if not layer_dims:
             raise ValueError(
                 f"Cannot infer MLP from {checkpoint_path}: "
-                f"no 'net.affine_layers.*.weight' keys found"
+                f"no 'net.affine_layers.*.weight' keys found",
             )
 
         teacher = LatticePolicy(
@@ -450,7 +494,7 @@ class ArnoldTrainer:
 
         logger.info(
             f"  GPU teacher [{expert_name}] loaded from {checkpoint_path} "
-            f"(epoch {ckpt.get('epoch', '?')}, mlp={layer_dims})"
+            f"(epoch {ckpt.get('epoch', '?')}, mlp={layer_dims})",
         )
         return teacher
 
@@ -469,7 +513,7 @@ class ArnoldTrainer:
         else:
             raise ValueError(
                 f"Unknown policy: {self.cfg.learning.policy}. "
-                f"Supported: transformer, lattice, moe, gate_moe"
+                f"Supported: transformer, lattice, moe, gate_moe",
             )
 
         self.policy.to(self.device)
@@ -479,7 +523,10 @@ class ArnoldTrainer:
             logger.info("torch.compile applied (mode=reduce-overhead)")
 
         if self.device_ids is not None:
-            self.policy = nn.DataParallel(self.policy, device_ids=self.device_ids)
+            self.policy = nn.DataParallel(
+                self.policy,
+                device_ids=self.device_ids,
+            )
             self.policy_module = self.policy.module
             logger.info(f"DataParallel enabled on GPUs {self.device_ids}")
         else:
@@ -487,7 +534,7 @@ class ArnoldTrainer:
 
         logger.info(
             f"Arnold policy created ({self.policy}). "
-            f"Parameters: {sum(p.numel() for p in self.policy.parameters()):,}"
+            f"Parameters: {sum(p.numel() for p in self.policy.parameters()):,}",
         )
 
     def _get_action_granulation(self) -> str:
@@ -500,16 +547,25 @@ class ArnoldTrainer:
     def _setup_transformer_policy(self) -> None:
         """TransformerPolicy с merged группами всех экспертов."""
         transformer_cfg = OmegaConf.to_container(
-            self.cfg.learning.transformer, resolve=True
+            self.cfg.learning.transformer,
+            resolve=True,
         )
 
-        # Pop параметры, которые передаются как explicit kwargs, не через **transformer_cfg
+        # Pop параметры, которые передаются как explicit kwargs,
+        # не через **transformer_cfg
         action_granulation = transformer_cfg.pop("action_granulation", "none")
-        action_decoder_layers = transformer_cfg.pop("action_decoder_layers", None)
+        action_decoder_layers = transformer_cfg.pop(
+            "action_decoder_layers",
+            None,
+        )
 
-        self.vocab = SensorimotorVocabulary(embed_dim=transformer_cfg["embed_dim"])
+        self.vocab = SensorimotorVocabulary(
+            embed_dim=transformer_cfg["embed_dim"],
+        )
         groups = {name: ctx.groups for name, ctx in self.experts.items()}
-        max_action_dim = max(ctx.wrapper.action_dim for ctx in self.experts.values())
+        max_action_dim = max(
+            ctx.wrapper.action_dim for ctx in self.experts.values()
+        )
 
         # Action granulation: собираем groupings и signatures per expert
         action_groupings = None
@@ -520,12 +576,14 @@ class ArnoldTrainer:
             for name, ctx in self.experts.items():
                 if ctx.muscle_grouping is None:
                     raise ValueError(
-                        f"action_granulation={action_granulation!r} but expert "
-                        f"'{name}' has no muscle_grouping. "
-                        f"Check that setup_experts() ran before setup_policy()."
+                        f"action_granulation={action_granulation!r} but "
+                        f"expert '{name}' has no muscle_grouping. Check that "
+                        f"setup_experts() ran before setup_policy().",
                     )
                 action_groupings[name] = ctx.muscle_grouping
-                action_sigs_by_expert[name] = ctx.action_parser.action_signatures
+                action_sigs_by_expert[name] = (
+                    ctx.action_parser.action_signatures
+                )
 
         self.policy = TransformerPolicy(
             vocab=self.vocab,
@@ -540,14 +598,16 @@ class ArnoldTrainer:
         )
 
     def _setup_lattice_policy(self) -> None:
-        """LatticePolicy — MLP с полной ковариацией (как в Kinesis). Только single-expert."""
+        """LatticePolicy — MLP с полной ковариацией (как в Kinesis).
+        Только single-expert.
+        """
         from arnold.torch_model.policy_lattice import LatticePolicy
 
         if len(self.experts) > 1:
             raise ValueError(
                 f"Lattice policy поддерживает только одного эксперта, "
                 f"сейчас: {list(self.experts.keys())}. "
-                "Используйте policy=transformer для multi-expert."
+                "Используйте policy=transformer для multi-expert.",
             )
 
         ctx = next(iter(self.experts.values()))
@@ -556,24 +616,27 @@ class ArnoldTrainer:
         action_dim = ctx.wrapper.action_dim
 
         lattice_cfg = OmegaConf.to_container(
-            self.cfg.learning.lattice, resolve=True
+            self.cfg.learning.lattice,
+            resolve=True,
         )
 
         self.policy = LatticePolicy(
             state_dim=state_dim,
             action_dim=action_dim,
-            **lattice_cfg
+            **lattice_cfg,
         )
 
     def _setup_moe_policy(self) -> None:
-        """MoE-Lattice Policy — Shared Expert + N Routed Experts, Low-Rank Covariance."""
+        """MoE-Lattice Policy — Shared Expert + N Routed Experts,
+        Low-Rank Covariance.
+        """
         from arnold.torch_model.policy_moe import MoELatticePolicy
 
         if len(self.experts) > 1:
             raise ValueError(
                 f"MoE policy поддерживает только одного эксперта, "
                 f"сейчас: {list(self.experts.keys())}. "
-                "Используйте policy=transformer для multi-expert."
+                "Используйте policy=transformer для multi-expert.",
             )
 
         ctx = next(iter(self.experts.values()))
@@ -587,15 +650,20 @@ class ArnoldTrainer:
         top_k = moe_cfg["top_k"]
         alpha = moe_cfg["alpha"]
 
-        routing_mode = "soft (all experts)" if top_k == num_experts else f"sparse top_k={top_k}"
+        routing_mode = (
+            "soft (all experts)"
+            if top_k == num_experts
+            else f"sparse top_k={top_k}"
+        )
         logger.info(
             f"MoE setup:\n"
-            f"  state_dim={state_dim}  action_dim={action_dim}  latent_dim={latent_dim}\n"
+            f"  state_dim={state_dim}  action_dim={action_dim}  "
+            f"latent_dim={latent_dim}\n"
             f"  alpha={alpha} (shared) / {1 - alpha:.2f} (routed)\n"
             f"  routing: {routing_mode} / {num_experts} experts  "
             f"(~{top_k / num_experts:.0%} of pool per sample)\n"
             f"  cov_factor: α·W_shared + (1-α)·Σ(w_i·W_i) * latent_std  "
-            f"[{action_dim}×{latent_dim}]"
+            f"[{action_dim}×{latent_dim}]",
         )
 
         self.policy = MoELatticePolicy(
@@ -611,19 +679,23 @@ class ArnoldTrainer:
         if len(self.experts) > 1:
             raise ValueError(
                 f"gate_moe policy supports only one expert, "
-                f"now: {list(self.experts.keys())}"
+                f"now: {list(self.experts.keys())}",
             )
 
         ctx = next(iter(self.experts.values()))
         state_dim = ctx.parser.n_obs_elements
         action_dim = ctx.wrapper.action_dim
 
-        gate_cfg = OmegaConf.to_container(self.cfg.learning.gate_moe, resolve=True)
+        gate_cfg = OmegaConf.to_container(
+            self.cfg.learning.gate_moe,
+            resolve=True,
+        )
         expert_ckpts = list(gate_cfg.get("expert_checkpoints", []) or [])
         if not expert_ckpts:
             raise ValueError(
                 "gate_moe.expert_checkpoints is empty. "
-                "Pass via CLI: 'learning.gate_moe.expert_checkpoints=[path1,path2,...]'"
+                "Pass via CLI: "
+                "'learning.gate_moe.expert_checkpoints=[path1,path2,...]'",
             )
 
         logger.info(
@@ -631,7 +703,7 @@ class ArnoldTrainer:
             f"  state_dim={state_dim}  action_dim={action_dim}\n"
             f"  num_experts={len(expert_ckpts)}\n"
             f"  gate_units={gate_cfg.get('gate_units')}  "
-            f"activation={gate_cfg.get('gate_activation')}"
+            f"activation={gate_cfg.get('gate_activation')}",
         )
         for i, ckpt in enumerate(expert_ckpts):
             logger.info(f"  expert {i}: {ckpt}")
@@ -670,10 +742,9 @@ class ArnoldTrainer:
             self.policy_scheduler = None
             self.value_scheduler = None
 
-    # ------------------------------------------------------------------
-    #  Sampling
-    # ------------------------------------------------------------------
-
+    ############################################
+    #                 Sampling                 #
+    ############################################
     def seed_worker(self, pid: int) -> None:
         if pid > 0:
             seed = random.randint(0, 5000) * pid + self.epoch
@@ -688,7 +759,7 @@ class ArnoldTrainer:
         mp_done: mp.Event,
         min_batch_size: int,
         expert_name: str,
-        step_counter: Optional[mp.Value] = None,
+        step_counter: mp.Value | None = None,
         enable_profiler: bool = False,
     ) -> None:
         """
@@ -703,7 +774,10 @@ class ArnoldTrainer:
 
         ctx = self.experts[expert_name]
         wrapper = ctx.wrapper
-        worker_parser = ObservationParser.from_env(wrapper.env, self.history_len)
+        worker_parser = ObservationParser.from_env(
+            wrapper.env,
+            self.history_len,
+        )
         worker_action_parser = ActionParser.from_env(wrapper.env)
 
         memory = OBCMemory()
@@ -721,17 +795,23 @@ class ArnoldTrainer:
                 worker_parser.reset(obs)
 
                 p = self.policy_module.profiler
-                for t in range(10000):
+                for t in range(10000):  # noqa: B007
                     with p.section("parser.get_obs"):
-                        obs_ts, obs_sigs = worker_parser.get_observation(torch.device("cpu"))
+                        obs_ts, obs_sigs = worker_parser.get_observation(
+                            torch.device("cpu"),
+                        )
                         act_sigs = worker_action_parser.action_signatures
 
-                    with p.section("policy.forward"):
+                    with p.section("policy.forward"):  # noqa: SIM117
                         with torch.no_grad():
-                            env_action, policy_action, log_prob, value = self.policy_module.get_action(
-                                obs_ts, obs_sigs, act_sigs,
-                                expert_name=expert_name,
-                                deterministic=False,
+                            env_action, policy_action, log_prob, value = (
+                                self.policy_module.get_action(
+                                    obs_ts,
+                                    obs_sigs,
+                                    act_sigs,
+                                    expert_name=expert_name,
+                                    deterministic=False,
+                                )
                             )
 
                     if ctx.use_expert:
@@ -740,27 +820,37 @@ class ArnoldTrainer:
                                 with torch.no_grad():
                                     t_mean, _, _, _, _ = ctx.gpu_teacher(
                                         obs_ts.to(self.device),
-                                        obs_sigs, act_sigs,
+                                        obs_sigs,
+                                        act_sigs,
                                         expert_name=expert_name,
-                                        return_std=False, return_value=False,
+                                        return_std=False,
+                                        return_value=False,
                                     )
-                                expert_action_t = t_mean.squeeze(0).float().cpu()
+                                expert_action_t = (
+                                    t_mean.squeeze(0).float().cpu()
+                                )
                             else:
                                 expert_action = wrapper.get_expert_action(obs)
-                                expert_action_t = torch.from_numpy(expert_action).float()
+                                expert_action_t = torch.from_numpy(
+                                    expert_action,
+                                ).float()
                     else:
                         expert_action_t = zero_expert
 
                     env_action_np = env_action.squeeze(0).cpu().numpy()
                     with p.section("env.step"):
-                        next_obs, reward, terminated, truncated, info = wrapper.step(env_action_np)
+                        next_obs, reward, terminated, truncated, info = (
+                            wrapper.step(env_action_np)
+                        )
                     done = terminated or truncated
 
                     with p.section("memory.append"):
                         memory.states.append(obs_ts.squeeze(0).cpu())
                         memory.obs_signatures.append(obs_sigs)
                         memory.action_signatures.append(act_sigs)
-                        memory.policy_actions.append(policy_action.squeeze(0).cpu())
+                        memory.policy_actions.append(
+                            policy_action.squeeze(0).cpu(),
+                        )
                         memory.expert_actions.append(expert_action_t.cpu())
                         memory.rewards.append(reward)
                         memory.values.append(value.squeeze(0).cpu())
@@ -787,6 +877,7 @@ class ArnoldTrainer:
 
         except Exception as e:
             import traceback
+
             print(f"Worker {pid} [{expert_name}] failed: {e}")
             traceback.print_exc()
 
@@ -794,10 +885,18 @@ class ArnoldTrainer:
             p = self.policy_module.profiler
             profiler_data = p.to_dict() if p.time_enabled else None
             p.time_enabled = False
-            queue.put([pid, expert_name, memory.to_transfer_dict(), obc_logger, profiler_data])
+            queue.put(
+                [
+                    pid,
+                    expert_name,
+                    memory.to_transfer_dict(),
+                    obc_logger,
+                    profiler_data,
+                ],
+            )
             mp_done.wait()
 
-    def sample(self) -> Tuple[Dict[str, OBCBatch], Dict[str, OBCLogger]]:
+    def sample(self) -> tuple[dict[str, OBCBatch], dict[str, OBCLogger]]:
         """
         Собирает траектории от ВСЕХ экспертов полностью параллельно.
 
@@ -813,36 +912,43 @@ class ArnoldTrainer:
             expert_loggers: Dict[expert_name -> OBCLogger]
         """
         # Vectorized: env workers on CPU, batched inference on GPU/MPS
-        if self.device.type in ('cuda', 'mps'):
+        if self.device.type in ("cuda", "mps"):
             return self._sample_vectorized_persistent()
 
         t_start = time.time()
         self.mp_done.clear()
         to_test(self.policy)
 
-        optimizer_to(self.policy_optimizer, torch.device('cpu'))
-        optimizer_to(self.value_optimizer, torch.device('cpu'))
-        with to_cpu(self.policy):
+        optimizer_to(self.policy_optimizer, torch.device("cpu"))
+        optimizer_to(self.value_optimizer, torch.device("cpu"))
+        with to_cpu(self.policy):  # noqa: SIM117
             with torch.no_grad():
                 queue = fork_ctx.Queue()
 
                 # Shared step counters для tqdm (один на эксперта)
-                step_counters: Dict[str, fork_ctx.Value] = {
-                    name: fork_ctx.Value('i', 0)
-                    for name in self.experts
+                step_counters: dict[str, fork_ctx.Value] = {
+                    name: fork_ctx.Value("i", 0) for name in self.experts
                 }
 
                 # Spawn ALL workers as background (daemon) processes
                 total_workers = 0
-                workers: List[fork_ctx.Process] = []
+                workers: list[fork_ctx.Process] = []
                 for expert_name, ctx in self.experts.items():
-                    thread_batch = int(math.floor(ctx.min_batch_size / ctx.num_threads))
+                    thread_batch = int(
+                        math.floor(ctx.min_batch_size / ctx.num_threads),
+                    )
                     for worker_num in range(ctx.num_threads):
                         pid = total_workers + 1
                         profile_this = worker_num == 0 and self.epoch == 0
                         worker = fork_ctx.Process(
                             target=self.sample_worker,
-                            args=(pid, queue, self.mp_done, thread_batch, expert_name),
+                            args=(
+                                pid,
+                                queue,
+                                self.mp_done,
+                                thread_batch,
+                                expert_name,
+                            ),
                             kwargs={
                                 "step_counter": step_counters[expert_name],
                                 "enable_profiler": profile_this,
@@ -854,7 +960,7 @@ class ArnoldTrainer:
                         total_workers += 1
 
                 # Main process: только мониторинг progress bars
-                pbars: Dict[str, tqdm] = {}
+                pbars: dict[str, tqdm] = {}
                 for expert_name, ctx in self.experts.items():
                     pbars[expert_name] = tqdm(
                         total=ctx.min_batch_size,
@@ -862,16 +968,22 @@ class ArnoldTrainer:
                         unit="step",
                     )
 
-                results: List = []
+                results: list = []
                 while len(results) < total_workers:
                     for expert_name, counter in step_counters.items():
-                        pbars[expert_name].n = min(counter.value, pbars[expert_name].total)
+                        pbars[expert_name].n = min(
+                            counter.value,
+                            pbars[expert_name].total,
+                        )
                         pbars[expert_name].refresh()
 
                     # Check for dead workers (segfault, SIGKILL, etc.)
                     dead_workers = [
-                        w for w in workers
-                        if not w.is_alive() and w.exitcode is not None and w.exitcode != 0
+                        w
+                        for w in workers
+                        if not w.is_alive()
+                        and w.exitcode is not None
+                        and w.exitcode != 0
                     ]
                     finished_not_reported = sum(
                         1 for w in workers if not w.is_alive()
@@ -879,9 +991,10 @@ class ArnoldTrainer:
                     if finished_not_reported > 0 and len(dead_workers) > 0:
                         exit_codes = {w.pid: w.exitcode for w in dead_workers}
                         raise RuntimeError(
-                            f"Sampling workers crashed (exit codes: {exit_codes}). "
+                            f"Sampling workers crashed "
+                            f"(exit codes: {exit_codes}). "
                             f"This usually means a segfault in forked process. "
-                            f"Check worker logs above for details."
+                            f"Check worker logs above for details.",
                         )
 
                     try:
@@ -898,31 +1011,51 @@ class ArnoldTrainer:
                     pbar.close()
 
                 # Collect results per expert
-                per_expert_memories: Dict[str, List[OBCMemory]] = {n: [] for n in self.experts}
-                per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
+                per_expert_memories: dict[str, list[OBCMemory]] = {
+                    n: [] for n in self.experts
+                }
+                per_expert_loggers: dict[str, list[OBCLogger]] = {
+                    n: [] for n in self.experts
+                }
 
-                for w_pid, w_expert, w_transfer, w_logger, w_profiler_data in results:
-                    per_expert_memories[w_expert].append(OBCMemory.from_transfer_dict(w_transfer))
+                for (
+                    w_pid,  # noqa: B007
+                    w_expert,
+                    w_transfer,
+                    w_logger,
+                    w_profiler_data,
+                ) in results:
+                    per_expert_memories[w_expert].append(
+                        OBCMemory.from_transfer_dict(w_transfer),
+                    )
                     per_expert_loggers[w_expert].append(w_logger)
                     if w_profiler_data is not None:
-                        self.profiler_reports[w_expert] = Profiler.from_dict(w_profiler_data)
+                        self.profiler_reports[w_expert] = Profiler.from_dict(
+                            w_profiler_data,
+                        )
 
         self.mp_done.set()
         optimizer_to(self.policy_optimizer, self.device)
         optimizer_to(self.value_optimizer, self.device)
 
         # Merge per expert
-        expert_batches: Dict[str, OBCBatch] = {}
-        expert_loggers: Dict[str, OBCLogger] = {}
+        expert_batches: dict[str, OBCBatch] = {}
+        expert_loggers: dict[str, OBCLogger] = {}
 
         for expert_name in self.experts:
             merged_memory = OBCMemory()
             for mem in per_expert_memories[expert_name]:
                 merged_memory.extend(mem)
 
-            batch = merged_memory.to_batch(gamma=self.gamma, tau=self.tau, device=None)
+            batch = merged_memory.to_batch(
+                gamma=self.gamma,
+                tau=self.tau,
+                device=None,
+            )
             expert_batches[expert_name] = batch
-            expert_loggers[expert_name] = OBCLogger.merge(per_expert_loggers[expert_name])
+            expert_loggers[expert_name] = OBCLogger.merge(
+                per_expert_loggers[expert_name],
+            )
 
         sample_time = time.time() - t_start
         for lg in expert_loggers.values():
@@ -930,10 +1063,9 @@ class ArnoldTrainer:
 
         return expert_batches, expert_loggers
 
-    # ------------------------------------------------------------------
-    #  Vectorized Sampling
-    # ------------------------------------------------------------------
-
+    ############################################
+    #           Vectorized Sampling            #
+    ############################################
     def _vec_env_worker_persistent(
         self,
         expert_name: str,
@@ -986,7 +1118,10 @@ class ArnoldTrainer:
                 torch.manual_seed(seed)
 
                 # Resample motions if main process requested it
-                if resample_flag.value and hasattr(wrapper.env, 'sample_motions'):
+                if resample_flag.value and hasattr(
+                    wrapper.env,
+                    "sample_motions",
+                ):
                     wrapper.env.sample_motions()
 
                 obc_logger = OBCLogger()
@@ -1023,7 +1158,9 @@ class ArnoldTrainer:
                             break
 
                         action_np = action_buf.numpy().copy()
-                        next_obs, reward, terminated, truncated, info = wrapper.step(action_np)
+                        next_obs, reward, terminated, truncated, info = (
+                            wrapper.step(action_np)
+                        )
                         done = terminated or truncated
 
                         reward_val.value = float(reward)
@@ -1048,51 +1185,73 @@ class ArnoldTrainer:
                         obs_buf.copy_(obs_ts.squeeze(0))
                         if ctx.use_expert and wrapper.has_expert:
                             ea = wrapper.get_expert_action(obs)
-                            expert_action_buf.copy_(torch.from_numpy(ea).float())
+                            expert_action_buf.copy_(
+                                torch.from_numpy(ea).float(),
+                            )
 
                         obs_ready.set()
 
                 except Exception as e:
                     import traceback
-                    print(f"PersistentWorker [{expert_name}#{worker_id}] inner loop failed: {e}")
+
+                    print(
+                        f"PersistentWorker [{expert_name}#{worker_id}] "
+                        f"inner loop failed: {e}",
+                    )
                     traceback.print_exc()
 
                 # Send logger + termination stats for this epoch
                 term_stats = None
                 if hasattr(wrapper.env, "get_termination_stats"):
                     term_stats = wrapper.env.get_termination_stats()
-                result_queue.put(("logger", expert_name, obc_logger, term_stats))
+                result_queue.put(
+                    ("logger", expert_name, obc_logger, term_stats),
+                )
 
         except Exception as e:
             import traceback
-            print(f"PersistentWorker [{expert_name}#{worker_id}] outer loop failed: {e}")
+
+            print(
+                f"PersistentWorker [{expert_name}#{worker_id}] "
+                f"outer loop failed: {e}",
+            )
             traceback.print_exc()
 
-    # ------------------------------------------------------------------
-    #  Persistent Worker Management
-    # ------------------------------------------------------------------
-
+    ############################################
+    #       Persistent Worker Management       #
+    ############################################
     def _ensure_persistent_workers(self) -> None:
-        """Lazily spawn persistent workers on first call. No-op if already alive."""
+        """Lazily spawn persistent workers on first call. No-op if
+        already alive.
+        """
         if self._persistent_state is not None:
             return
 
         result_queue = fork_ctx.Queue()
-        stop_flag = fork_ctx.Value('i', 0)
-        shutdown_flag = fork_ctx.Value('i', 0)
-        epoch_val = fork_ctx.Value('i', 0)
-        resample_flag = fork_ctx.Value('i', 0)
+        stop_flag = fork_ctx.Value("i", 0)
+        shutdown_flag = fork_ctx.Value("i", 0)
+        epoch_val = fork_ctx.Value("i", 0)
+        resample_flag = fork_ctx.Value("i", 0)
 
         class _WH:
             """Persistent worker handle."""
+
             __slots__ = (
-                'expert_name', 'obs_buf', 'action_buf', 'expert_action_buf',
-                'reward_val', 'done_val', 'obs_ready', 'action_ready',
-                'epoch_start', 'proc', 'active',
+                "expert_name",
+                "obs_buf",
+                "action_buf",
+                "expert_action_buf",
+                "reward_val",
+                "done_val",
+                "obs_ready",
+                "action_ready",
+                "epoch_start",
+                "proc",
+                "active",
             )
 
-        workers_by_expert: Dict[str, List] = {n: [] for n in self.experts}
-        all_workers: List = []
+        workers_by_expert: dict[str, list] = {n: [] for n in self.experts}
+        all_workers: list = []
 
         for expert_name, ctx in self.experts.items():
             obs_shape = (ctx.parser.n_obs_elements, self.history_len)
@@ -1102,11 +1261,20 @@ class ArnoldTrainer:
             for w_idx in range(n_workers):
                 wh = _WH()
                 wh.expert_name = expert_name
-                wh.obs_buf = torch.zeros(obs_shape, dtype=torch.float32).share_memory_()
-                wh.action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
-                wh.expert_action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
-                wh.reward_val = fork_ctx.Value('d', 0.0)
-                wh.done_val = fork_ctx.Value('i', 0)
+                wh.obs_buf = torch.zeros(
+                    obs_shape,
+                    dtype=torch.float32,
+                ).share_memory_()
+                wh.action_buf = torch.zeros(
+                    action_dim,
+                    dtype=torch.float32,
+                ).share_memory_()
+                wh.expert_action_buf = torch.zeros(
+                    action_dim,
+                    dtype=torch.float32,
+                ).share_memory_()
+                wh.reward_val = fork_ctx.Value("d", 0.0)
+                wh.done_val = fork_ctx.Value("i", 0)
                 wh.obs_ready = fork_ctx.Event()
                 wh.action_ready = fork_ctx.Event()
                 wh.epoch_start = fork_ctx.Event()
@@ -1119,14 +1287,20 @@ class ArnoldTrainer:
                     args=(
                         expert_name,
                         global_wid,
-                        wh.obs_buf, wh.action_buf, wh.expert_action_buf,
-                        wh.reward_val, wh.done_val,
-                        wh.obs_ready, wh.action_ready,
-                        stop_flag, shutdown_flag,
-                        wh.epoch_start, epoch_val,
+                        wh.obs_buf,
+                        wh.action_buf,
+                        wh.expert_action_buf,
+                        wh.reward_val,
+                        wh.done_val,
+                        wh.obs_ready,
+                        wh.action_ready,
+                        stop_flag,
+                        shutdown_flag,
+                        wh.epoch_start,
+                        epoch_val,
                         resample_flag,
                         result_queue,
-                        fork_ctx.Value('i', 0),  # step_counter per worker
+                        fork_ctx.Value("i", 0),  # step_counter per worker
                         w_idx == 0,  # send_sigs
                     ),
                     daemon=True,
@@ -1141,7 +1315,7 @@ class ArnoldTrainer:
         workers_per_expert = {n: len(ws) for n, ws in workers_by_expert.items()}
         logger.info(
             f"Persistent vectorized workers spawned: {total_workers} "
-            f"({workers_per_expert})"
+            f"({workers_per_expert})",
         )
 
         # Collect signatures from first epoch trigger
@@ -1150,7 +1324,7 @@ class ArnoldTrainer:
         for wh in all_workers:
             wh.epoch_start.set()
 
-        sigs_by_expert: Dict[str, Tuple] = {}
+        sigs_by_expert: dict[str, tuple] = {}
         while len(sigs_by_expert) < len(self.experts):
             msg = result_queue.get(timeout=30)
             if msg[0] == "sigs":
@@ -1189,7 +1363,9 @@ class ArnoldTrainer:
         self._persistent_state = None
         logger.info("Persistent workers shut down.")
 
-    def _sample_vectorized_persistent(self) -> Tuple[Dict[str, OBCBatch], Dict[str, OBCLogger]]:
+    def _sample_vectorized_persistent(
+        self,
+    ) -> tuple[dict[str, OBCBatch], dict[str, OBCLogger]]:
         """
         Vectorized sampling with persistent workers.
 
@@ -1203,16 +1379,16 @@ class ArnoldTrainer:
         t_start = time.time()
         self.policy.eval()
 
-        optimizer_to(self.policy_optimizer, torch.device('cpu'))
-        optimizer_to(self.value_optimizer, torch.device('cpu'))
+        optimizer_to(self.policy_optimizer, torch.device("cpu"))
+        optimizer_to(self.value_optimizer, torch.device("cpu"))
 
         prof = Profiler(
-            device=str(self.device) if self.device.type == 'cuda' else None,
+            device=str(self.device) if self.device.type == "cuda" else None,
         )
-        prof.time_enabled = (self.epoch == 0)
+        prof.time_enabled = self.epoch == 0
 
-        old_profiler = getattr(self.policy_module, 'profiler', None)
-        if hasattr(self.policy_module, 'set_profiler'):
+        old_profiler = getattr(self.policy_module, "profiler", None)
+        if hasattr(self.policy_module, "set_profiler"):
             self.policy_module.set_profiler(prof)
 
         result_queue = state["result_queue"]
@@ -1228,7 +1404,8 @@ class ArnoldTrainer:
         for wh in all_workers:
             wh.active = True
 
-        # Signal epoch start (skip on first epoch — already triggered in _ensure)
+        # Signal epoch start (skip on first epoch — already triggered
+        # in _ensure)
         if not state["first_epoch"]:
             state["epoch_val"].value = self.epoch
             for wh in all_workers:
@@ -1239,7 +1416,7 @@ class ArnoldTrainer:
         logger.info(
             f"Persistent sampling: {total_workers} workers "
             f"({workers_per_expert}), inference on {self.device}, "
-            f"finish_episodes={self.finish_episodes}"
+            f"finish_episodes={self.finish_episodes}",
         )
 
         # Wait for initial obs from all workers
@@ -1251,18 +1428,22 @@ class ArnoldTrainer:
                     if not wh.proc.is_alive():
                         raise RuntimeError(
                             f"PersistentWorker [{wh.expert_name}] died "
-                            f"(exit code {wh.proc.exitcode})"
+                            f"(exit code {wh.proc.exitcode})",
                         )
                 wh.obs_ready.clear()
 
         _wait_obs_active()
 
         # Per-worker memory tracking
-        worker_mems: Dict[int, OBCMemory] = {id(w): OBCMemory() for w in all_workers}
-        worker_prev: Dict[int, Optional[dict]] = {id(w): None for w in all_workers}
+        worker_mems: dict[int, OBCMemory] = {
+            id(w): OBCMemory() for w in all_workers
+        }
+        worker_prev: dict[int, dict | None] = {id(w): None for w in all_workers}
 
-        per_expert_steps: Dict[str, int] = {n: 0 for n in self.experts}
-        target_steps = {n: ctx.min_batch_size for n, ctx in self.experts.items()}
+        per_expert_steps: dict[str, int] = dict.fromkeys(self.experts, 0)
+        target_steps = {
+            n: ctx.min_batch_size for n, ctx in self.experts.items()
+        }
 
         pbars = {
             n: tqdm(total=t, desc=f"  Sampling [{n}]", unit="step")
@@ -1299,7 +1480,9 @@ class ArnoldTrainer:
                                 mem.expert_actions.append(prev["expert_action"])
                                 mem.rewards.append(wh.reward_val.value)
                                 mem.values.append(prev["value"])
-                                mem.masks.append(0.0 if wh.done_val.value else 1.0)
+                                mem.masks.append(
+                                    0.0 if wh.done_val.value else 1.0,
+                                )
                                 mem.log_probs.append(prev["log_prob"])
                                 per_expert_steps[expert_name] += 1
 
@@ -1340,21 +1523,27 @@ class ArnoldTrainer:
 
                         with prof.section("stack_obs"):
                             batch_obs = torch.stack(
-                                [wh.obs_buf.clone() for wh in active_workers]
+                                [wh.obs_buf.clone() for wh in active_workers],
                             )
 
                         with prof.section("gpu_forward"):
                             with prof.section("to_device"):
                                 batch_obs_dev = batch_obs.to(device)
-                            with prof.section("policy_forward"):
+                            with prof.section("policy_forward"):  # noqa: SIM117
                                 with torch.autocast(
                                     device_type=device_type,
                                     dtype=torch.bfloat16,
                                     enabled=use_amp,
                                 ):
-                                    env_actions, policy_actions, log_probs, values = self.policy_module.get_action(
+                                    (
+                                        env_actions,
+                                        policy_actions,
+                                        log_probs,
+                                        values,
+                                    ) = self.policy_module.get_action(
                                         batch_obs_dev,
-                                        obs_sigs, act_sigs,
+                                        obs_sigs,
+                                        act_sigs,
                                         expert_name=expert_name,
                                         deterministic=False,
                                     )
@@ -1367,9 +1556,12 @@ class ArnoldTrainer:
                                         enabled=use_amp,
                                     ):
                                         t_mean, _, _, _, _ = ctx.gpu_teacher(
-                                            batch_obs_dev, obs_sigs, act_sigs,
+                                            batch_obs_dev,
+                                            obs_sigs,
+                                            act_sigs,
                                             expert_name=expert_name,
-                                            return_std=False, return_value=False,
+                                            return_std=False,
+                                            return_value=False,
                                         )
                                     teacher_actions_cpu = t_mean.float().cpu()
                             with prof.section("to_cpu"):
@@ -1418,8 +1610,10 @@ class ArnoldTrainer:
             wh.action_ready.set()
 
         # Collect loggers from workers
-        per_expert_loggers: Dict[str, List[OBCLogger]] = {n: [] for n in self.experts}
-        per_expert_term_stats: Dict[str, list] = {n: [] for n in self.experts}
+        per_expert_loggers: dict[str, list[OBCLogger]] = {
+            n: [] for n in self.experts
+        }
+        per_expert_term_stats: dict[str, list] = {n: [] for n in self.experts}
         collected = 0
         while collected < total_workers:
             try:
@@ -1433,15 +1627,18 @@ class ArnoldTrainer:
                 break
 
         # Restore profiler
-        if old_profiler is not None and hasattr(self.policy_module, 'set_profiler'):
+        if old_profiler is not None and hasattr(
+            self.policy_module,
+            "set_profiler",
+        ):
             self.policy_module.set_profiler(old_profiler)
 
         optimizer_to(self.policy_optimizer, self.device)
         optimizer_to(self.value_optimizer, self.device)
 
         # Merge per expert
-        expert_batches: Dict[str, OBCBatch] = {}
-        expert_loggers: Dict[str, OBCLogger] = {}
+        expert_batches: dict[str, OBCBatch] = {}
+        expert_loggers: dict[str, OBCLogger] = {}
 
         for expert_name, workers in workers_by_expert.items():
             merged = OBCMemory()
@@ -1454,7 +1651,7 @@ class ArnoldTrainer:
             batch = merged.to_batch(gamma=self.gamma, tau=self.tau, device=None)
             expert_batches[expert_name] = batch
             expert_loggers[expert_name] = OBCLogger.merge(
-                per_expert_loggers.get(expert_name, [])
+                per_expert_loggers.get(expert_name, []),
             )
 
         # Merge termination stats
@@ -1473,7 +1670,9 @@ class ArnoldTrainer:
                         env._termination_dists[body] = []
                     env._termination_counts[body] += s["caused"]
                     if s["mean_dist"] > 0 and s["caused"] > 0:
-                        env._termination_dists[body].extend([s["mean_dist"]] * s["caused"])
+                        env._termination_dists[body].extend(
+                            [s["mean_dist"]] * s["caused"],
+                        )
 
         if prof.time_enabled:
             self.profiler_reports["vectorized_sampling"] = prof
@@ -1484,15 +1683,14 @@ class ArnoldTrainer:
 
         return expert_batches, expert_loggers
 
-    # ------------------------------------------------------------------
-    #  Update
-    # ------------------------------------------------------------------
-
+    ############################################
+    #                  Update                  #
+    ############################################
     def update_params(
         self,
-        expert_batches: Dict[str, OBCBatch],
+        expert_batches: dict[str, OBCBatch],
         debug_memory: bool = False,
-    ) -> Dict[str, Dict[str, float]]:
+    ) -> dict[str, dict[str, float]]:
         """
         Обновляет параметры policy.
 
@@ -1519,25 +1717,42 @@ class ArnoldTrainer:
                 "advantages": batch.advantages.to(self.device),
                 "fixed_log_probs": batch.log_probs.to(self.device),
                 "old_values": batch.values.to(self.device),
-                "expert_actions": batch.expert_actions.to(self.device) if ctx.use_expert else None,
+                "expert_actions": batch.expert_actions.to(self.device)
+                if ctx.use_expert
+                else None,
                 "obs_signatures": batch.obs_signatures,
                 "action_signatures": batch.action_signatures,
                 "batch_size": batch.states.shape[0],
             }
 
         # Accumulators per expert
-        per_expert_losses: Dict[str, Dict[str, list]] = {
-            n: {"ppo": [], "imitation": [], "imitation_per_sample": [], "value": [], "entropy": [], "sigma": [], "load_balance": [], "mean_penalty": []}
+        per_expert_losses: dict[str, dict[str, list]] = {
+            n: {
+                "ppo": [],
+                "imitation": [],
+                "value": [],
+                "entropy": [],
+                "sigma": [],
+                "load_balance": [],
+                "mean_penalty": [],
+            }
             for n in self.experts
         }
-        per_expert_diag: Dict[str, Dict[str, list]] = {
-            n: {"ratios": [], "clip_fracs": [], "value_clip_fracs": [], "approx_kls": [], "grad_norms": [], "value_grad_norms": []}
+        per_expert_diag: dict[str, dict[str, list]] = {
+            n: {
+                "ratios": [],
+                "clip_fracs": [],
+                "value_clip_fracs": [],
+                "approx_kls": [],
+                "grad_norms": [],
+                "value_grad_norms": [],
+            }
             for n in self.experts
         }
 
         # Общее число mini-batch forwards для progress bar
         total_updates = 0
-        for expert_name, ed in expert_data.items():
+        for expert_name, ed in expert_data.items():  # noqa: B007
             n_batches = max(1, ed["batch_size"] // self.batch_size)
             total_updates += self.opt_num_epochs * n_batches
         # Log effective optimizer steps
@@ -1547,9 +1762,9 @@ class ArnoldTrainer:
         # Memory profiling: включается на первый mini-batch, потом выключается
         _mem_prof_done: bool = False
 
-        for ppo_epoch in range(self.opt_num_epochs):
+        for ppo_epoch in range(self.opt_num_epochs):  # noqa: B007
             # Строим interleaved расписание mini-batches
-            schedule: List[Tuple[str, np.ndarray]] = []
+            schedule: list[tuple[str, np.ndarray]] = []
 
             for expert_name, ed in expert_data.items():
                 bs = ed["batch_size"]
@@ -1589,12 +1804,17 @@ class ArnoldTrainer:
 
                 use_autocast = self.use_bfloat16 and self.device.type == "cuda"
 
-                with prof.section(f"mini_batch  expert={expert_name}"):
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_autocast):
+                with prof.section(f"mini_batch  expert={expert_name}"):  # noqa: SIM117
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=torch.bfloat16,
+                        enabled=use_autocast,
+                    ):
                         with prof.section("policy.forward"):
                             if prof.mem_enabled and self.device_ids is not None:
                                 # DataParallel реплики не видят profiler →
-                                # при профилировании вызываем policy_module напрямую
+                                # при профилировании вызываем
+                                # policy_module напрямую
                                 policy_out = self.policy_module.forward(
                                     mini_states,
                                     ed["obs_signatures"],
@@ -1608,12 +1828,18 @@ class ArnoldTrainer:
                                     ed["action_signatures"],
                                     expert_name=expert_name,
                                 )
-                        pred_mean, cov_factor, diag_std, values, latent_std = policy_out[:5]
-                        forward_lb_loss = policy_out[5] if len(policy_out) > 5 else None
+                        pred_mean, cov_factor, diag_std, values, latent_std = (
+                            policy_out[:5]
+                        )
+                        forward_lb_loss = (
+                            policy_out[5] if len(policy_out) > 5 else None
+                        )
 
                         with prof.section("build_dist"):
                             dist = self.policy_module.build_action_dist(
-                                pred_mean, cov_factor, diag_std,
+                                pred_mean,
+                                cov_factor,
+                                diag_std,
                             )
 
                         policy_loss = torch.tensor(0.0, device=self.device)
@@ -1622,38 +1848,75 @@ class ArnoldTrainer:
                         # --- PPO ---
                         if ctx.ppo_weight > 0:
                             with prof.section("compute_log_prob"):
-                                new_log_probs = self.policy_module.dist_log_prob(dist, mini_actions)
+                                new_log_probs = (
+                                    self.policy_module.dist_log_prob(
+                                        dist,
+                                        mini_actions,
+                                    )
+                                )
                             with prof.section("ppo_loss"):
                                 log_ratio = new_log_probs - mini_fixed_lp
                                 ratio = torch.exp(log_ratio)
                                 surr1 = ratio * mini_advantages
-                                surr2 = torch.clamp(
-                                    ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon,
-                                ) * mini_advantages
+                                surr2 = (
+                                    torch.clamp(
+                                        ratio,
+                                        1.0 - self.clip_epsilon,
+                                        1.0 + self.clip_epsilon,
+                                    )
+                                    * mini_advantages
+                                )
                                 ppo_loss = -torch.min(surr1, surr2).mean()
-                            policy_loss = policy_loss + ctx.ppo_weight * ppo_loss
-                            per_expert_losses[expert_name]["ppo"].append(ppo_loss.item())
+                            policy_loss = (
+                                policy_loss + ctx.ppo_weight * ppo_loss
+                            )
+                            per_expert_losses[expert_name]["ppo"].append(
+                                ppo_loss.item(),
+                            )
 
                             with torch.no_grad():
-                                approx_kl = ((ratio - 1) - log_ratio).mean().item()
-                                clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
-                                per_expert_diag[expert_name]["ratios"].append(ratio.mean().item())
-                                per_expert_diag[expert_name]["clip_fracs"].append(clip_frac)
-                                per_expert_diag[expert_name]["approx_kls"].append(approx_kl)
+                                approx_kl = (
+                                    ((ratio - 1) - log_ratio).mean().item()
+                                )
+                                clip_frac = (
+                                    ((ratio - 1.0).abs() > self.clip_epsilon)
+                                    .float()
+                                    .mean()
+                                    .item()
+                                )
+                                per_expert_diag[expert_name]["ratios"].append(
+                                    ratio.mean().item(),
+                                )
+                                per_expert_diag[expert_name][
+                                    "clip_fracs"
+                                ].append(clip_frac)
+                                per_expert_diag[expert_name][
+                                    "approx_kls"
+                                ].append(approx_kl)
 
                         # --- OBC Imitation ---
-                        # Skipped for gate_moe: pred_mean is gate logits, not action mean.
+                        # Skipped for gate_moe: pred_mean is gate logits,
+                        # not action mean.
                         if (
-                            ctx.use_expert and ctx.obc_imitation_weight > 0
+                            ctx.use_expert
+                            and ctx.obc_imitation_weight > 0
                             and self.cfg.learning.policy != "gate_moe"
                         ):
                             with prof.section("imitation_loss"):
-                                mini_expert = ed["expert_actions"][batch_indices]
-                                per_sample = ((pred_mean - mini_expert) ** 2).mean(dim=1)
+                                mini_expert = ed["expert_actions"][
+                                    batch_indices
+                                ]
+                                per_sample = (
+                                    (pred_mean - mini_expert) ** 2
+                                ).mean(dim=1)
                                 imitation_loss = per_sample.mean()
-                            policy_loss = policy_loss + ctx.obc_imitation_weight * imitation_loss
-                            per_expert_losses[expert_name]["imitation"].append(imitation_loss.item())
-                            per_expert_losses[expert_name]["imitation_per_sample"].append(imitation_loss.item())
+                            policy_loss = (
+                                policy_loss
+                                + ctx.obc_imitation_weight * imitation_loss
+                            )
+                            per_expert_losses[expert_name]["imitation"].append(
+                                imitation_loss.item(),
+                            )
 
                         # --- Value ---
                         with prof.section("value_loss"):
@@ -1664,44 +1927,79 @@ class ArnoldTrainer:
                                     -self.clip_epsilon,
                                     self.clip_epsilon,
                                 )
-                                vf_loss_clipped = (v_clipped - mini_returns) ** 2
-                                value_loss = 0.5 * torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
+                                vf_loss_clipped = (
+                                    v_clipped - mini_returns
+                                ) ** 2
+                                value_loss = (
+                                    0.5
+                                    * torch.max(
+                                        vf_loss_unclipped,
+                                        vf_loss_clipped,
+                                    ).mean()
+                                )
                             else:
                                 value_loss = 0.5 * vf_loss_unclipped.mean()
                         value_loss_total = value_loss_total + value_loss
-                        per_expert_losses[expert_name]["value"].append(value_loss.item())
+                        per_expert_losses[expert_name]["value"].append(
+                            value_loss.item(),
+                        )
                         if self.value_clip:
                             with torch.no_grad():
                                 value_clip_frac = (
-                                    (values - mini_old_values).abs() > self.clip_epsilon
-                                ).float().mean().item()
-                                per_expert_diag[expert_name]["value_clip_fracs"].append(value_clip_frac)
+                                    (
+                                        (values - mini_old_values).abs()
+                                        > self.clip_epsilon
+                                    )
+                                    .float()
+                                    .mean()
+                                    .item()
+                                )
+                                per_expert_diag[expert_name][
+                                    "value_clip_fracs"
+                                ].append(value_clip_frac)
 
                         # --- Entropy ---
                         if ctx.entropy_weight > 0:
                             with prof.section("entropy"):
                                 entropy = self.policy_module.dist_entropy(dist)
                             entropy_loss = -entropy
-                            policy_loss = policy_loss + ctx.entropy_weight * entropy_loss
-                            per_expert_losses[expert_name]["entropy"].append(entropy_loss.item())
+                            policy_loss = (
+                                policy_loss + ctx.entropy_weight * entropy_loss
+                            )
+                            per_expert_losses[expert_name]["entropy"].append(
+                                entropy_loss.item(),
+                            )
 
                         # --- MoE load balancing ---
-                        if (ctx.load_balance_weight or 0) > 0 and forward_lb_loss is not None:
+                        if (
+                            ctx.load_balance_weight or 0
+                        ) > 0 and forward_lb_loss is not None:
                             lb_loss = forward_lb_loss.mean()
-                            policy_loss = policy_loss + ctx.load_balance_weight * lb_loss
-                            per_expert_losses[expert_name]["load_balance"].append(lb_loss.item())
+                            policy_loss = (
+                                policy_loss + ctx.load_balance_weight * lb_loss
+                            )
+                            per_expert_losses[expert_name][
+                                "load_balance"
+                            ].append(lb_loss.item())
 
-                        # --- Mean penalty: keep pred_mean inside [-1, 1] action box ---
-                        # Skipped for gate_moe: pred_mean is gate logits, not action mean.
+                        # --- Mean penalty: keep pred_mean inside
+                        # [-1, 1] action box ---
+                        # Skipped for gate_moe: pred_mean is gate logits,
+                        # not action mean.
                         if (
                             ctx.mean_penalty_weight > 0
                             and self.cfg.learning.policy != "gate_moe"
                         ):
                             with prof.section("mean_penalty"):
                                 out_of_box = torch.relu(pred_mean.abs() - 1.0)
-                                mean_penalty = (out_of_box ** 2).mean()
-                            policy_loss = policy_loss + ctx.mean_penalty_weight * mean_penalty
-                            per_expert_losses[expert_name]["mean_penalty"].append(mean_penalty.item())
+                                mean_penalty = (out_of_box**2).mean()
+                            policy_loss = (
+                                policy_loss
+                                + ctx.mean_penalty_weight * mean_penalty
+                            )
+                            per_expert_losses[expert_name][
+                                "mean_penalty"
+                            ].append(mean_penalty.item())
 
                         # Apply expert loss scale and accumulation scaling
                         scale = ctx.loss_scale / self.grad_accum_steps
@@ -1711,27 +2009,41 @@ class ArnoldTrainer:
                         with prof.section("loss.backward"):
                             (policy_loss + value_loss_total).backward()
 
-                accum_step += 1
+                accum_step += 1  # noqa: SIM113
                 is_last = sched_idx == len(schedule) - 1
                 if accum_step % self.grad_accum_steps == 0 or is_last:
                     with prof.section("grad_clip + optimizer.step"):
                         if self.grad_clip > 0:
                             policy_grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self.policy_module.policy_parameters(), self.grad_clip,
+                                self.policy_module.policy_parameters(),
+                                self.grad_clip,
                             )
-                            per_expert_diag[expert_name]["grad_norms"].append(policy_grad_norm.item())
+                            per_expert_diag[expert_name]["grad_norms"].append(
+                                policy_grad_norm.item(),
+                            )
                         else:
-                            total_norm = sum(
-                                p.grad.norm().item() ** 2
-                                for p in self.policy_module.policy_parameters() if p.grad is not None
-                            ) ** 0.5
-                            per_expert_diag[expert_name]["grad_norms"].append(total_norm)
+                            total_norm = (
+                                sum(
+                                    p.grad.norm().item() ** 2
+                                    for p in (
+                                        self.policy_module.policy_parameters()
+                                    )
+                                    if p.grad is not None
+                                )
+                                ** 0.5
+                            )
+                            per_expert_diag[expert_name]["grad_norms"].append(
+                                total_norm,
+                            )
 
                         if self.value_grad_clip > 0:
                             value_grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self.policy_module.value_parameters(), self.value_grad_clip,
+                                self.policy_module.value_parameters(),
+                                self.value_grad_clip,
                             )
-                            per_expert_diag[expert_name]["value_grad_norms"].append(value_grad_norm.item())
+                            per_expert_diag[expert_name][
+                                "value_grad_norms"
+                            ].append(value_grad_norm.item())
 
                         self.policy_optimizer.step()
                         self.value_optimizer.step()
@@ -1749,7 +2061,7 @@ class ArnoldTrainer:
         pbar.close()
 
         # Собираем диагностику per expert
-        all_diagnostics: Dict[str, Dict[str, float]] = {}
+        all_diagnostics: dict[str, dict[str, float]] = {}
 
         for expert_name in self.experts:
             ed = expert_data[expert_name]
@@ -1767,7 +2079,13 @@ class ArnoldTrainer:
                     ed["action_signatures"],
                     expert_name=expert_name,
                 )
-                diag_actions, diag_cov_factor, diag_diag_std, diag_values, diag_latent_std = diag_out[:5]
+                (
+                    diag_actions,
+                    diag_cov_factor,
+                    diag_diag_std,
+                    diag_values,
+                    diag_latent_std,
+                ) = diag_out[:5]
 
                 if diag_diag_std is not None:
                     logstd_mean = diag_diag_std.log().mean().item()
@@ -1775,17 +2093,35 @@ class ArnoldTrainer:
                     logstd_max = diag_diag_std.log().max().item()
                 else:
                     logstd_mean = logstd_min = logstd_max = 0.0
-                    
+
                 act_mean = diag_actions.mean().item()
                 act_std = diag_actions.std().item()
                 act_abs_mean = diag_actions.abs().mean().item()
                 act_min = diag_actions.min().item()
                 act_max = diag_actions.max().item()
-                val_post_mean = diag_values.mean().item() if diag_values is not None else 0.0
-                val_post_std = diag_values.std().item() if diag_values is not None else 0.0
-                latent_std_mean = diag_latent_std.mean().item() if diag_latent_std is not None else 0.0
-                latent_std_min = diag_latent_std.min().item() if diag_latent_std is not None else 0.0
-                latent_std_max = diag_latent_std.max().item() if diag_latent_std is not None else 0.0
+                val_post_mean = (
+                    diag_values.mean().item()
+                    if diag_values is not None
+                    else 0.0
+                )
+                val_post_std = (
+                    diag_values.std().item() if diag_values is not None else 0.0
+                )
+                latent_std_mean = (
+                    diag_latent_std.mean().item()
+                    if diag_latent_std is not None
+                    else 0.0
+                )
+                latent_std_min = (
+                    diag_latent_std.min().item()
+                    if diag_latent_std is not None
+                    else 0.0
+                )
+                latent_std_max = (
+                    diag_latent_std.max().item()
+                    if diag_latent_std is not None
+                    else 0.0
+                )
 
                 cov_factor_norm = 0.0
                 lr_fraction = 0.0
@@ -1799,9 +2135,10 @@ class ArnoldTrainer:
 
                 # MoE gate diagnostics
                 gate_stats = None
-                if hasattr(self.policy_module, 'get_gate_stats'):
+                if hasattr(self.policy_module, "get_gate_stats"):
                     obs_norm = self.policy_module.obs_normalizer(
-                        ed["obs_signatures"], ed["states"][diag_idx],
+                        ed["obs_signatures"],
+                        ed["states"][diag_idx],
                     )
                     x_diag = obs_norm[:, :, -1]
                     gate_stats = self.policy_module.get_gate_stats(x_diag)
@@ -1816,23 +2153,50 @@ class ArnoldTrainer:
                 val_mean = old_v.mean().item()
                 val_std = old_v.std().item()
                 ret_var = ret.var().item()
-                explained_var = 1 - (ret - old_v).var().item() / (ret_var + 1e-8)
+                explained_var = 1 - (ret - old_v).var().item() / (
+                    ret_var + 1e-8
+                )
 
             all_diagnostics[expert_name] = {
-                "ppo_loss": float(np.mean(losses["ppo"])) if losses["ppo"] else 0.0,
-                "imitation_loss": float(np.mean(losses["imitation"])) if losses["imitation"] else 0.0,
-                "imitation_loss_per_sample": float(np.mean(losses["imitation_per_sample"])) if losses["imitation_per_sample"] else 0.0,
-                "value_loss": float(np.mean(losses["value"])) if losses["value"] else 0.0,
-                "entropy_loss": float(np.mean(losses["entropy"])) if losses["entropy"] else 0.0,
-                "sigma_loss": float(np.mean(losses["sigma"])) if losses["sigma"] else 0.0,
-                "load_balance_loss": float(np.mean(losses["load_balance"])) if losses["load_balance"] else 0.0,
-                "mean_penalty_loss": float(np.mean(losses["mean_penalty"])) if losses["mean_penalty"] else 0.0,
-                "approx_kl": float(np.mean(diag["approx_kls"])) if diag["approx_kls"] else 0.0,
-                "clip_frac": float(np.mean(diag["clip_fracs"])) if diag["clip_fracs"] else 0.0,
-                "value_clip_frac": float(np.mean(diag["value_clip_fracs"])) if diag["value_clip_fracs"] else 0.0,
-                "ratio_mean": float(np.mean(diag["ratios"])) if diag["ratios"] else 1.0,
-                "grad_norm": float(np.mean(diag["grad_norms"])) if diag["grad_norms"] else 0.0,
-                "value_grad_norm": float(np.mean(diag["value_grad_norms"])) if diag["value_grad_norms"] else 0.0,
+                "ppo_loss": float(np.mean(losses["ppo"]))
+                if losses["ppo"]
+                else 0.0,
+                "imitation_loss": float(np.mean(losses["imitation"]))
+                if losses["imitation"]
+                else 0.0,
+                "value_loss": float(np.mean(losses["value"]))
+                if losses["value"]
+                else 0.0,
+                "entropy_loss": float(np.mean(losses["entropy"]))
+                if losses["entropy"]
+                else 0.0,
+                "sigma_loss": float(np.mean(losses["sigma"]))
+                if losses["sigma"]
+                else 0.0,
+                "load_balance_loss": float(np.mean(losses["load_balance"]))
+                if losses["load_balance"]
+                else 0.0,
+                "mean_penalty_loss": float(np.mean(losses["mean_penalty"]))
+                if losses["mean_penalty"]
+                else 0.0,
+                "approx_kl": float(np.mean(diag["approx_kls"]))
+                if diag["approx_kls"]
+                else 0.0,
+                "clip_frac": float(np.mean(diag["clip_fracs"]))
+                if diag["clip_fracs"]
+                else 0.0,
+                "value_clip_frac": float(np.mean(diag["value_clip_fracs"]))
+                if diag["value_clip_fracs"]
+                else 0.0,
+                "ratio_mean": float(np.mean(diag["ratios"]))
+                if diag["ratios"]
+                else 1.0,
+                "grad_norm": float(np.mean(diag["grad_norms"]))
+                if diag["grad_norms"]
+                else 0.0,
+                "value_grad_norm": float(np.mean(diag["value_grad_norms"]))
+                if diag["value_grad_norms"]
+                else 0.0,
                 "explained_var": explained_var,
                 "adv_mean": adv_mean,
                 "adv_std": adv_std,
@@ -1861,10 +2225,13 @@ class ArnoldTrainer:
                 d = all_diagnostics[expert_name]
                 d["gate_entropy"] = gate_stats["gate_entropy"]
                 d["balance_entropy"] = gate_stats["balance_entropy"]
-                for i, (f, p) in enumerate(zip(
-                    gate_stats["routing_fracs"].tolist(),
-                    gate_stats["mean_probs"].tolist(),
-                )):
+                for i, (f, p) in enumerate(
+                    zip(
+                        gate_stats["routing_fracs"].tolist(),
+                        gate_stats["mean_probs"].tolist(),
+                        strict=False,
+                    ),
+                ):
                     d[f"gate_frac_{i}"] = f
                     d[f"gate_prob_{i}"] = p
 
@@ -1875,11 +2242,12 @@ class ArnoldTrainer:
                 for k, v in expert_stats.items():
                     d[k] = v
 
-        # Update normalizer stats ONCE with the full batch data.
-        # Must happen before the PPO loop — stats are frozen during updates
-        # to avoid drift between new_log_probs and fixed_log_probs.
+        # Update normalizer stats ONCE with the full batch data, AFTER the PPO
+        # loop above. Stats stay frozen throughout the PPO updates (this batch's
+        # stats only take effect on the next update_params call) to avoid drift
+        # between new_log_probs and fixed_log_probs.
         with torch.no_grad():
-            for expert_name, ed in expert_data.items():
+            for expert_name, ed in expert_data.items():  # noqa: B007
                 self.policy_module.obs_normalizer.update(
                     ed["obs_signatures"],
                     ed["states"],
@@ -1887,16 +2255,18 @@ class ArnoldTrainer:
 
         return all_diagnostics
 
-    # ------------------------------------------------------------------
-    #  Main training loop
-    # ------------------------------------------------------------------
-
+    ############################################
+    #            Main training loop            #
+    ############################################
     def optimize_policy(self) -> None:
         """Главный цикл обучения."""
         expert_names = list(self.experts.keys())
-        logger.info(self._section_header(
-            f"Training  |  experts: {', '.join(expert_names)}  |  epochs: {self.max_epochs}"
-        ))
+        logger.info(
+            self._section_header(
+                f"Training  |  experts: {', '.join(expert_names)}  "
+                f"|  epochs: {self.max_epochs}",
+            ),
+        )
 
         try:
             for epoch in range(self.epoch, self.max_epochs):
@@ -1926,12 +2296,16 @@ class ArnoldTrainer:
                         self.wandb_logger.log_eval(epoch, merged)
 
                 # Pre-epoch: resample motions (persistent workers handle it)
-                need_resample = epoch > 0 and epoch % self.resampling_interval == 0
+                need_resample = (
+                    epoch > 0 and epoch % self.resampling_interval == 0
+                )
                 if self._persistent_state is not None:
-                    self._persistent_state["resample_flag"].value = 1 if need_resample else 0
+                    self._persistent_state["resample_flag"].value = (
+                        1 if need_resample else 0
+                    )
                 elif need_resample:
-                    for expert_name, ctx in self.experts.items():
-                        if hasattr(ctx.wrapper.env, 'sample_motions'):
+                    for expert_name, ctx in self.experts.items():  # noqa: B007
+                        if hasattr(ctx.wrapper.env, "sample_motions"):
                             ctx.wrapper.env.sample_motions()
 
                 # Sample
@@ -1941,7 +2315,10 @@ class ArnoldTrainer:
 
                 # Update
                 t_update_start = time.time()
-                all_diagnostics = self.update_params(expert_batches, debug_memory=(epoch == 0))
+                all_diagnostics = self.update_params(
+                    expert_batches,
+                    debug_memory=(epoch == 0),
+                )
                 t_update = time.time() - t_update_start
 
                 # Apply timing and losses to loggers
@@ -1997,7 +2374,7 @@ class ArnoldTrainer:
     def eval_checkpoint(
         self,
         epoch: int,
-        all_eval: Dict[str, Dict[str, float]],
+        all_eval: dict[str, dict[str, float]],
     ) -> None:
         """Сохраняет best-чекпоинты по результатам eval."""
         for expert_name, metrics in all_eval.items():
@@ -2006,8 +2383,11 @@ class ArnoldTrainer:
 
             ctx = self.experts[expert_name]
 
-            im_loss = metrics.get("eval/imitation_loss", float('inf'))
-            if ctx.use_expert and im_loss < self.best_eval_imitation_loss[expert_name]:
+            im_loss = metrics.get("eval/imitation_loss", float("inf"))
+            if (
+                ctx.use_expert
+                and im_loss < self.best_eval_imitation_loss[expert_name]
+            ):
                 self.best_eval_imitation_loss[expert_name] = im_loss
                 self.save_checkpoint(suffix=f"best_im_loss_{expert_name}")
 
@@ -2016,7 +2396,7 @@ class ArnoldTrainer:
                 self.best_eval_episode_avg_length[expert_name] = ep_len
                 self.save_checkpoint(suffix=f"best_ep_length_{expert_name}")
 
-            mpjpe = metrics.get("eval/mpjpe", float('inf'))
+            mpjpe = metrics.get("eval/mpjpe", float("inf"))
             if mpjpe < self.best_eval_mpjpe[expert_name]:
                 self.best_eval_mpjpe[expert_name] = mpjpe
                 self.save_checkpoint(suffix=f"best_mpjpe_{expert_name}")
@@ -2028,10 +2408,9 @@ class ArnoldTrainer:
                     merged[f"{expert_name}/{k}"] = v
             self.wandb_logger.log_eval(epoch, merged)
 
-    # ------------------------------------------------------------------
-    #  Logging
-    # ------------------------------------------------------------------
-
+    ############################################
+    #                 Logging                  #
+    ############################################
     @staticmethod
     def _section_header(title: str, width: int = 60) -> str:
         """Формирует визуальный разделитель для логов."""
@@ -2051,25 +2430,29 @@ class ArnoldTrainer:
                 f"  {expert_name}: mode={ctx.training_mode.upper()}  "
                 f"ppo={ctx.ppo_weight}  obc_im={ctx.obc_imitation_weight}  "
                 f"ent={ctx.entropy_weight}  "
-                f"scale={ctx.loss_scale}"
+                f"scale={ctx.loss_scale}",
             )
 
     def log_train(
         self,
         epoch: int,
-        expert_loggers: Dict[str, OBCLogger],
-        all_diagnostics: Dict[str, Dict[str, float]],
+        expert_loggers: dict[str, OBCLogger],
+        all_diagnostics: dict[str, dict[str, float]],
     ) -> None:
         """Логирует метрики эпохи для каждого эксперта."""
         for expert_name, obc_logger in expert_loggers.items():
             ctx = self.experts[expert_name]
             logger.info(
                 self._section_header(
-                    f"Epoch {epoch}  |  {expert_name} ({ctx.training_mode.upper()})"
-                )
+                    f"Epoch {epoch}  |  "
+                    f"{expert_name} ({ctx.training_mode.upper()})",
+                ),
             )
 
-            log_str = obc_logger.get_log_str(epoch=epoch, expert_name=f"{self.exp_name}/{expert_name}")
+            log_str = obc_logger.get_log_str(
+                epoch=epoch,
+                expert_name=f"{self.exp_name}/{expert_name}",
+            )
             logger.info(log_str)
 
             d = all_diagnostics.get(expert_name, {})
@@ -2084,47 +2467,65 @@ class ArnoldTrainer:
                     f"val_grad_norm={d.get('value_grad_norm', 0):.3f}  "
                     f"σ_global={d.get('sigma_global', 0):.4f}  "
                     f"expl_var={d.get('explained_var', 0):.3f}  "
-                    f"adv={d.get('adv_mean', 0):.4f}±{d.get('adv_std', 0):.4f}  "
-                    f"ret={d.get('ret_mean', 0):.3f}±{d.get('ret_std', 0):.3f}  "
-                    f"val={d.get('val_mean', 0):.3f}±{d.get('val_std', 0):.3f}"
+                    f"adv={d.get('adv_mean', 0):.4f}"
+                    f"±{d.get('adv_std', 0):.4f}  "
+                    f"ret={d.get('ret_mean', 0):.3f}"
+                    f"±{d.get('ret_std', 0):.3f}  "
+                    f"val={d.get('val_mean', 0):.3f}±{d.get('val_std', 0):.3f}",
                 )
                 logger.info(
                     f"  [{expert_name}] Policy out: "
                     f"act_mean={d.get('act_mean', 0):.4f}  "
                     f"act_std={d.get('act_std', 0):.4f}  "
                     f"|act|={d.get('act_abs_mean', 0):.4f}  "
-                    f"act_range=[{d.get('act_min', 0):.3f}, {d.get('act_max', 0):.3f}]  "
-                    f"logstd={d.get('logstd_mean', 0):.3f} [{d.get('logstd_min', 0):.3f}, {d.get('logstd_max', 0):.3f}]  "
-                    f"val_post={d.get('val_post_mean', 0):.3f}±{d.get('val_post_std', 0):.3f}  "
+                    f"act_range=[{d.get('act_min', 0):.3f}, "
+                    f"{d.get('act_max', 0):.3f}]  "
+                    f"logstd={d.get('logstd_mean', 0):.3f} "
+                    f"[{d.get('logstd_min', 0):.3f}, "
+                    f"{d.get('logstd_max', 0):.3f}]  "
+                    f"val_post={d.get('val_post_mean', 0):.3f}"
+                    f"±{d.get('val_post_std', 0):.3f}  ",
                 )
                 logger.info(
                     f"  [{expert_name}] Covariance: "
                     f"sigma_loss={d.get('sigma_loss', 0):.4f}  "
-                    f"latent_std={d.get('latent_std_mean', 0):.4f} [{d.get('latent_std_min', 0):.4f}, {d.get('latent_std_max', 0):.4f}]  "
+                    f"latent_std={d.get('latent_std_mean', 0):.4f} "
+                    f"[{d.get('latent_std_min', 0):.4f}, "
+                    f"{d.get('latent_std_max', 0):.4f}]  "
                     f"cov_norm={d.get('cov_factor_norm', 0):.4f}  "
                     f"lr_frac={d.get('lr_fraction', 0):.3f}  "
-                    f"cov_max={d.get('cov_factor_abs_max', 0):.4f}"
+                    f"cov_max={d.get('cov_factor_abs_max', 0):.4f}",
                 )
 
                 # Imitation diagnostics
-                l_im = d.get('imitation_loss', 0)
+                l_im = d.get("imitation_loss", 0)
                 if l_im > 0:
                     logger.info(
                         f"  [{expert_name}] OBC Imitation: "
                         f"L_im={l_im:.4f}  "
-                        f"im_contrib={ctx.obc_imitation_weight * l_im:.4f}"
+                        f"im_contrib={ctx.obc_imitation_weight * l_im:.4f}",
                     )
 
                 if "gate_entropy" in d:
-                    n_experts = self.policy_module.num_experts if hasattr(self.policy_module, 'num_experts') else 0
-                    fracs = " ".join(f"{d.get(f'gate_frac_{i}', 0):.3f}" for i in range(n_experts))
-                    probs = " ".join(f"{d.get(f'gate_prob_{i}', 0):.3f}" for i in range(n_experts))
+                    n_experts = (
+                        self.policy_module.num_experts
+                        if hasattr(self.policy_module, "num_experts")
+                        else 0
+                    )
+                    fracs = " ".join(
+                        f"{d.get(f'gate_frac_{i}', 0):.3f}"
+                        for i in range(n_experts)
+                    )
+                    probs = " ".join(
+                        f"{d.get(f'gate_prob_{i}', 0):.3f}"
+                        for i in range(n_experts)
+                    )
                     logger.info(
                         f"  [{expert_name}] Gate: "
                         f"entropy={d['gate_entropy']:.3f}  "
                         f"balance_H={d['balance_entropy']:.3f}  "
                         f"routing=[{fracs}]  "
-                        f"probs=[{probs}]"
+                        f"probs=[{probs}]",
                     )
 
                 if "shared_mean_frac" in d:
@@ -2133,14 +2534,14 @@ class ArnoldTrainer:
                         f"  [{expert_name}] Mean: "
                         f"shared={d['shared_mean_norm']:.4f}  "
                         f"routed={d['routed_mean_norm']:.4f}  "
-                        f"shared_frac={d['shared_mean_frac']:.3f}"
+                        f"shared_frac={d['shared_mean_frac']:.3f}",
                     ]
                     if "shared_cov_frac" in d:
                         parts.append(
                             f"  [{expert_name}] Cov:  "
                             f"shared={d['shared_cov_norm']:.4f}  "
                             f"routed={d['routed_cov_norm']:.4f}  "
-                            f"shared_frac={d['shared_cov_frac']:.3f}"
+                            f"shared_frac={d['shared_cov_frac']:.3f}",
                         )
                     if "lb_ind_entropy" in d:
                         parts.append(
@@ -2149,7 +2550,7 @@ class ArnoldTrainer:
                             f"H_batch={d['lb_batch_entropy']:.4f}  "
                             f"l_ind={d['lb_l_ind']:.4f}  "
                             f"l_batch={d['lb_l_batch']:.4f}  "
-                            f"total={d['lb_total']:.4f}"
+                            f"total={d['lb_total']:.4f}",
                         )
                     parts.append(f"  (α={alpha})")
                     logger.info("\n".join(parts))
@@ -2157,9 +2558,9 @@ class ArnoldTrainer:
         # Per-expert sampling profiler — только эпоха 0
         if epoch == 0 and self.profiler_reports:
             for expert_name, profiler in self.profiler_reports.items():
-                logger.info(self._section_header(
-                    f"Sampling Profile  |  {expert_name}"
-                ))
+                logger.info(
+                    self._section_header(f"Sampling Profile  |  {expert_name}"),
+                )
                 logger.info(profiler.report())
 
         # GPU Memory Profile — собран в update_params epoch 0
@@ -2176,10 +2577,20 @@ class ArnoldTrainer:
                 if stats and sum(s["caused"] for s in stats.values()) > 0:
                     total = sum(s["caused"] for s in stats.values())
                     parts = []
-                    for body, s in sorted(stats.items(), key=lambda x: -x[1]["caused"]):
+                    for body, s in sorted(
+                        stats.items(),
+                        key=lambda x: -x[1]["caused"],
+                    ):
                         if s["caused"] > 0:
-                            parts.append(f"{body}={s['caused']}({100 * s['caused'] / total:.0f}% d={s['mean_dist'] * 100:.1f}cm)")
-                    logger.info(f"  [{expert_name}] Terminations ({total}): {' | '.join(parts)}")
+                            parts.append(
+                                f"{body}={s['caused']}"
+                                f"({100 * s['caused'] / total:.0f}% "
+                                f"d={s['mean_dist'] * 100:.1f}cm)",
+                            )
+                    logger.info(
+                        f"  [{expert_name}] Terminations ({total}): "
+                        f"{' | '.join(parts)}",
+                    )
 
         if self.use_wandb:
             self.wandb_logger.log_train(
@@ -2189,14 +2600,13 @@ class ArnoldTrainer:
                 total_steps=self.num_steps,
             )
 
-    # ------------------------------------------------------------------
-    #  Evaluation
-    # ------------------------------------------------------------------
-
-    def evaluate(self) -> Dict[str, Dict[str, float]]:
+    ############################################
+    #                Evaluation                #
+    ############################################
+    def evaluate(self) -> dict[str, dict[str, float]]:
         """Оценивает policy на каждом эксперте отдельно."""
         logger.info(self._section_header("Evaluation"))
-        all_eval: Dict[str, Dict[str, float]] = {}
+        all_eval: dict[str, dict[str, float]] = {}
 
         for expert_name, ctx in self.experts.items():
             valid_wrapper = self.valid_experts.get(expert_name)
@@ -2204,18 +2614,22 @@ class ArnoldTrainer:
                 all_eval[expert_name] = {}
                 continue
 
-            if self.vectorized_eval and self.device.type in ('cuda', 'mps'):
+            if self.vectorized_eval and self.device.type in ("cuda", "mps"):
                 all_eval[expert_name] = self._evaluate_expert_vectorized(
-                    expert_name, ctx, valid_wrapper,
+                    expert_name,
+                    ctx,
+                    valid_wrapper,
                 )
             else:
                 all_eval[expert_name] = self.evaluate_expert(
-                    expert_name, ctx, valid_wrapper,
+                    expert_name,
+                    ctx,
+                    valid_wrapper,
                 )
 
         return all_eval
 
-    def evaluate_train(self) -> Dict[str, Dict[str, float]]:
+    def evaluate_train(self) -> dict[str, dict[str, float]]:
         """
         Deterministic eval на train выборке (без exploration noise).
         Логирует с prefix train_eval/ для сравнения с eval/.
@@ -2228,17 +2642,21 @@ class ArnoldTrainer:
         for ctx in self.experts.values():
             ctx.wrapper.env.start_eval(im_eval=True)
 
-        all_eval: Dict[str, Dict[str, float]] = {}
+        all_eval: dict[str, dict[str, float]] = {}
         try:
             for expert_name, ctx in self.experts.items():
                 wrapper = ctx.wrapper
-                if self.vectorized_eval and self.device.type in ('cuda', 'mps'):
+                if self.vectorized_eval and self.device.type in ("cuda", "mps"):
                     metrics = self._evaluate_expert_vectorized(
-                        expert_name, ctx, wrapper,
+                        expert_name,
+                        ctx,
+                        wrapper,
                     )
                 else:
                     metrics = self.evaluate_expert(
-                        expert_name, ctx, wrapper,
+                        expert_name,
+                        ctx,
+                        wrapper,
                     )
                 # Rename eval/ → train_eval/
                 all_eval[expert_name] = {
@@ -2263,20 +2681,34 @@ class ArnoldTrainer:
         episode_successes: list,
         use_expert: bool,
         label: str = "",
-    ) -> Dict[str, float]:
-        """Build metrics dict and log summary. Shared by sequential and vectorized eval."""
+    ) -> dict[str, float]:
+        """Build metrics dict and log summary. Shared by sequential and
+        vectorized eval.
+        """
         metrics = {
-            "eval/mean_reward": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
-            "eval/std_reward": float(np.std(episode_rewards)) if episode_rewards else 0.0,
-            "eval/mean_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
-            "eval/std_length": float(np.std(episode_lengths)) if episode_lengths else 0.0,
+            "eval/mean_reward": float(np.mean(episode_rewards))
+            if episode_rewards
+            else 0.0,
+            "eval/std_reward": float(np.std(episode_rewards))
+            if episode_rewards
+            else 0.0,
+            "eval/mean_length": float(np.mean(episode_lengths))
+            if episode_lengths
+            else 0.0,
+            "eval/std_length": float(np.std(episode_lengths))
+            if episode_lengths
+            else 0.0,
         }
         if episode_imitation_losses:
-            metrics["eval/imitation_loss"] = float(np.mean(episode_imitation_losses))
+            metrics["eval/imitation_loss"] = float(
+                np.mean(episode_imitation_losses),
+            )
         if episode_mpjpes:
             metrics["eval/mpjpe"] = float(np.mean(episode_mpjpes))
         if episode_frame_coverages:
-            metrics["eval/frame_coverage"] = float(np.mean(episode_frame_coverages))
+            metrics["eval/frame_coverage"] = float(
+                np.mean(episode_frame_coverages),
+            )
         if episode_successes:
             metrics["eval/success_rate"] = float(np.mean(episode_successes))
 
@@ -2291,10 +2723,15 @@ class ArnoldTrainer:
         tag = f" ({label})" if label else ""
         logger.info(
             f"Eval [{expert_name}]{tag}: "
-            f"reward={metrics['eval/mean_reward']:.4f}±{metrics['eval/std_reward']:.4f}, "
+            f"reward={metrics['eval/mean_reward']:.4f}"
+            f"±{metrics['eval/std_reward']:.4f}, "
             f"length={metrics['eval/mean_length']:.2f}±{metrics['eval/std_length']:.2f}"
-            + (f", im_loss={metrics.get('eval/imitation_loss', 0):.4f}" if use_expert else "")
-            + extra
+            + (
+                f", im_loss={metrics.get('eval/imitation_loss', 0):.4f}"
+                if use_expert
+                else ""
+            )
+            + extra,
         )
         return metrics
 
@@ -2304,10 +2741,13 @@ class ArnoldTrainer:
         ctx: ExpertContext,
         valid_wrapper,
         return_per_motion: bool = False,
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         """Sequential evaluation для одного эксперта (CPU inference)."""
         self.policy.eval()
-        valid_parser = ObservationParser.from_env(valid_wrapper.env, self.history_len)
+        valid_parser = ObservationParser.from_env(
+            valid_wrapper.env,
+            self.history_len,
+        )
         valid_action_parser = ActionParser.from_env(valid_wrapper.env)
 
         episode_rewards = []
@@ -2316,7 +2756,7 @@ class ArnoldTrainer:
         episode_mpjpes = []
         episode_frame_coverages = []
         episode_successes = []
-        per_motion_results: List[Dict[str, Any]] = []
+        per_motion_results: list[dict[str, Any]] = []
 
         for motion_id in tqdm(
             valid_wrapper.forward_motions(),
@@ -2330,13 +2770,15 @@ class ArnoldTrainer:
             episode_length = 0
             step_imitation_losses = []
 
-            for t in range(10000):
+            for t in range(10000):  # noqa: B007
                 obs_ts, obs_sigs = valid_parser.get_observation(self.device)
                 act_sigs = valid_action_parser.action_signatures
 
                 with torch.no_grad():
                     action, _, _, _ = self.policy_module.get_action(
-                        obs_ts, obs_sigs, act_sigs,
+                        obs_ts,
+                        obs_sigs,
+                        act_sigs,
                         expert_name=expert_name,
                         deterministic=True,
                         return_value=False,
@@ -2345,19 +2787,32 @@ class ArnoldTrainer:
                     if ctx.use_expert:
                         if ctx.gpu_teacher is not None:
                             t_mean, _, _, _, _ = ctx.gpu_teacher(
-                                obs_ts, obs_sigs, act_sigs,
+                                obs_ts,
+                                obs_sigs,
+                                act_sigs,
                                 expert_name=expert_name,
-                                return_std=False, return_value=False,
+                                return_std=False,
+                                return_value=False,
                             )
                             expert_action_t = t_mean.squeeze(0).float()
                         else:
                             expert_action = valid_wrapper.get_expert_action(obs)
-                            expert_action_t = torch.from_numpy(expert_action).float().to(self.device)
-                        im_loss = ((action.squeeze(0) - expert_action_t) ** 2).mean().item()
+                            expert_action_t = (
+                                torch.from_numpy(expert_action)
+                                .float()
+                                .to(self.device)
+                            )
+                        im_loss = (
+                            ((action.squeeze(0) - expert_action_t) ** 2)
+                            .mean()
+                            .item()
+                        )
                         step_imitation_losses.append(im_loss)
 
                 action_np = action.squeeze(0).cpu().numpy()
-                next_obs, reward, terminated, truncated, info = valid_wrapper.step(action_np)
+                next_obs, reward, terminated, truncated, info = (
+                    valid_wrapper.step(action_np)
+                )
                 done = terminated or truncated
 
                 episode_reward += reward
@@ -2370,7 +2825,9 @@ class ArnoldTrainer:
                     if "mpjpe" in info:
                         episode_mpjpes.append(float(info["mpjpe"]))
                     if "frame_coverage" in info:
-                        episode_frame_coverages.append(float(info["frame_coverage"]))
+                        episode_frame_coverages.append(
+                            float(info["frame_coverage"]),
+                        )
                     if "success" in info:
                         episode_successes.append(float(info["success"]))
                     break
@@ -2382,21 +2839,29 @@ class ArnoldTrainer:
                 episode_imitation_losses.append(np.mean(step_imitation_losses))
 
             if return_per_motion:
-                per_motion_results.append({
-                    "motion_id": motion_id,
-                    "reward": episode_reward,
-                    "length": episode_length,
-                    "im_loss": float(np.mean(step_imitation_losses)) if step_imitation_losses else None,
-                    "mpjpe": info.get("mpjpe"),
-                    "max_mpjpe": info.get("max_mpjpe"),
-                    "frame_coverage": info.get("frame_coverage"),
-                    "success": info.get("success"),
-                })
+                per_motion_results.append(
+                    {
+                        "motion_id": motion_id,
+                        "reward": episode_reward,
+                        "length": episode_length,
+                        "im_loss": float(np.mean(step_imitation_losses))
+                        if step_imitation_losses
+                        else None,
+                        "mpjpe": info.get("mpjpe"),
+                        "max_mpjpe": info.get("max_mpjpe"),
+                        "frame_coverage": info.get("frame_coverage"),
+                        "success": info.get("success"),
+                    },
+                )
 
         metrics = self._build_eval_metrics(
-            expert_name, episode_rewards, episode_lengths,
-            episode_imitation_losses, episode_mpjpes,
-            episode_frame_coverages, episode_successes,
+            expert_name,
+            episode_rewards,
+            episode_lengths,
+            episode_imitation_losses,
+            episode_mpjpes,
+            episode_frame_coverages,
+            episode_successes,
             use_expert=ctx.use_expert,
         )
 
@@ -2404,10 +2869,9 @@ class ArnoldTrainer:
             return metrics, per_motion_results
         return metrics
 
-    # ------------------------------------------------------------------
-    #  Vectorized Evaluation
-    # ------------------------------------------------------------------
-
+    ############################################
+    #          Vectorized Evaluation           #
+    ############################################
     def _eval_env_worker(
         self,
         expert_name: str,
@@ -2436,7 +2900,9 @@ class ArnoldTrainer:
         env.start_eval(im_eval=True)
 
         def _load_next_motion() -> bool:
-            """Pull next motion from queue, reset env. Returns False if no more."""
+            """Pull next motion from queue, reset env. Returns False if
+            no more.
+            """
             try:
                 motion_id = motion_queue.get_nowait()
             except Exception:
@@ -2489,9 +2955,13 @@ class ArnoldTrainer:
 
                 if eval_uses_wrapper_expert:
                     ea_np = expert_action_buf.numpy().copy()
-                    ep_im_losses.append(float(((action_np - ea_np) ** 2).mean()))
+                    ep_im_losses.append(
+                        float(((action_np - ea_np) ** 2).mean()),
+                    )
 
-                next_obs, reward, terminated, truncated, info = wrapper.step(action_np)
+                next_obs, reward, terminated, truncated, info = wrapper.step(
+                    action_np,
+                )
                 done = terminated or truncated
                 ep_reward += reward
                 ep_length += 1
@@ -2501,14 +2971,18 @@ class ArnoldTrainer:
                         "motion_id": env._current_eval_motion_id,
                         "reward": ep_reward,
                         "length": ep_length,
-                        "im_loss": float(np.mean(ep_im_losses)) if ep_im_losses else None,
+                        "im_loss": float(np.mean(ep_im_losses))
+                        if ep_im_losses
+                        else None,
                         "mpjpe": info.get("mpjpe"),
                         "max_mpjpe": info.get("max_mpjpe"),
                         "frame_coverage": info.get("frame_coverage"),
                         "success": info.get("success"),
                     }
                     if terminated:
-                        ep_result["termination_body"] = info.get("termination_body")
+                        ep_result["termination_body"] = info.get(
+                            "termination_body",
+                        )
                     result_queue.put(("episode", expert_name, ep_result))
 
                     # Try next motion
@@ -2532,6 +3006,7 @@ class ArnoldTrainer:
 
         except Exception as e:
             import traceback
+
             print(f"EvalWorker {worker_id} [{expert_name}] failed: {e}")
             traceback.print_exc()
 
@@ -2545,7 +3020,7 @@ class ArnoldTrainer:
         ctx: ExpertContext,
         valid_wrapper,
         return_per_motion: bool = False,
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         """
         Vectorized evaluation: N env workers step on CPU,
         main process does batched inference on GPU/MPS.
@@ -2566,7 +3041,7 @@ class ArnoldTrainer:
             motion_queue.put(int(motion_id))
 
         result_queue = fork_ctx.Queue()
-        stop_flag = fork_ctx.Value('i', 0)
+        stop_flag = fork_ctx.Value("i", 0)
 
         # Spawn workers
         obs_shape = (ctx.parser.n_obs_elements, self.history_len)
@@ -2577,26 +3052,46 @@ class ArnoldTrainer:
 
         class _WH:
             __slots__ = (
-                'obs_buf', 'action_buf', 'expert_action_buf',
-                'obs_ready', 'action_ready', 'proc', 'active',
+                "obs_buf",
+                "action_buf",
+                "expert_action_buf",
+                "obs_ready",
+                "action_ready",
+                "proc",
+                "active",
             )
 
-        workers: List[_WH] = []
+        workers: list[_WH] = []
         for w_idx in range(n_workers):
             wh = _WH()
-            wh.obs_buf = torch.zeros(obs_shape, dtype=torch.float32).share_memory_()
-            wh.action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
-            wh.expert_action_buf = torch.zeros(action_dim, dtype=torch.float32).share_memory_()
+            wh.obs_buf = torch.zeros(
+                obs_shape,
+                dtype=torch.float32,
+            ).share_memory_()
+            wh.action_buf = torch.zeros(
+                action_dim,
+                dtype=torch.float32,
+            ).share_memory_()
+            wh.expert_action_buf = torch.zeros(
+                action_dim,
+                dtype=torch.float32,
+            ).share_memory_()
             wh.obs_ready = fork_ctx.Event()
             wh.action_ready = fork_ctx.Event()
             wh.active = True
             wh.proc = fork_ctx.Process(
                 target=self._eval_env_worker,
                 args=(
-                    expert_name, w_idx + 1,
-                    wh.obs_buf, wh.action_buf, wh.expert_action_buf,
-                    wh.obs_ready, wh.action_ready,
-                    stop_flag, motion_queue, result_queue,
+                    expert_name,
+                    w_idx + 1,
+                    wh.obs_buf,
+                    wh.action_buf,
+                    wh.expert_action_buf,
+                    wh.obs_ready,
+                    wh.action_ready,
+                    stop_flag,
+                    motion_queue,
+                    result_queue,
                     w_idx == 0,  # send_sigs
                 ),
                 daemon=True,
@@ -2619,9 +3114,13 @@ class ArnoldTrainer:
         episode_mpjpes = []
         episode_frame_coverages = []
         episode_successes = []
-        per_motion_results: List[Dict[str, Any]] = []
+        per_motion_results: list[dict[str, Any]] = []
 
-        pbar = tqdm(total=total_motions, desc=f"Eval [{expert_name}]", unit="ep")
+        pbar = tqdm(
+            total=total_motions,
+            desc=f"Eval [{expert_name}]",
+            unit="ep",
+        )
         workers_done = 0
 
         # Main inference loop
@@ -2640,7 +3139,9 @@ class ArnoldTrainer:
                             if m["mpjpe"] is not None:
                                 episode_mpjpes.append(float(m["mpjpe"]))
                             if m["frame_coverage"] is not None:
-                                episode_frame_coverages.append(float(m["frame_coverage"]))
+                                episode_frame_coverages.append(
+                                    float(m["frame_coverage"]),
+                                )
                             if m["success"] is not None:
                                 episode_successes.append(float(m["success"]))
                             if return_per_motion:
@@ -2672,7 +3173,9 @@ class ArnoldTrainer:
                     continue
 
                 # Batched GPU inference
-                batch_obs = torch.stack([wh.obs_buf.clone() for wh in active_workers])
+                batch_obs = torch.stack(
+                    [wh.obs_buf.clone() for wh in active_workers],
+                )
                 batch_obs_dev = batch_obs.to(device)
 
                 with torch.autocast(
@@ -2682,7 +3185,8 @@ class ArnoldTrainer:
                 ):
                     actions, _, _, _ = self.policy_module.get_action(
                         batch_obs_dev,
-                        obs_sigs, act_sigs,
+                        obs_sigs,
+                        act_sigs,
                         expert_name=expert_name,
                         deterministic=True,
                         return_std=False,
@@ -2699,9 +3203,12 @@ class ArnoldTrainer:
                         enabled=use_amp,
                     ):
                         t_mean, _, _, _, _ = ctx.gpu_teacher(
-                            batch_obs_dev, obs_sigs, act_sigs,
+                            batch_obs_dev,
+                            obs_sigs,
+                            act_sigs,
                             expert_name=expert_name,
-                            return_std=False, return_value=False,
+                            return_std=False,
+                            return_value=False,
                         )
                     teacher_actions_cpu = t_mean.float().cpu()
 
@@ -2721,7 +3228,8 @@ class ArnoldTrainer:
         for wh in workers:
             wh.action_ready.set()
 
-        # Drain any remaining messages (workers may block on put if queue is full)
+        # Drain any remaining messages (workers may block on put if
+        # queue is full)
         deadline = time.time() + 10
         while workers_done < n_workers and time.time() < deadline:
             try:
@@ -2739,9 +3247,13 @@ class ArnoldTrainer:
                 wh.proc.terminate()
 
         metrics = self._build_eval_metrics(
-            expert_name, episode_rewards, episode_lengths,
-            episode_imitation_losses, episode_mpjpes,
-            episode_frame_coverages, episode_successes,
+            expert_name,
+            episode_rewards,
+            episode_lengths,
+            episode_imitation_losses,
+            episode_mpjpes,
+            episode_frame_coverages,
+            episode_successes,
             use_expert=ctx.use_expert,
             label=f"vectorized, {n_workers} workers",
         )
@@ -2750,10 +3262,9 @@ class ArnoldTrainer:
             return metrics, per_motion_results
         return metrics
 
-    # ------------------------------------------------------------------
-    #  Checkpoints
-    # ------------------------------------------------------------------
-
+    ############################################
+    #               Checkpoints                #
+    ############################################
     def save_checkpoint(self, suffix: str = "latest") -> None:
         expert_modes = {n: ctx.training_mode for n, ctx in self.experts.items()}
         checkpoint = {
@@ -2795,18 +3306,29 @@ class ArnoldTrainer:
         self.load_from_path(path, resume_training=True)
 
     def load_from_path(self, path: str, resume_training: bool = True) -> None:
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=False,
+        )
 
         # DataParallel: убираем префикс "module." в checkpoint если есть
         policy_state = checkpoint["policy"]
-        if policy_state and next(iter(policy_state.keys()), "").startswith("module."):
-            policy_state = {k.replace("module.", "", 1): v for k, v in policy_state.items()}
+        if policy_state and next(iter(policy_state.keys()), "").startswith(
+            "module.",
+        ):
+            policy_state = {
+                k.replace("module.", "", 1): v for k, v in policy_state.items()
+            }
 
         try:
             self.policy_module.load_state_dict(policy_state)
         except RuntimeError as e:
             logger.warning(f"Strict load failed. Exception: {e}")
-            logger.info("Filtering checkpoint for size mismatches (cross-environment transfer)...")
+            logger.info(
+                "Filtering checkpoint for size mismatches "
+                "(cross-environment transfer)...",
+            )
 
             model_state = self.policy_module.state_dict()
             ckpt_state = checkpoint["policy"]
@@ -2814,14 +3336,15 @@ class ArnoldTrainer:
 
             for k, v in ckpt_state.items():
                 if (
-                    k in model_state and
-                    hasattr(model_state[k], 'shape') and
-                    hasattr(v, 'shape') and
-                    model_state[k].shape != v.shape
+                    k in model_state
+                    and hasattr(model_state[k], "shape")
+                    and hasattr(v, "shape")
+                    and model_state[k].shape != v.shape
                 ):
                     logger.info(
                         f"  Skipping '{k}' due to size mismatch: "
-                        f"checkpoint={v.shape} vs current={model_state[k].shape}"
+                        f"checkpoint={v.shape} vs "
+                        f"current={model_state[k].shape}",
                     )
                     continue
                 filtered_state[k] = v
@@ -2832,28 +3355,49 @@ class ArnoldTrainer:
             self.epoch = checkpoint["epoch"] + 1
             self.num_steps = checkpoint["num_steps"]
             if "policy_optimizer" in checkpoint:
-                self.policy_optimizer.load_state_dict(checkpoint["policy_optimizer"])
+                self.policy_optimizer.load_state_dict(
+                    checkpoint["policy_optimizer"],
+                )
             elif "optimizer" in checkpoint:
-                logger.warning("Loading legacy single-optimizer checkpoint into policy_optimizer")
+                logger.warning(
+                    "Loading legacy single-optimizer checkpoint "
+                    "into policy_optimizer",
+                )
                 self.policy_optimizer.load_state_dict(checkpoint["optimizer"])
             if "value_optimizer" in checkpoint:
-                self.value_optimizer.load_state_dict(checkpoint["value_optimizer"])
-            if self.policy_scheduler is not None and "policy_scheduler" in checkpoint:
-                self.policy_scheduler.load_state_dict(checkpoint["policy_scheduler"])
-            if self.value_scheduler is not None and "value_scheduler" in checkpoint:
-                self.value_scheduler.load_state_dict(checkpoint["value_scheduler"])
+                self.value_optimizer.load_state_dict(
+                    checkpoint["value_optimizer"],
+                )
+            if (
+                self.policy_scheduler is not None
+                and "policy_scheduler" in checkpoint
+            ):
+                self.policy_scheduler.load_state_dict(
+                    checkpoint["policy_scheduler"],
+                )
+            if (
+                self.value_scheduler is not None
+                and "value_scheduler" in checkpoint
+            ):
+                self.value_scheduler.load_state_dict(
+                    checkpoint["value_scheduler"],
+                )
         else:
             self.epoch = 0
             self.num_steps = 0
 
-            # Normalizer stats keyed by semantic signature (e.g. "femur|r|position|x"),
+            # Normalizer stats keyed by semantic signature
+            # (e.g. "femur|r|position|x"),
             # so stats from source expert transfer naturally to target expert
-            # for shared body parts. Only prune stats not needed by any new expert.
+            # for shared body parts. Only prune stats not needed by any
+            # new expert.
             ckpt_keys = set(self.policy_module.obs_normalizer.stats.keys())
             needed_keys = set()
             for ctx in self.experts.values():
                 for sig in ctx.parser.obs_signatures:
-                    needed_keys.add(self.policy_module.obs_normalizer._sig_key(sig))
+                    needed_keys.add(
+                        self.policy_module.obs_normalizer._sig_key(sig),
+                    )
 
             reused = ckpt_keys & needed_keys
             pruned = ckpt_keys - needed_keys
@@ -2866,7 +3410,7 @@ class ArnoldTrainer:
             logger.info(
                 f"Transfer mode: normalizer stats — "
                 f"{len(reused)} reused, {len(fresh)} new (no stats yet), "
-                f"{len(pruned)} pruned (not in target experts)"
+                f"{len(pruned)} pruned (not in target experts)",
             )
 
             if self.cfg.learning.get("transfer_keep_value", False):
@@ -2874,7 +3418,10 @@ class ArnoldTrainer:
             else:
                 logger.info("Transfer mode: reinitializing value nets")
                 if self.cfg.learning.policy == "transformer":
-                    for module in [self.policy_module.value_decoder, self.policy_module.value_head]:
+                    for module in [
+                        self.policy_module.value_decoder,
+                        self.policy_module.value_head,
+                    ]:
                         for param in module.parameters():
                             if param.dim() >= 2:
                                 nn.init.xavier_uniform_(param)
@@ -2888,11 +3435,14 @@ class ArnoldTrainer:
                         elif param.dim() == 1:
                             nn.init.zeros_(param)
                     self.policy_module.value_head.weight.data.mul_(0.0)
-                    nn.init.xavier_uniform_(self.policy_module.value_head.weight)
+                    nn.init.xavier_uniform_(
+                        self.policy_module.value_head.weight,
+                    )
                     self.policy_module.value_head.weight.data.mul_(0.1)
                     self.policy_module.value_head.bias.data.zero_()
 
-            # Reinit action head for masked indices (e.g. arms after OBC on legs-only teacher)
+            # Reinit action head for masked indices (e.g. arms after OBC
+            # on legs-only teacher)
             self._transfer_reinit_masked_actions()
 
         prev_mode = checkpoint.get("training_mode", "unknown")
@@ -2900,11 +3450,12 @@ class ArnoldTrainer:
         logger.info(
             f"Loaded checkpoint from {path} "
             f"(epoch={src_epoch}, mode={prev_mode}), "
-            f"resuming from epoch {self.epoch}"
+            f"resuming from epoch {self.epoch}",
         )
 
     def _transfer_reinit_masked_actions(self) -> None:
-        """Reinit action head rows for masked action indices (e.g. arms after OBC on legs-only teacher).
+        """Reinit action head rows for masked action indices (e.g. arms
+        after OBC on legs-only teacher).
 
         Uses get_action_mask() from any expert wrapper that provides it.
         Indices where mask=0 get reinitialized in:
@@ -2914,13 +3465,14 @@ class ArnoldTrainer:
         """
         if self.cfg.learning.policy != "lattice":
             raise NotImplementedError(
-                "Transfer reinit for masked actions not implemented for this policy"
+                "Transfer reinit for masked actions "
+                "not implemented for this policy",
             )
 
         # Collect union of masked indices across all experts
         masked_indices = set()
         for ctx in self.experts.values():
-            if hasattr(ctx.wrapper, 'get_action_mask'):
+            if hasattr(ctx.wrapper, "get_action_mask"):
                 mask = ctx.wrapper.get_action_mask()
                 zero_idx = (mask == 0).nonzero(as_tuple=True)[0].tolist()
                 masked_indices.update(zero_idx)
@@ -2937,9 +3489,13 @@ class ArnoldTrainer:
             # weight shape: (action_dim, latent_dim) — reinit rows
             fan_in = pm.action_mean.weight.shape[1]
             std = (2.0 / (fan_in + 1)) ** 0.5
-            pm.action_mean.weight[idx_t] = torch.randn_like(
-                pm.action_mean.weight[idx_t],
-            ) * std * 0.1
+            pm.action_mean.weight[idx_t] = (
+                torch.randn_like(
+                    pm.action_mean.weight[idx_t],
+                )
+                * std
+                * 0.1
+            )
             pm.action_mean.bias[idx_t] = 0.0
 
             # log_std: (1, action_dim + latent_dim)
@@ -2948,6 +3504,7 @@ class ArnoldTrainer:
             pm.log_std.data[0, idx_t] = log_std_init
 
         logger.info(
-            f"Transfer mode: reinitialized action head for {len(idx)} masked indices "
-            f"(arms: {idx[0]}..{idx[-1]})"
+            f"Transfer mode: reinitialized action head for "
+            f"{len(idx)} masked indices "
+            f"(arms: {idx[0]}..{idx[-1]})",
         )

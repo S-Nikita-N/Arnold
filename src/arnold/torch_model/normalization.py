@@ -7,9 +7,15 @@ Per-signature нормализация наблюдений.
 всё через батчевые тензорные операции.
 """
 
-from typing import Dict, List, Tuple, Any
 import torch
 import torch.nn as nn
+
+from typing import Any
+
+
+########################################
+#         Signature normalizer         #
+########################################
 
 
 class SignatureNormalizerModule(nn.Module):
@@ -23,8 +29,11 @@ class SignatureNormalizerModule(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.stats: Dict[str, Tuple[int, torch.Tensor, torch.Tensor]] = {}
-        self._index_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]]] = {}
+        self.stats: dict[str, tuple[int, torch.Tensor, torch.Tensor]] = {}
+        self._index_cache: dict[
+            int,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]],
+        ] = {}
 
     def _apply(self, fn):
         super()._apply(fn)
@@ -40,27 +49,33 @@ class SignatureNormalizerModule(nn.Module):
         return str(sig)
 
     def get_index_map(
-        self, signatures: List[Tuple[str, ...]], device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
+        self,
+        signatures: list[tuple[str, ...]],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
         """
         Возвращает закешированную индексную карту для данного набора signatures.
 
         Returns:
-            keys: список строковых ключей (n_obs)
-            known_mask: [n_obs] bool — есть ли статистика для этого ключа
-            known_indices: индексы в signatures где known_mask=True
-            unknown_indices: индексы в signatures где known_mask=False
+            known_t: [n_known] long — индексы в signatures, для которых есть
+                     статистика (count >= 2)
+            unknown_t: [n_unknown] long — остальные индексы
+            keys: список строковых ключей (n_obs), по одному на signature
         """
         cache_key = id(signatures)
         if cache_key in self._index_cache:
             cached = self._index_cache[cache_key]
             if cached[0].device == device:
                 return cached
-            return (
+            moved = (
                 cached[0].to(device),
                 cached[1].to(device),
                 cached[2],
             )
+            # Кешируем перенесённые тензоры, чтобы не повторять .to()
+            # на каждом вызове
+            self._index_cache[cache_key] = moved
+            return moved
 
         keys = [self._sig_key(sig) for sig in signatures]
         known_idx = []
@@ -83,7 +98,7 @@ class SignatureNormalizerModule(nn.Module):
     def _invalidate_cache(self):
         self._index_cache.clear()
 
-    def update(self, signatures: List[Tuple[str, ...]], values: torch.Tensor):
+    def update(self, signatures: list[tuple[str, ...]], values: torch.Tensor):
         """
         Обновляет статистики (Welford's online algorithm), векторизовано.
 
@@ -93,7 +108,7 @@ class SignatureNormalizerModule(nn.Module):
         """
         b, n, h = values.shape
         vals = values.detach()[:, :, -1]  # [batch, n_obs]
-        batch_means = vals.mean(dim=0)    # [n_obs]
+        batch_means = vals.mean(dim=0)  # [n_obs]
         batch_vars = vals.var(dim=0, unbiased=False)  # [n_obs]
         count_new = b
 
@@ -116,7 +131,11 @@ class SignatureNormalizerModule(nn.Module):
         if cache_invalidated:
             self._invalidate_cache()
 
-    def normalize(self, signatures: List[Tuple[str, ...]], values: torch.Tensor) -> torch.Tensor:
+    def normalize(
+        self,
+        signatures: list[tuple[str, ...]],
+        values: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Нормализует значения используя накопленные статистики.
         Векторизованная реализация — без Python for-loop на hot path.
@@ -126,11 +145,16 @@ class SignatureNormalizerModule(nn.Module):
         known_t, unknown_t, keys = self.get_index_map(signatures, device)
 
         if len(unknown_t) == 0 and len(known_t) == n:
-            means = torch.stack([self.stats[keys[i]][1] for i in range(n)]).to(device)
-            M2s = torch.stack([self.stats[keys[i]][2] for i in range(n)]).to(device)
+            means = torch.stack([self.stats[keys[i]][1] for i in range(n)]).to(
+                device,
+            )
+            M2s = torch.stack([self.stats[keys[i]][2] for i in range(n)]).to(
+                device,
+            )
             counts = torch.tensor(
                 [self.stats[keys[i]][0] for i in range(n)],
-                dtype=values.dtype, device=device
+                dtype=values.dtype,
+                device=device,
             )
             stds = torch.sqrt(M2s / counts + 1e-8)
             return (values - means.view(1, n, 1)) / stds.view(1, n, 1)
@@ -141,21 +165,32 @@ class SignatureNormalizerModule(nn.Module):
         else:
             out = values.clone()
             k_idx = known_t.tolist()
-            means = torch.stack([self.stats[keys[i]][1] for i in k_idx]).to(device)
-            M2s = torch.stack([self.stats[keys[i]][2] for i in k_idx]).to(device)
+            means = torch.stack([self.stats[keys[i]][1] for i in k_idx]).to(
+                device,
+            )
+            M2s = torch.stack([self.stats[keys[i]][2] for i in k_idx]).to(
+                device,
+            )
             counts = torch.tensor(
                 [self.stats[keys[i]][0] for i in k_idx],
-                dtype=values.dtype, device=device
+                dtype=values.dtype,
+                device=device,
             )
             stds = torch.sqrt(M2s / counts + 1e-8)
             k = len(k_idx)
-            out[:, known_t, :] = (values[:, known_t, :] - means.view(1, k, 1)) / stds.view(1, k, 1)
+            out[:, known_t, :] = (
+                values[:, known_t, :] - means.view(1, k, 1)
+            ) / stds.view(1, k, 1)
             return out
 
-    def forward(self, signatures: List[Tuple[str, ...]], values: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        signatures: list[tuple[str, ...]],
+        values: torch.Tensor,
+    ) -> torch.Tensor:
         return self.normalize(signatures, values)
 
-    def get_extra_state(self) -> Dict[str, Any]:
+    def get_extra_state(self) -> dict[str, Any]:
         stats_serialized = {}
         for k, (count, mean, M2) in self.stats.items():
             stats_serialized[k] = {
@@ -165,7 +200,7 @@ class SignatureNormalizerModule(nn.Module):
             }
         return {"stats": stats_serialized}
 
-    def set_extra_state(self, state: Dict[str, Any]) -> None:
+    def set_extra_state(self, state: dict[str, Any]) -> None:
         stats_serialized = state.get("stats", {})
         self.stats = {}
         for k, v in stats_serialized.items():

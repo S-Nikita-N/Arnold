@@ -12,19 +12,19 @@ MyoKin Wrapper — MyoHuman env + Kinesis teacher.
 В обоих случаях wrapper:
   - Создаёт MyoHuman env (338 actuators)
   - Перезаписывает arm actions в step()
-  - Предоставляет action_mask для transfer reinit (290 legs/back = 1, 48 arms = 0)
+  - Предоставляет action_mask для transfer reinit
+    (290 legs/back = 1, 48 arms = 0)
 """
 
 import os
 import sys
-import logging
-from pathlib import Path
-
-import mujoco
-import numpy as np
 import torch
+import mujoco
+import logging
+import numpy as np
 
-from typing import Tuple, Iterator
+from pathlib import Path
+from collections.abc import Iterator
 
 # Paths to submodules
 _EXPERTS_DIR = Path(__file__).resolve().parent
@@ -46,6 +46,11 @@ ARM_ACTION_START = 290
 ARM_ACTION_END = 338
 
 
+########################################
+#               Wrapper                #
+########################################
+
+
 class MyoKinWrapper:
     """
     MyoHuman env (338 actuators) + optional Kinesis teacher (290 actuators).
@@ -56,7 +61,7 @@ class MyoKinWrapper:
     - get_expert_action(flat_obs) → np.ndarray  (только если teacher загружен)
     - get_action_mask() → torch.Tensor  (338,) — 1.0 legs/back, 0.0 arms
     - forward_motions() → Iterator[int]
-    - env property → MyoLegsIm
+    - env property → MyoHumanIm
     """
 
     def __init__(
@@ -82,12 +87,9 @@ class MyoKinWrapper:
         os.chdir(_MYOHUMAN_ROOT)
 
         try:
-            from myohuman.env.myolegs_im import MyoLegsIm
+            from myohuman.env.myohuman_im import MyoHumanIm
 
-            if mode == "valid":
-                run_config = "run=eval_run"
-            else:
-                run_config = "run=train_run"
+            run_config = "run=eval_run" if mode == "valid" else "run=train_run"
 
             default_overrides = [
                 run_config,
@@ -101,11 +103,12 @@ class MyoKinWrapper:
 
             cfg_dir = cfg_path if cfg_path else str(_MYOHUMAN_CFG)
             self.cfg = load_myohuman_config(
-                config_dir=cfg_dir, overrides=default_overrides,
+                config_dir=cfg_dir,
+                overrides=default_overrides,
             )
             self.cfg.project_root = str(_MYOHUMAN_ROOT)
 
-            self._env = MyoLegsIm(self.cfg)
+            self._env = MyoHumanIm(self.cfg)
 
             self.action_dim = self._env.action_space.shape[0]
             self.obs_dim = self._env.observation_space.shape[0]
@@ -127,7 +130,8 @@ class MyoKinWrapper:
         self._action_mask = torch.zeros(self.action_dim, dtype=torch.float32)
         self._action_mask[:ARM_ACTION_START] = 1.0
 
-        # Arm joint qpos indices in MyoHuman model (same as evaluate_kinesis_teacher)
+        # Arm joint qpos indices in MyoHuman model
+        # (same as evaluate_kinesis_teacher)
         self._arm_qpos_slice = slice(27, 59)
 
     def _load_teacher(self, checkpoint_path: str) -> None:
@@ -157,7 +161,7 @@ class MyoKinWrapper:
         """(338,) float mask: 1.0 for legs/back, 0.0 for arms."""
         return self._action_mask
 
-    def reset(self) -> Tuple[np.ndarray, dict]:
+    def reset(self) -> tuple[np.ndarray, dict]:
         obs, info = self._env.reset()
         # Zero out arm joints so arms start in neutral pose
         self._env.mj_data.qpos[self._arm_qpos_slice] = 0.0
@@ -170,15 +174,25 @@ class MyoKinWrapper:
         next_obs, reward, terminated, truncated, info = self._env.step(action)
 
         if "r_body_pos" in info and isinstance(info["r_body_pos"], np.ndarray):
-            info["r_body_pos"] = info["r_body_pos"][0] if info["r_body_pos"].ndim > 0 else info["r_body_pos"]
+            info["r_body_pos"] = (
+                info["r_body_pos"][0]
+                if info["r_body_pos"].ndim > 0
+                else info["r_body_pos"]
+            )
         if "r_vel" in info and isinstance(info["r_vel"], np.ndarray):
-            info["r_vel"] = info["r_vel"][0] if info["r_vel"].ndim > 0 else info["r_vel"]
+            info["r_vel"] = (
+                info["r_vel"][0] if info["r_vel"].ndim > 0 else info["r_vel"]
+            )
 
         return next_obs, reward, terminated, truncated, info
 
     def preprocess_actions(self, action: np.ndarray) -> np.ndarray:
         """Clip and rescale actions (same as MyoHumanWrapper)."""
-        action = np.clip(action.astype(np.float32), self.actions_low, self.actions_high)
+        action = np.clip(
+            action.astype(np.float32),
+            self.actions_low,
+            self.actions_high,
+        )
         d = (self.actions_high - self.actions_low) / 2.0
         m = (self.actions_low + self.actions_high) / 2.0
         return action * d + m
@@ -187,7 +201,7 @@ class MyoKinWrapper:
         """Get 338-dim teacher action (arms=0) from Kinesis MoE."""
         if self._teacher is None:
             raise RuntimeError(
-                "Kinesis teacher not loaded. Set teacher_checkpoint in config."
+                "Kinesis teacher not loaded. Set teacher_checkpoint in config.",
             )
 
         kin_obs = self._obs_adapter.build_obs(self._env)

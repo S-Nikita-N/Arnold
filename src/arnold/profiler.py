@@ -6,7 +6,7 @@ Profiler — единый профайлер времени и GPU-памяти 
   mem_enabled   — замеряет GPU memory (cuda allocated / peak)
 
 Использование:
-    profiler = Profiler(device="cuda:0")
+    profiler = Profiler(device=dev)  # dev, e.g. cuda:0 / mps / cpu
 
     # Включить время (sampling worker)
     profiler.time_enabled = True
@@ -26,10 +26,16 @@ Profiler — единый профайлер времени и GPU-памяти 
 Когда оба флага False — section() просто yield, без overhead.
 """
 
-import contextlib
 import time
 import torch
-from typing import List, Dict, Any
+import contextlib
+
+from typing import Any
+
+
+########################################
+#               Profiler               #
+########################################
 
 
 class Profiler:
@@ -47,27 +53,28 @@ class Profiler:
         self.mem_enabled: bool = False
 
         # Shared nesting stack
-        self._stack: List[str] = []
+        self._stack: list[str] = []
 
-        # Records: {'depth', 'name', 'meta', 'time', 'mem_before', 'mem_after', 'mem_delta', 'mem_peak'}
-        self._records: List[Dict[str, Any]] = []
+        # Records: {'depth', 'name', 'meta', 'time', 'mem_before',
+        #  'mem_after', 'mem_delta', 'mem_peak'}
+        self._records: list[dict[str, Any]] = []
 
-    # ------------------------------------------------------------------
-    #  Internal helpers
-    # ------------------------------------------------------------------
+    ########################################
+    #           Internal helpers           #
+    ########################################
 
     def _sync_mem(self) -> tuple:
         """(cur_mb, peak_mb) — текущее и пиковое выделение GPU."""
         if not torch.cuda.is_available():
             return 0.0, 0.0
         torch.cuda.synchronize(self.device)
-        cur = torch.cuda.memory_allocated(self.device) / 1024 ** 2
-        peak = torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
+        cur = torch.cuda.memory_allocated(self.device) / 1024**2
+        peak = torch.cuda.max_memory_allocated(self.device) / 1024**2
         return cur, peak
 
-    # ------------------------------------------------------------------
-    #  Public API
-    # ------------------------------------------------------------------
+    ########################################
+    #              Public API              #
+    ########################################
 
     @contextlib.contextmanager
     def section(self, name: str, meta: str = ""):
@@ -78,7 +85,7 @@ class Profiler:
         depth = len(self._stack)
         self._stack.append(name)
 
-        rec: Dict[str, Any] = {
+        rec: dict[str, Any] = {
             "depth": depth,
             "name": name,
             "meta": meta,
@@ -113,24 +120,24 @@ class Profiler:
         if self.mem_enabled and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(self.device)
 
-    # ------------------------------------------------------------------
-    #  Serialization (для передачи между процессами, только time)
-    # ------------------------------------------------------------------
+    ########################################
+    #            Serialization             #
+    ########################################
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {"records": list(self._records)}
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Profiler":
+    def from_dict(cls, data: dict[str, Any]) -> "Profiler":
         p = cls()
         p._records = data["records"]
         return p
 
-    # ------------------------------------------------------------------
-    #  Tree layout helpers
-    # ------------------------------------------------------------------
+    ########################################
+    #         Tree layout helpers          #
+    ########################################
 
-    def _build_tree_layout(self, records: List[Dict[str, Any]]):
+    def _build_tree_layout(self, records: list[dict[str, Any]]):
         """Вычисляет is_last и prefixes для tree-отображения."""
         n = len(records)
 
@@ -147,10 +154,10 @@ class Profiler:
                     break
 
         # Build tree prefixes (depth 0 тоже получает ├─ / └─)
-        prefixes: List[str] = []
+        prefixes: list[str] = []
         for i, rec in enumerate(records):
             depth = rec["depth"]
-            parts: List[str] = []
+            parts: list[str] = []
             for d in range(0, depth + 1):
                 if d == depth:
                     parts.append("└─ " if is_last[i] else "├─ ")
@@ -168,11 +175,11 @@ class Profiler:
 
         return prefixes
 
-    # ------------------------------------------------------------------
-    #  Report rendering
-    # ------------------------------------------------------------------
+    ########################################
+    #           Report rendering           #
+    ########################################
 
-    def _aggregate_by_path(self, records: List[Dict[str, Any]]):
+    def _aggregate_by_path(self, records: list[dict[str, Any]]):
         """
         Агрегирует записи с одинаковым path (depth-first path от корня).
 
@@ -180,9 +187,9 @@ class Profiler:
         Каждая запись: {depth, name, path, meta, avg_time_s, avg_mem_delta,
                         avg_mem_after, avg_mem_peak, count}
         """
-        ancestor_names: List[str] = []
-        agg: Dict[tuple, Dict[str, Any]] = {}
-        order: List[tuple] = []
+        ancestor_names: list[str] = []
+        agg: dict[tuple, dict[str, Any]] = {}
+        order: list[tuple] = []
 
         for rec in records:
             d = rec["depth"]
@@ -212,28 +219,40 @@ class Profiler:
             if rec.get("mem_delta") is not None:
                 entry["sum_mem_delta"] += rec["mem_delta"]
                 entry["sum_mem_after"] += rec["mem_after"]
-                entry["sum_mem_peak"] = max(entry["sum_mem_peak"], rec["mem_peak"])
+                entry["sum_mem_peak"] = max(
+                    entry["sum_mem_peak"],
+                    rec["mem_peak"],
+                )
                 entry["count_mem"] += 1
 
         result = []
         for path in order:
             e = agg[path]
-            result.append({
-                "depth": e["depth"],
-                "name": e["name"],
-                "path": e["path"],
-                "meta": e["meta"],
-                "avg_ms": e["sum_time"] / e["count_time"] * 1000 if e["count_time"] else None,
-                "avg_mem_delta": e["sum_mem_delta"] / e["count_mem"] if e["count_mem"] else None,
-                "avg_mem_after": e["sum_mem_after"] / e["count_mem"] if e["count_mem"] else None,
-                "peak_mem": e["sum_mem_peak"] if e["count_mem"] else None,
-            })
+            result.append(
+                {
+                    "depth": e["depth"],
+                    "name": e["name"],
+                    "path": e["path"],
+                    "meta": e["meta"],
+                    "avg_ms": e["sum_time"] / e["count_time"] * 1000
+                    if e["count_time"]
+                    else None,
+                    "avg_mem_delta": e["sum_mem_delta"] / e["count_mem"]
+                    if e["count_mem"]
+                    else None,
+                    "avg_mem_after": e["sum_mem_after"] / e["count_mem"]
+                    if e["count_mem"]
+                    else None,
+                    "peak_mem": e["sum_mem_peak"] if e["count_mem"] else None,
+                },
+            )
         return result
 
     def report(self) -> str:
         """Деревянный отчёт — время и/или память в зависимости от данных."""
         records_raw = [
-            r for r in self._records
+            r
+            for r in self._records
             if r["time"] is not None or r["mem_delta"] is not None
         ]
         if not records_raw:
@@ -243,7 +262,7 @@ class Profiler:
         has_time_agg = any(r["avg_ms"] is not None for r in agg)
         has_mem_agg = any(r["avg_mem_delta"] is not None for r in agg)
 
-        lines: List[str] = []
+        lines: list[str] = []
 
         if has_time_agg:
             lines.extend(self._render_time(agg))
@@ -255,40 +274,50 @@ class Profiler:
 
         return "\n" + "\n".join(lines)
 
-    # ── Dot-leader helper ─────────────────────────────────────────────
+    ########################################
+    #          Dot-leader helper           #
+    ########################################
 
     @staticmethod
     def _dot_leader(label: str, leader_col: int, min_dots: int = 1) -> str:
-        """Возвращает label + пробел + точки до фиксированной колонки leader_col."""
+        """
+        Возвращает label + пробел + точки до фиксированной колонки
+        leader_col.
+        """
         dots = max(min_dots, leader_col - len(label) - 1)
         return label + " " + "." * dots
 
-    # ── Time rendering ────────────────────────────────────────────────
+    ########################################
+    #            Time rendering            #
+    ########################################
 
-    def _render_time(self, agg: List[Dict[str, Any]]) -> List[str]:
+    def _render_time(self, agg: list[dict[str, Any]]) -> list[str]:
         time_recs = [r for r in agg if r["avg_ms"] is not None]
         if not time_recs:
             return []
 
-        path_ms: Dict[tuple, float] = {r["path"]: r["avg_ms"] for r in time_recs}
+        path_ms: dict[tuple, float] = {
+            r["path"]: r["avg_ms"] for r in time_recs
+        }
         top_avg_ms = sum(r["avg_ms"] for r in time_recs if r["depth"] == 0)
         prefixes = self._build_tree_layout(time_recs)
 
         # leader_col: колонка где начинается число (от начала строки с "  ")
-        LEADER_COL = 46   # "  " + label + dots → до этой позиции
+        LEADER_COL = 46  # "  " + label + dots → до этой позиции
         # число: "  XX.XXX ms/step  (XX.X%)"  — фиксировано вправо от leader_col
-        NUM_W = 8          # ширина поля числа (X.XXX)
+        NUM_W = 8  # ширина поля числа (X.XXX)
 
-        # Вычисляем ширину бокса из самой длинной строки (с процентом от родителя)
+        # Вычисляем ширину бокса из самой длинной строки
+        # (с процентом от родителя)
         max_pct_len = max(
             len(f"({100.0:>5.1f}% of {'LowRankMultivariateNormal'})"),
-            len("(100.0%)")
+            len("(100.0%)"),
         )
         total_w = LEADER_COL + NUM_W + len(" ms/step  ") + max_pct_len + 4
         sep = "  " + "─" * (total_w - 4)
 
         title = "  Profiler Report  |  time"
-        lines: List[str] = []
+        lines: list[str] = []
         lines.append("┌" + "─" * (total_w - 2) + "┐")
         lines.append("│" + title.ljust(total_w - 2) + "│")
         lines.append("└" + "─" * (total_w - 2) + "┘")
@@ -321,15 +350,17 @@ class Profiler:
         lines.append(f"  {leader} {top_avg_ms:>{NUM_W}.3f} ms/step")
         return lines
 
-    # ── Memory rendering ──────────────────────────────────────────────
+    ########################################
+    #           Memory rendering           #
+    ########################################
 
-    def _render_mem(self, agg: List[Dict[str, Any]]) -> List[str]:
+    def _render_mem(self, agg: list[dict[str, Any]]) -> list[str]:
         mem_recs = [r for r in agg if r["avg_mem_delta"] is not None]
         if not mem_recs:
             return []
 
         if torch.cuda.is_available() and self.device is not None:
-            peak_mb = torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
+            peak_mb = torch.cuda.max_memory_allocated(self.device) / 1024**2
         else:
             peak_mb = None
 
@@ -347,13 +378,13 @@ class Profiler:
 
         sep = "  " + "─" * (total_w - 4)
 
-        lines: List[str] = []
+        lines: list[str] = []
         lines.append("┌" + "─" * (total_w - 2) + "┐")
         lines.append("│" + title.ljust(total_w - 2) + "│")
         lines.append("└" + "─" * (total_w - 2) + "┘")
 
         hdr = f"  {'section'}"
-        for c, w in zip(cols, col_widths):
+        for c, w in zip(cols, col_widths, strict=False):
             hdr += f"  {c:>{w}}"
         lines.append(hdr)
         lines.append(sep)
@@ -372,7 +403,7 @@ class Profiler:
                 f"  {leader}"
                 f" {delta_str:>{col_widths[0]}}"
                 f" {cur_str:>{col_widths[1]}}"
-                f" {peak_str:>{col_widths[2]}}"
+                f" {peak_str:>{col_widths[2]}}",
             )
 
         lines.append(sep)

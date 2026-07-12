@@ -3,22 +3,32 @@ Memory и Batch для OBC training.
 """
 
 import torch
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+
+from dataclasses import field, dataclass
+
+
+########################################
+#              OBCMemory               #
+########################################
 
 
 @dataclass
 class OBCMemory:
     """Хранит данные для OBC обновления."""
-    states: List[torch.Tensor] = field(default_factory=list)       # [n_obs, history_len]
-    obs_signatures: List[List[Tuple[str, ...]]] = field(default_factory=list)
-    action_signatures: List[List[Tuple[str, ...]]] = field(default_factory=list)
-    policy_actions: List[torch.Tensor] = field(default_factory=list)
-    expert_actions: List[torch.Tensor] = field(default_factory=list)
-    rewards: List[float] = field(default_factory=list)
-    values: List[torch.Tensor] = field(default_factory=list)
-    masks: List[float] = field(default_factory=list)  # 0 если episode done
-    log_probs: List[torch.Tensor] = field(default_factory=list)  # log prob действий
+
+    states: list[torch.Tensor] = field(
+        default_factory=list,
+    )  # [n_obs, history_len]
+    obs_signatures: list[list[tuple[str, ...]]] = field(default_factory=list)
+    action_signatures: list[list[tuple[str, ...]]] = field(default_factory=list)
+    policy_actions: list[torch.Tensor] = field(default_factory=list)
+    expert_actions: list[torch.Tensor] = field(default_factory=list)
+    rewards: list[float] = field(default_factory=list)
+    values: list[torch.Tensor] = field(default_factory=list)
+    masks: list[float] = field(default_factory=list)  # 0 если episode done
+    log_probs: list[torch.Tensor] = field(
+        default_factory=list,
+    )  # log prob действий
 
     def clear(self):
         self.states.clear()
@@ -48,8 +58,9 @@ class OBCMemory:
 
     def to_transfer_dict(self) -> dict:
         """
-        Упаковывает memory в dict со stacked тензорами для передачи через multiprocessing.Queue.
-        Резко уменьшает число shared-memory сегментов (тысячи мелких тензоров → несколько больших).
+        Упаковывает memory в dict со stacked тензорами для передачи
+        через multiprocessing.Queue. Резко уменьшает число shared-memory
+        сегментов (тысячи мелких тензоров → несколько больших).
         """
         if len(self.states) == 0:
             return {"n": 0}
@@ -87,7 +98,7 @@ class OBCMemory:
         self,
         gamma: float,
         tau: float,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ) -> "OBCBatch":
         """
         Конвертирует OBCMemory в OBCBatch и считает GAE.
@@ -126,9 +137,13 @@ class OBCMemory:
 
         for i in reversed(range(batch_size)):
             # TD error: δ_t = r_t + γ * V(s_{t+1}) * mask - V(s_t)
-            deltas[i] = rewards_exp[i] + gamma * prev_value * masks_exp[i] - values[i]
+            deltas[i] = (
+                rewards_exp[i] + gamma * prev_value * masks_exp[i] - values[i]
+            )
             # GAE: A_t = δ_t + γ * λ * A_{t+1} * mask
-            advantages[i] = deltas[i] + gamma * tau * prev_advantage * masks_exp[i]
+            advantages[i] = (
+                deltas[i] + gamma * tau * prev_advantage * masks_exp[i]
+            )
 
             prev_value = values[i, 0].item()
             prev_advantage = advantages[i, 0].item()
@@ -137,7 +152,9 @@ class OBCMemory:
         returns = values + advantages
 
         # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = (advantages - advantages.mean()) / (
+            advantages.std() + 1e-8
+        )
 
         if device is not None:
             states = states.to(device)
@@ -165,17 +182,25 @@ class OBCMemory:
         )
 
 
+########################################
+#               OBCBatch               #
+########################################
+
+
 @dataclass
 class OBCBatch:
     """Батч для OBC обновления."""
-    states: torch.Tensor           # [batch, n_obs, history_len]
-    obs_signatures: List[Tuple[str, ...]]
-    action_signatures: List[Tuple[str, ...]]
+
+    states: torch.Tensor  # [batch, n_obs, history_len]
+    obs_signatures: list[tuple[str, ...]]
+    action_signatures: list[tuple[str, ...]]
     policy_actions: torch.Tensor  # [batch, n_actions]
-    expert_actions: torch.Tensor   # [batch, n_actions]
-    rewards: torch.Tensor          # [batch]
-    values: torch.Tensor           # [batch, 1]
-    masks: torch.Tensor            # [batch]
-    log_probs: torch.Tensor        # [batch, 1] - log prob действий (fixed, до обновления)
-    returns: torch.Tensor = None   # [batch, 1] - GAE returns
+    expert_actions: torch.Tensor  # [batch, n_actions]
+    rewards: torch.Tensor  # [batch]
+    values: torch.Tensor  # [batch, 1]
+    masks: torch.Tensor  # [batch]
+    log_probs: (
+        torch.Tensor
+    )  # [batch, 1] - log prob действий (fixed, до обновления)
+    returns: torch.Tensor = None  # [batch, 1] - GAE returns
     advantages: torch.Tensor = None  # [batch, 1] - GAE advantages

@@ -13,7 +13,13 @@ are contiguous before multiplication, avoiding the Metal BLAS crash path.
 
 import math
 import torch
+
 from torch.distributions import LowRankMultivariateNormal
+
+
+########################################
+#            Safe log_prob             #
+########################################
 
 
 def safe_lrmvn_log_prob(
@@ -31,8 +37,8 @@ def safe_lrmvn_log_prob(
     """
     diff = value - dist.loc  # [B, n]
     W = dist._unbroadcasted_cov_factor  # [B, n, k]
-    D = dist._unbroadcasted_cov_diag    # [B, n]
-    cap_tril = dist._capacitance_tril   # [B, k, k]
+    D = dist._unbroadcasted_cov_diag  # [B, n]
+    cap_tril = dist._capacitance_tril  # [B, k, k]
     n = dist.event_shape[0]
 
     # Mahalanobis distance via Woodbury identity:
@@ -40,7 +46,9 @@ def safe_lrmvn_log_prob(
     # where v = W^T D^{-1} diff, C = I + W^T D^{-1} W (capacitance)
     D_inv = 1.0 / D
     # W * D_inv gives D^{-1}W column-wise, then transpose → contiguous
-    Wt_Dinv = (W * D_inv.unsqueeze(-1)).transpose(-2, -1).contiguous()  # [B, k, n]
+    Wt_Dinv = (
+        (W * D_inv.unsqueeze(-1)).transpose(-2, -1).contiguous()
+    )  # [B, k, n]
     Wt_Dinv_diff = Wt_Dinv @ diff.unsqueeze(-1)  # [B, k, 1]
 
     # C^{-1} v  via  solve_triangular  (L x = v,  then L^T y = x)
