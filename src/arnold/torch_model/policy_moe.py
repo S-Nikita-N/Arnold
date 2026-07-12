@@ -124,13 +124,15 @@ class MoELatticePolicy(nn.Module):
             raise ValueError(
                 f"shared_expert_units[-1] ({shared_expert_units[-1]}) != "
                 f"expert_units[-1] ({expert_units[-1]}): "
-                f"latent_dim должен совпадать для cov_factor aggregation"
+                f"latent_dim должен совпадать для cov_factor aggregation",
             )
 
         self.latent_dim = shared_expert_units[-1]
 
         self.shared_expert_net = MLP(
-            trunk_out_dim, shared_expert_units, activation
+            trunk_out_dim,
+            shared_expert_units,
+            activation,
         )
         self.shared_expert_head = nn.Linear(self.latent_dim, action_dim)
         self.shared_expert_head.weight.data.mul_(0.1)
@@ -368,7 +370,7 @@ class MoELatticePolicy(nn.Module):
                 f"MoE state_dim mismatch: policy expects {self.state_dim}, "
                 f"got obs with {x.shape[1]} elements "
                 f"(obs_timeseries.shape={obs_timeseries.shape}, "
-                f"n_signatures={len(obs_signatures)})"
+                f"n_signatures={len(obs_signatures)})",
             )
 
         # ── 1. Shared trunk ──────────────────────────────────────────
@@ -379,7 +381,7 @@ class MoELatticePolicy(nn.Module):
         with p.section("shared_expert"):
             e_shared = self.shared_expert_net(h)  # [batch, latent_dim]
             shared_mean = self.shared_expert_head(
-                e_shared
+                e_shared,
             )  # [batch, action_dim]
 
         # ── 3. Gate routing (отдельная MLP на h) ─────────────────────
@@ -387,7 +389,7 @@ class MoELatticePolicy(nn.Module):
             top_k_weights, top_k_indices, gate_probs = self.gate_forward(h)
             if self.soft_routing:
                 load_balance_loss, lb_stats = self.compute_soft_balance_loss(
-                    gate_probs
+                    gate_probs,
                 )
             else:
                 load_balance_loss, lb_stats = self.compute_sparse_balance_loss(
@@ -419,7 +421,9 @@ class MoELatticePolicy(nn.Module):
         # ── 5. Combine shared + routed → mean ────────────────────────
         with p.section("mean_combine"):
             route_means = flat_route_out.view(
-                batch_size, self.top_k, self.action_dim
+                batch_size,
+                self.top_k,
+                self.action_dim,
             )
             routed_mean = (route_means * top_k_weights.unsqueeze(-1)).sum(dim=1)
             mean = self.alpha * shared_mean + (1.0 - self.alpha) * routed_mean
@@ -456,7 +460,7 @@ class MoELatticePolicy(nn.Module):
                     self.shared_expert_head.weight.detach().norm().item()
                 )
                 W_exp_norms = torch.stack(
-                    [eh.weight.detach().norm() for eh in self.expert_heads]
+                    [eh.weight.detach().norm() for eh in self.expert_heads],
                 )
                 mean_probs = gate_probs.detach().mean(dim=0)
                 r_cov_norm = (mean_probs * W_exp_norms).sum().item()
@@ -533,7 +537,7 @@ class MoELatticePolicy(nn.Module):
         else:
             if cov_factor is None:
                 raise ValueError(
-                    "return_std=False допустим только при deterministic=True"
+                    "return_std=False допустим только при deterministic=True",
                 )
             with p.section("dist_build"):
                 dist = self.build_action_dist(mean, cov_factor, diag_std)

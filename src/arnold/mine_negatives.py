@@ -196,7 +196,10 @@ def log_group_stats(items: list, label: str) -> None:
 
 
 def log_summary(
-    expert_name: str, split: str, per_motion: list, negatives: list
+    expert_name: str,
+    split: str,
+    per_motion: list,
+    negatives: list,
 ) -> None:
     total = len(per_motion)
     n_neg = len(negatives)
@@ -204,7 +207,7 @@ def log_summary(
 
     logger.info(
         f"[{expert_name}] {split}: "
-        f"{n_neg} negatives + {len(positives)} positives = {total} total"
+        f"{n_neg} negatives + {len(positives)} positives = {total} total",
     )
     log_group_stats(negatives, "negatives")
     log_group_stats(positives, "positives")
@@ -242,7 +245,7 @@ def _evaluate_all_experts(trainer, split):
             if wrapper is None:
                 raise ValueError(
                     f"No wrapper for expert '{expert_name}'. "
-                    f"Set eval_frequency > 0 in config."
+                    f"Set eval_frequency > 0 in config.",
                 )
 
             if trainer.vectorized_eval and trainer.device.type in (
@@ -282,7 +285,7 @@ def mine_split(trainer, split, split_cfg, run_cfg, checkpoint_path):
     logger.info(f"Mining: {split}")
     logger.info(
         f"  mean_mpjpe={mean_mpjpe}, max_mpjpe={max_mpjpe}, "
-        f"not_success={not_success}"
+        f"not_success={not_success}",
     )
     logger.info(f"{'=' * 60}")
 
@@ -326,7 +329,9 @@ def hydra_main():
     from omegaconf import DictConfig
 
     @hydra.main(
-        config_path="../../cfg", config_name="config", version_base=None
+        config_path="../../cfg",
+        config_name="config",
+        version_base=None,
     )
     def _main(cfg: DictConfig) -> None:
         logging.basicConfig(
@@ -362,7 +367,11 @@ def hydra_main():
             mine_split(trainer, "valid", run_cfg.test, run_cfg, checkpoint_path)
         if run_cfg.mine_train:
             mine_split(
-                trainer, "train", run_cfg.train, run_cfg, checkpoint_path
+                trainer,
+                "train",
+                run_cfg.train,
+                run_cfg,
+                checkpoint_path,
             )
 
         logger.info("Done!")
@@ -438,7 +447,8 @@ def refilter_main():
         base = os.path.basename(neg_path)
         if base.endswith("_negatives.txt"):
             pos_path = os.path.join(
-                dire, base.replace("_negatives.txt", "_positives.txt")
+                dire,
+                base.replace("_negatives.txt", "_positives.txt"),
             )
         else:
             stem, _ext = os.path.splitext(neg_path)
@@ -458,7 +468,7 @@ def refilter_main():
             "negatives_count": len(negatives),
             "positives_count": len(positives),
             "total_motions": total,
-        }
+        },
     )
     save_eval_json(frames, meta, json_out)
 

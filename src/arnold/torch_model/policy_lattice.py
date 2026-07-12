@@ -205,7 +205,7 @@ class LatticePolicy(nn.Module):
         else:
             if cov_factor is None:
                 raise ValueError(
-                    "return_std=False допустим только при deterministic=True"
+                    "return_std=False допустим только при deterministic=True",
                 )
             with p.section("dist_build"):
                 dist = self.build_action_dist(mean, cov_factor, diag_std)

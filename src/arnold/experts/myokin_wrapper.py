@@ -189,7 +189,9 @@ class MyoKinWrapper:
     def preprocess_actions(self, action: np.ndarray) -> np.ndarray:
         """Clip and rescale actions (same as MyoHumanWrapper)."""
         action = np.clip(
-            action.astype(np.float32), self.actions_low, self.actions_high
+            action.astype(np.float32),
+            self.actions_low,
+            self.actions_high,
         )
         d = (self.actions_high - self.actions_low) / 2.0
         m = (self.actions_low + self.actions_high) / 2.0
@@ -199,7 +201,7 @@ class MyoKinWrapper:
         """Get 338-dim teacher action (arms=0) from Kinesis MoE."""
         if self._teacher is None:
             raise RuntimeError(
-                "Kinesis teacher not loaded. Set teacher_checkpoint in config."
+                "Kinesis teacher not loaded. Set teacher_checkpoint in config.",
             )
 
         kin_obs = self._obs_adapter.build_obs(self._env)

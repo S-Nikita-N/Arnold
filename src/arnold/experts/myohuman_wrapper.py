@@ -156,7 +156,7 @@ class MyoHumanWrapper:
                     )
                     default_overrides.append(f"run.xml_path={xml_path}")
                     default_overrides.append(
-                        f"run.initial_pose_file={pose_path}"
+                        f"run.initial_pose_file={pose_path}",
                     )
 
                 if overrides:
@@ -170,7 +170,8 @@ class MyoHumanWrapper:
 
                 cfg_dir = cfg_path if cfg_path else str(MYOHUMAN_CFG)
                 self.cfg = load_myohuman_config(
-                    config_dir=cfg_dir, overrides=default_overrides
+                    config_dir=cfg_dir,
+                    overrides=default_overrides,
                 )
 
             # Устанавливаем project_root на корень Myohuman
@@ -211,7 +212,7 @@ class MyoHumanWrapper:
             "Myohuman-native expert checkpoints are no longer supported "
             "(checkpoint_epoch must stay 0). Train the expert through Arnold "
             "and point the expert config's `teacher_checkpoint` at the "
-            "resulting Arnold LatticePolicy .pth for OBC distillation."
+            "resulting Arnold LatticePolicy .pth for OBC distillation.",
         )
 
     @property
@@ -240,7 +241,7 @@ class MyoHumanWrapper:
         (MyoHuman-native policy)."""
         if self._expert_policy is None:
             raise RuntimeError(
-                "Expert policy not loaded. Use checkpoint_epoch != 0."
+                "Expert policy not loaded. Use checkpoint_epoch != 0.",
             )
 
         with torch.no_grad():
@@ -258,7 +259,9 @@ class MyoHumanWrapper:
         Среда ожидает действия в [actions_low, actions_high].
         """
         action = np.clip(
-            action.astype(np.float32), self.actions_low, self.actions_high
+            action.astype(np.float32),
+            self.actions_low,
+            self.actions_high,
         )
         d = (self.actions_high - self.actions_low) / 2.0
         m = (self.actions_low + self.actions_high) / 2.0

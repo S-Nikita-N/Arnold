@@ -35,16 +35,19 @@ GOLDEN_NPZ = os.path.join(HERE, "goldens.npz")
 #           Module builders            #
 ########################################
 
+
 def build_vocab():
     from arnold.torch_model.sensorimotor_vocabulary import (
         SensorimotorVocabulary,
     )
+
     torch.manual_seed(0)
     return SensorimotorVocabulary(embed_dim=helpers.EMBED_DIM)
 
 
 def build_sensory_encoder():
     from arnold.torch_model.sensory_encoder import SensoryEncoder
+
     torch.manual_seed(1)
     return SensoryEncoder(
         history_len=helpers.HISTORY_LEN,
@@ -54,12 +57,14 @@ def build_sensory_encoder():
 
 def build_mlp():
     from arnold.torch_model.mlp import MLP
+
     torch.manual_seed(2)
     return MLP(input_dim=8, hidden_dims=(16, 4), activation="silu")
 
 
 def build_body_tokenizer(op):
     from arnold.torch_model.body_tokenizer import BodyTokenizer
+
     groups = op.get_body_groups("per_body")
     torch.manual_seed(3)
     tok = BodyTokenizer(
@@ -72,6 +77,7 @@ def build_body_tokenizer(op):
 
 def build_action_tokenizer(ap):
     from arnold.torch_model.action_tokenizer import ActionTokenizer
+
     grouping = ap.get_muscle_grouping("hybrid")
     torch.manual_seed(4)
     tok = ActionTokenizer(
@@ -85,12 +91,14 @@ def build_action_tokenizer(ap):
 
 def build_normalizer():
     from arnold.torch_model.normalization import SignatureNormalizerModule
+
     return SignatureNormalizerModule()
 
 
 ########################################
 #              Generation              #
 ########################################
+
 
 def main():
     goldens = {}
@@ -191,36 +199,49 @@ def main():
         }
     goldens["norm_stats"] = norm_stats
     test_vals = torch.arange(
-        3 * helpers.HISTORY_LEN, dtype=torch.float32,
+        3 * helpers.HISTORY_LEN,
+        dtype=torch.float32,
     ).reshape(1, 3, helpers.HISTORY_LEN)
     npz["norm_normalized"] = norm.normalize(sigs, test_vals).detach().numpy()
 
     # -- policy_moe deterministic helpers --
     # Build a tiny MoE policy purely to call its pure helper methods.
     from arnold.torch_model.policy_moe import MoELatticePolicy
+
     torch.manual_seed(5)
     action_dim = 6
     latent_dim = 4
     sparse = MoELatticePolicy(
-        state_dim=8, action_dim=action_dim,
-        shared_units=(), shared_expert_units=(latent_dim,),
-        num_experts=4, top_k=2, expert_units=(latent_dim,),
-        gate_units=(8,), value_units=(8,),
+        state_dim=8,
+        action_dim=action_dim,
+        shared_units=(),
+        shared_expert_units=(latent_dim,),
+        num_experts=4,
+        top_k=2,
+        expert_units=(latent_dim,),
+        gate_units=(8,),
+        value_units=(8,),
     )
     torch.manual_seed(106)
     top_k_indices = torch.tensor([[0, 1], [2, 3], [0, 2]], dtype=torch.long)
     gate_probs = torch.softmax(torch.randn(3, 4), dim=-1)
     lb_sparse, lb_sparse_stats = sparse.compute_sparse_balance_loss(
-        top_k_indices, gate_probs,
+        top_k_indices,
+        gate_probs,
     )
     goldens["moe_sparse_lb"] = float(lb_sparse.item())
 
     torch.manual_seed(6)
     soft = MoELatticePolicy(
-        state_dim=8, action_dim=action_dim,
-        shared_units=(), shared_expert_units=(latent_dim,),
-        num_experts=4, top_k=4, expert_units=(latent_dim,),
-        gate_units=(8,), value_units=(8,),
+        state_dim=8,
+        action_dim=action_dim,
+        shared_units=(),
+        shared_expert_units=(latent_dim,),
+        num_experts=4,
+        top_k=4,
+        expert_units=(latent_dim,),
+        gate_units=(8,),
+        value_units=(8,),
     )
     lb_soft, lb_soft_stats = soft.compute_soft_balance_loss(gate_probs)
     goldens["moe_soft_lb"] = float(lb_soft.item())
@@ -229,7 +250,8 @@ def main():
     # _compute_cov_factor: shared-only path (default cov_from_experts=False)
     top_k_weights = torch.tensor([[0.6, 0.4], [0.7, 0.3], [0.5, 0.5]])
     cov_f, diag_std, latent_std = sparse._compute_cov_factor(
-        top_k_indices, top_k_weights,
+        top_k_indices,
+        top_k_weights,
     )
     goldens["moe_cov_shared_shape"] = list(cov_f.shape)
     npz["moe_cov_shared"] = cov_f.detach().numpy()
@@ -239,10 +261,15 @@ def main():
     # cov_from_experts=True path (per-sample)
     torch.manual_seed(7)
     per = MoELatticePolicy(
-        state_dim=8, action_dim=action_dim,
-        shared_units=(), shared_expert_units=(latent_dim,),
-        num_experts=4, top_k=2, expert_units=(latent_dim,),
-        gate_units=(8,), value_units=(8,),
+        state_dim=8,
+        action_dim=action_dim,
+        shared_units=(),
+        shared_expert_units=(latent_dim,),
+        num_experts=4,
+        top_k=2,
+        expert_units=(latent_dim,),
+        gate_units=(8,),
+        value_units=(8,),
         cov_from_experts=True,
     )
     cov_pf, _, _ = per._compute_cov_factor(top_k_indices, top_k_weights)
@@ -251,6 +278,7 @@ def main():
 
     # -- OBCMemory GAE --
     from arnold.memory import OBCMemory
+
     m = OBCMemory()
     torch.manual_seed(107)
     n = 5

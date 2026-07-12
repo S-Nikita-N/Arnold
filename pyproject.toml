@@ -77,7 +77,18 @@ extend-exclude = ["src/arnold/experts/Kinesis", "src/arnold/experts/myochallenge
 select = ["E", "F", "UP", "B", "SIM", "C4", "PT"]
 
 [tool.typos.files]
-extend-exclude = ["src/arnold/experts/Kinesis", "src/arnold/experts/myochallenge-lattice", "src/arnold/experts/Myohuman"]
+extend-exclude = ["src/arnold/experts/Kinesis", "src/arnold/experts/myochallenge-lattice", "src/arnold/experts/Myohuman", "downloads", "docs"]
+
+# Domain terms / muscle abbreviations that are not typos: DELT (deltoid),
+# abd (abduction), sart (sartorius), GAE (advantage estimation), ANC, strat, thr.
+[tool.typos.default.extend-words]
+DELT = "DELT"
+abd = "abd"
+sart = "sart"
+strat = "strat"
+gae = "gae"
+anc = "anc"
+thr = "thr"
 
 # Scoped to the typed tooling for now; annotating the legacy src/ is a
 # separate follow-up (hundreds of implicit-Optional / attr-defined findings).

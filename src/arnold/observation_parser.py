@@ -129,7 +129,7 @@ class ObservationParser:
                         for a in dir(env)
                         if 'track' in a.lower() or 'body' in a.lower()
                     ]
-                }"
+                }",
             )
         track_bodies = env.tracked_bodies
 
@@ -175,7 +175,7 @@ class ObservationParser:
                     name="root_height",
                     size=1,
                     signatures=[("root", "c", "height")],
-                )
+                ),
             )
 
         if "root_tilt" in self.proprioceptive_inputs:
@@ -189,7 +189,7 @@ class ObservationParser:
                         ("root", "c", "tilt", "qx"),  # cos(pitch)
                         ("root", "c", "tilt", "qy"),  # sin(pitch)
                     ],
-                )
+                ),
             )
 
         if "local_body_pos" in self.proprioceptive_inputs:
@@ -205,7 +205,7 @@ class ObservationParser:
                     name="local_body_pos",
                     size=3 * (self.num_bodies - 1),
                     signatures=sigs,
-                )
+                ),
             )
 
         if "local_body_rot" in self.proprioceptive_inputs:
@@ -226,7 +226,7 @@ class ObservationParser:
                     name="local_body_rot",
                     size=6 * self.num_bodies,
                     signatures=sigs,
-                )
+                ),
             )
 
         if "local_body_vel" in self.proprioceptive_inputs:
@@ -242,7 +242,7 @@ class ObservationParser:
                     name="local_body_vel",
                     size=3 * self.num_bodies,
                     signatures=sigs,
-                )
+                ),
             )
 
         if "local_body_ang_vel" in self.proprioceptive_inputs:
@@ -258,7 +258,7 @@ class ObservationParser:
                     name="local_body_ang_vel",
                     size=3 * self.num_bodies,
                     signatures=sigs,
-                )
+                ),
             )
 
         if "muscle_len" in self.proprioceptive_inputs:
@@ -269,8 +269,10 @@ class ObservationParser:
 
             specs.append(
                 ObservationSpec(
-                    name="muscle_len", size=self.num_muscles, signatures=sigs
-                )
+                    name="muscle_len",
+                    size=self.num_muscles,
+                    signatures=sigs,
+                ),
             )
 
         if "muscle_vel" in self.proprioceptive_inputs:
@@ -281,8 +283,10 @@ class ObservationParser:
 
             specs.append(
                 ObservationSpec(
-                    name="muscle_vel", size=self.num_muscles, signatures=sigs
-                )
+                    name="muscle_vel",
+                    size=self.num_muscles,
+                    signatures=sigs,
+                ),
             )
 
         if "muscle_force" in self.proprioceptive_inputs:
@@ -293,8 +297,10 @@ class ObservationParser:
 
             specs.append(
                 ObservationSpec(
-                    name="muscle_force", size=self.num_muscles, signatures=sigs
-                )
+                    name="muscle_force",
+                    size=self.num_muscles,
+                    signatures=sigs,
+                ),
             )
 
         if "feet_contacts" in self.proprioceptive_inputs:
@@ -308,7 +314,7 @@ class ObservationParser:
                         ("calcn", "l", "contacts"),  # left heel
                         ("toes", "l", "contacts"),  # left toes
                     ],
-                )
+                ),
             )
 
         # ==== Task inputs (imitation) ====
@@ -325,7 +331,7 @@ class ObservationParser:
                     name="diff_local_body_pos",
                     size=3 * len(self.track_bodies),
                     signatures=sigs,
-                )
+                ),
             )
 
         if "diff_local_vel" in self.task_inputs:
@@ -340,7 +346,7 @@ class ObservationParser:
                     name="diff_local_vel",
                     size=3 * len(self.track_bodies),
                     signatures=sigs,
-                )
+                ),
             )
 
         if "local_ref_body_pos" in self.task_inputs:
@@ -355,7 +361,7 @@ class ObservationParser:
                     name="local_ref_body_pos",
                     size=3 * len(self.track_bodies),
                     signatures=sigs,
-                )
+                ),
             )
 
         if "diff_muscle_len" in self.task_inputs:
@@ -369,7 +375,7 @@ class ObservationParser:
                     name="diff_muscle_len",
                     size=self.num_muscles,
                     signatures=sigs,
-                )
+                ),
             )
 
         if "diff_muscle_vel" in self.task_inputs:
@@ -383,7 +389,7 @@ class ObservationParser:
                     name="diff_muscle_vel",
                     size=self.num_muscles,
                     signatures=sigs,
-                )
+                ),
             )
 
         return specs
@@ -467,7 +473,7 @@ class ObservationParser:
         else:
             raise ValueError(
                 f"Unknown granularity '{granularity}'. "
-                f"Choose from: 'scalar', 'per_spec', 'per_body'"
+                f"Choose from: 'scalar', 'per_spec', 'per_body'",
             )
 
     def _build_groups_scalar(self) -> list[BodyGroup]:
@@ -490,7 +496,7 @@ class ObservationParser:
                         type="scalar",
                         indices=[offset + i],
                         signature=sig,
-                    )
+                    ),
                 )
             offset += spec.size
         return groups
@@ -517,7 +523,7 @@ class ObservationParser:
                             type=spec.name,
                             indices=indices,
                             signature=(name, side, spec.name),
-                        )
+                        ),
                     )
             else:
                 groups.append(
@@ -527,7 +533,7 @@ class ObservationParser:
                         type=spec.name,
                         indices=list(range(offset, offset + spec.size)),
                         signature=(spec.name, "c"),
-                    )
+                    ),
                 )
             offset += spec.size
         return groups
@@ -579,12 +585,12 @@ class ObservationParser:
                         root_indices.append(offset + i)
                     else:
                         body_indices.setdefault((name, side), []).append(
-                            offset + i
+                            offset + i,
                         )
             elif spec.name in MUSCLE_SPECS:
                 for i, sig in enumerate(spec.signatures):
                     muscle_indices.setdefault((sig[0], sig[1]), []).append(
-                        offset + i
+                        offset + i,
                     )
             elif spec.name == "feet_contacts":
                 for i in range(spec.size):
@@ -592,12 +598,12 @@ class ObservationParser:
             elif spec.name in TASK_BODY_SPECS:
                 for i, sig in enumerate(spec.signatures):
                     task_body_indices.setdefault((sig[0], sig[1]), []).append(
-                        offset + i
+                        offset + i,
                     )
             elif spec.name in TASK_MUSCLE_SPECS:
                 for i, sig in enumerate(spec.signatures):
                     task_muscle_indices.setdefault((sig[0], sig[1]), []).append(
-                        offset + i
+                        offset + i,
                     )
             offset += spec.size
 
@@ -610,7 +616,7 @@ class ObservationParser:
                     type="root",
                     indices=root_indices,
                     signature=("root", "c"),
-                )
+                ),
             )
         for (name, side), indices in body_indices.items():
             groups.append(
@@ -620,7 +626,7 @@ class ObservationParser:
                     type="body",
                     indices=indices,
                     signature=(name, side),
-                )
+                ),
             )
         for (name, side), indices in muscle_indices.items():
             groups.append(
@@ -630,7 +636,7 @@ class ObservationParser:
                     type="muscle",
                     indices=indices,
                     signature=(name, side, "muscle"),
-                )
+                ),
             )
         if feet_indices:
             groups.append(
@@ -640,7 +646,7 @@ class ObservationParser:
                     type="feet",
                     indices=feet_indices,
                     signature=("contacts", "c"),
-                )
+                ),
             )
         for (name, side), indices in task_body_indices.items():
             groups.append(
@@ -650,7 +656,7 @@ class ObservationParser:
                     type="task",
                     indices=indices,
                     signature=(name, side, "error"),
-                )
+                ),
             )
         for (name, side), indices in task_muscle_indices.items():
             groups.append(
@@ -660,6 +666,6 @@ class ObservationParser:
                     type="task_muscle",
                     indices=indices,
                     signature=(name, side, "muscle", "error"),
-                )
+                ),
             )
         return groups

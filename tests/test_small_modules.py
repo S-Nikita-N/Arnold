@@ -18,6 +18,7 @@ from arnold.torch_model.sensory_encoder import SensoryEncoder
 #                 MLP                  #
 ########################################
 
+
 @pytest.mark.parametrize("act", ["tanh", "relu", "sigmoid", "gelu", "silu"])
 def test_mlp_activation_dispatch(act):
     torch.manual_seed(0)
@@ -40,13 +41,17 @@ def test_mlp_forward_golden(goldens_npz):
     x = torch.randn(3, 8)
     out = mlp(x)
     np.testing.assert_allclose(
-        out.detach().numpy(), goldens_npz["mlp_out"], rtol=1e-5, atol=1e-6
+        out.detach().numpy(),
+        goldens_npz["mlp_out"],
+        rtol=1e-5,
+        atol=1e-6,
     )
 
 
 ########################################
 #            SensoryEncoder            #
 ########################################
+
 
 def test_sensory_encoder_golden(goldens_npz):
     torch.manual_seed(1)
@@ -59,13 +64,17 @@ def test_sensory_encoder_golden(goldens_npz):
     out = enc(x)
     assert out.shape == (2, 6, helpers.EMBED_DIM)
     np.testing.assert_allclose(
-        out.detach().numpy(), goldens_npz["sensory_out"], rtol=1e-5, atol=1e-6
+        out.detach().numpy(),
+        goldens_npz["sensory_out"],
+        rtol=1e-5,
+        atol=1e-6,
     )
 
 
 ########################################
 #              dist_utils              #
 ########################################
+
 
 def test_safe_lrmvn_log_prob_matches_torch():
     torch.manual_seed(0)
@@ -74,7 +83,9 @@ def test_safe_lrmvn_log_prob_matches_torch():
     cov_factor = torch.randn(B, n, k) * 0.3
     cov_diag = torch.rand(B, n) + 0.5
     dist = torch.distributions.LowRankMultivariateNormal(
-        loc, cov_factor, cov_diag,
+        loc,
+        cov_factor,
+        cov_diag,
     )
     value = torch.randn(B, n)
     got = safe_lrmvn_log_prob(dist, value)
@@ -86,6 +97,7 @@ def test_safe_lrmvn_log_prob_matches_torch():
 ########################################
 #            learning_utils            #
 ########################################
+
 
 def test_to_test_and_to_train_restore_mode():
     m = torch.nn.Linear(3, 3)
@@ -118,14 +130,23 @@ def test_batch_to_handles_none():
 def test_get_optimizer():
     m = torch.nn.Linear(3, 3)
     adam = learning_utils.get_optimizer(
-        m, lr=1e-3, weight_decay=0.0, optimizer_type="adam",
+        m,
+        lr=1e-3,
+        weight_decay=0.0,
+        optimizer_type="adam",
     )
     assert isinstance(adam, torch.optim.Adam)
     sgd = learning_utils.get_optimizer(
-        m, lr=1e-3, weight_decay=0.0, optimizer_type="sgd",
+        m,
+        lr=1e-3,
+        weight_decay=0.0,
+        optimizer_type="sgd",
     )
     assert isinstance(sgd, torch.optim.SGD)
     with pytest.raises(ValueError, match="Unknown optimizer"):
         learning_utils.get_optimizer(
-            m, lr=1e-3, weight_decay=0.0, optimizer_type="rmsprop",
+            m,
+            lr=1e-3,
+            weight_decay=0.0,
+            optimizer_type="rmsprop",
         )

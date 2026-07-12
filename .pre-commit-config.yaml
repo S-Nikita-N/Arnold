@@ -8,6 +8,8 @@ exclude: |
     src/arnold/experts/Kinesis/
     | src/arnold/experts/myochallenge-lattice/
     | src/arnold/experts/Myohuman/
+    | downloads/
+    | docs/
     | data/
   )
 

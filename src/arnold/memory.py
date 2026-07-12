@@ -17,7 +17,7 @@ class OBCMemory:
     """Хранит данные для OBC обновления."""
 
     states: list[torch.Tensor] = field(
-        default_factory=list
+        default_factory=list,
     )  # [n_obs, history_len]
     obs_signatures: list[list[tuple[str, ...]]] = field(default_factory=list)
     action_signatures: list[list[tuple[str, ...]]] = field(default_factory=list)
@@ -27,7 +27,7 @@ class OBCMemory:
     values: list[torch.Tensor] = field(default_factory=list)
     masks: list[float] = field(default_factory=list)  # 0 если episode done
     log_probs: list[torch.Tensor] = field(
-        default_factory=list
+        default_factory=list,
     )  # log prob действий
 
     def clear(self):

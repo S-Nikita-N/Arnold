@@ -97,7 +97,9 @@ class GateMoEPolicy(nn.Module):
     ) -> LatticePolicy:
         """Load Arnold LatticePolicy from checkpoint. MLP shape inferred."""
         ckpt = torch.load(
-            checkpoint_path, map_location="cpu", weights_only=True
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
         )
         policy_state = ckpt["policy"]
 
@@ -105,13 +107,13 @@ class GateMoEPolicy(nn.Module):
         i = 0
         while f"net.affine_layers.{i}.weight" in policy_state:
             layer_dims.append(
-                policy_state[f"net.affine_layers.{i}.weight"].shape[0]
+                policy_state[f"net.affine_layers.{i}.weight"].shape[0],
             )
             i += 1
         if not layer_dims:
             raise ValueError(
                 f"Cannot infer MLP from {checkpoint_path}: "
-                f"no 'net.affine_layers.*.weight' keys"
+                f"no 'net.affine_layers.*.weight' keys",
             )
 
         expert = LatticePolicy(
@@ -189,7 +191,9 @@ class GateMoEPolicy(nn.Module):
         return Categorical(logits=gate_logits)
 
     def dist_log_prob(
-        self, dist: Categorical, actions: torch.Tensor
+        self,
+        dist: Categorical,
+        actions: torch.Tensor,
     ) -> torch.Tensor:
         """log_prob дискретного expert_idx. actions: (B,) или (B, 1) long."""
         idx = actions.squeeze(-1) if actions.dim() > 1 else actions
@@ -246,7 +250,10 @@ class GateMoEPolicy(nn.Module):
         return_std: bool = True,
         return_value: bool = True,
     ) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
     ]:
         p = self.profiler
 

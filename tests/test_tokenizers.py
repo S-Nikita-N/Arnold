@@ -14,6 +14,7 @@ from arnold.torch_model.action_tokenizer import ActionTokenizer
 #            BodyTokenizer             #
 ########################################
 
+
 def _build_body_tokenizer(op):
     groups = op.get_body_groups("per_body")
     torch.manual_seed(3)
@@ -42,7 +43,10 @@ def test_body_tokenizer_encode_golden(goldens, goldens_npz):
     out = tok.encode(obs_ts, "legs")
     assert list(out.shape) == goldens["body_tok_out_shape"]
     np.testing.assert_allclose(
-        out.detach().numpy(), goldens_npz["body_tok_out"], rtol=1e-5, atol=1e-6
+        out.detach().numpy(),
+        goldens_npz["body_tok_out"],
+        rtol=1e-5,
+        atol=1e-6,
     )
 
 
@@ -51,14 +55,25 @@ def test_body_tokenizer_feature_mismatch_raises():
     -> ValueError.
     """
     from arnold.observation_parser import BodyGroup
-    g_a = [BodyGroup(
-        name="m1", side="c", type="muscle",
-        indices=[0, 1], signature=("m1", "c", "muscle"),
-    )]
-    g_b = [BodyGroup(
-        name="m2", side="c", type="muscle",
-        indices=[0, 1, 2], signature=("m2", "c", "muscle"),
-    )]
+
+    g_a = [
+        BodyGroup(
+            name="m1",
+            side="c",
+            type="muscle",
+            indices=[0, 1],
+            signature=("m1", "c", "muscle"),
+        ),
+    ]
+    g_b = [
+        BodyGroup(
+            name="m2",
+            side="c",
+            type="muscle",
+            indices=[0, 1, 2],
+            signature=("m2", "c", "muscle"),
+        ),
+    ]
     with pytest.raises(ValueError, match="Feature count mismatch"):
         BodyTokenizer(
             groups={"a": g_a, "b": g_b},
@@ -70,6 +85,7 @@ def test_body_tokenizer_feature_mismatch_raises():
 ########################################
 #           ActionTokenizer            #
 ########################################
+
 
 def _build_action_tokenizer(ap):
     grouping = ap.get_muscle_grouping("hybrid")
@@ -130,7 +146,10 @@ def test_action_tokenizer_decode_golden(goldens, goldens_npz):
     assert list(mean.shape) == goldens["atok_mean_shape"]
     assert list(hidden.shape) == goldens["atok_hidden_shape"]
     np.testing.assert_allclose(
-        mean.detach().numpy(), goldens_npz["atok_mean"], rtol=1e-5, atol=1e-6
+        mean.detach().numpy(),
+        goldens_npz["atok_mean"],
+        rtol=1e-5,
+        atol=1e-6,
     )
     np.testing.assert_allclose(
         hidden.detach().numpy(),

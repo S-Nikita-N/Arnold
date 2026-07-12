@@ -75,7 +75,9 @@ from arnold.trainer import ArnoldTrainer
 
 _repo_root = Path(__file__).resolve().parent.parent.parent
 warnings.filterwarnings(
-    "ignore", category=SyntaxWarning, message="invalid escape sequence"
+    "ignore",
+    category=SyntaxWarning,
+    message="invalid escape sequence",
 )
 
 

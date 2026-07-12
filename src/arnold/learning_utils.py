@@ -121,7 +121,10 @@ def get_optimizer(net, lr, weight_decay, optimizer_type="adam", **kwargs):
         )
     elif optimizer_type == "sgd":
         return torch.optim.SGD(
-            net.parameters(), lr=lr, weight_decay=weight_decay, **kwargs
+            net.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            **kwargs,
         )
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")

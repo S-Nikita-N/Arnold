@@ -22,32 +22,42 @@ from arnold.action_parser import (
 #            Static helpers            #
 ########################################
 
-@pytest.mark.parametrize(("name", "expected"), [
-    ("PECM1_r", ("PECM1", "r")),
-    ("DELT2_l", ("DELT2", "l")),
-    ("psoas", ("psoas", "c")),
-    ("rect_abd", ("rect_abd", "c")),
-    ("", ("", "c")),
-])
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("PECM1_r", ("PECM1", "r")),
+        ("DELT2_l", ("DELT2", "l")),
+        ("psoas", ("psoas", "c")),
+        ("rect_abd", ("rect_abd", "c")),
+        ("", ("", "c")),
+    ],
+)
 def test_parse_side(name, expected):
     assert ActionParser.parse_side(name) == expected
 
 
-@pytest.mark.parametrize(("gid", "base"), [
-    ("pectoralis_r", "pectoralis"),
-    ("hip_flexors_l", "hip_flexors"),
-    ("ercspn", "ercspn"),          # no side suffix
-    ("psoas_c", "psoas_c"),        # _c is not stripped (only _r/_l)
-])
+@pytest.mark.parametrize(
+    ("gid", "base"),
+    [
+        ("pectoralis_r", "pectoralis"),
+        ("hip_flexors_l", "hip_flexors"),
+        ("ercspn", "ercspn"),  # no side suffix
+        ("psoas_c", "psoas_c"),  # _c is not stripped (only _r/_l)
+    ],
+)
 def test_granule_base_from_group_id(gid, base):
     assert MuscleGrouping.granule_base_from_group_id(gid) == base
 
 
-@pytest.mark.parametrize(("gid", "side"), [
-    ("pectoralis_r", "r"),
-    ("hip_flexors_l", "l"),
-    ("ercspn", "c"),
-])
+@pytest.mark.parametrize(
+    ("gid", "side"),
+    [
+        ("pectoralis_r", "r"),
+        ("hip_flexors_l", "l"),
+        ("ercspn", "c"),
+    ],
+)
 def test_parse_side_from_group_id(gid, side):
     assert MuscleGrouping.parse_side_from_group_id(gid) == side
 
@@ -56,6 +66,7 @@ def test_parse_side_from_group_id(gid, side):
 #          Action signatures           #
 ########################################
 
+
 def test_build_action_signatures():
     ap = helpers.make_action_parser()
     assert len(ap.action_signatures) == len(helpers.MUSCLE_NAMES)
@@ -63,7 +74,9 @@ def test_build_action_signatures():
     # every signature: (base, side, "muscle", "activation")
     assert ap.action_signatures[0] == ("PECM1", "r", "muscle", "activation")
     for sig, muscle in zip(
-        ap.action_signatures, helpers.MUSCLE_NAMES, strict=False,
+        ap.action_signatures,
+        helpers.MUSCLE_NAMES,
+        strict=False,
     ):
         base, side = ActionParser.parse_side(muscle)
         assert sig == (base, side, "muscle", "activation")
@@ -73,41 +86,69 @@ def test_build_action_signatures():
 #             assign_group             #
 ########################################
 
+
 def test_assign_group_torso_regex():
     ap = helpers.make_action_parser()
     # regex match takes side suffix from the muscle
-    assert ap.assign_group(
-        "PECM1_r", ANATOMICAL_TORSO_REGEX_MAP, HYBRID_LIMB_MAP,
-    ) == "pectoralis_r"
-    assert ap.assign_group(
-        "DELT2_l", FUNCTIONAL_TORSO_REGEX_MAP, FUNCTIONAL_LIMB_MAP,
-    ) == "shoulder_abductors_l"
+    assert (
+        ap.assign_group(
+            "PECM1_r",
+            ANATOMICAL_TORSO_REGEX_MAP,
+            HYBRID_LIMB_MAP,
+        )
+        == "pectoralis_r"
+    )
+    assert (
+        ap.assign_group(
+            "DELT2_l",
+            FUNCTIONAL_TORSO_REGEX_MAP,
+            FUNCTIONAL_LIMB_MAP,
+        )
+        == "shoulder_abductors_l"
+    )
 
 
 def test_assign_group_limb_dict():
     ap = helpers.make_action_parser()
-    assert ap.assign_group(
-        "psoas_r", ANATOMICAL_TORSO_REGEX_MAP, HYBRID_LIMB_MAP,
-    ) == "hip_flexors_r"
+    assert (
+        ap.assign_group(
+            "psoas_r",
+            ANATOMICAL_TORSO_REGEX_MAP,
+            HYBRID_LIMB_MAP,
+        )
+        == "hip_flexors_r"
+    )
     # center muscle -> no side suffix
-    assert ap.assign_group(
-        "psoas", ANATOMICAL_TORSO_REGEX_MAP, HYBRID_LIMB_MAP,
-    ) == "hip_flexors"
+    assert (
+        ap.assign_group(
+            "psoas",
+            ANATOMICAL_TORSO_REGEX_MAP,
+            HYBRID_LIMB_MAP,
+        )
+        == "hip_flexors"
+    )
 
 
 def test_assign_group_singleton_fallback():
     ap = helpers.make_action_parser()
-    assert ap.assign_group(
-        "unknownmuscle_r", ANATOMICAL_TORSO_REGEX_MAP, {},
-        singleton_fallback=True,
-    ) == "unknownmuscle_r"
+    assert (
+        ap.assign_group(
+            "unknownmuscle_r",
+            ANATOMICAL_TORSO_REGEX_MAP,
+            {},
+            singleton_fallback=True,
+        )
+        == "unknownmuscle_r"
+    )
 
 
 def test_assign_group_valueerror_when_unmatched():
     ap = helpers.make_action_parser()
     with pytest.raises(ValueError, match="not matched by any"):
         ap.assign_group(
-            "totallyunknown_r", ANATOMICAL_TORSO_REGEX_MAP, {},
+            "totallyunknown_r",
+            ANATOMICAL_TORSO_REGEX_MAP,
+            {},
             singleton_fallback=False,
         )
 
@@ -115,6 +156,7 @@ def test_assign_group_valueerror_when_unmatched():
 ########################################
 #          Canonical granules          #
 ########################################
+
 
 def test_get_canonical_granules_dispatch():
     assert get_canonical_granules("anatomical") is CANONICAL_GRANULES_ANATOMICAL
@@ -144,6 +186,7 @@ def test_canonical_granule_contents():
 ########################################
 #           Muscle grouping            #
 ########################################
+
 
 @pytest.mark.parametrize("strategy", ["anatomical", "functional", "hybrid"])
 def test_get_muscle_grouping_matches_golden(strategy, goldens):

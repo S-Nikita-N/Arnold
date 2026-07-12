@@ -35,23 +35,41 @@ BODY_NAMES: list[str] = [
 # limb muscles.
 MUSCLE_NAMES: list[str] = [
     # torso fascicles (match ANATOMICAL/FUNCTIONAL torso regex)
-    "PECM1_r", "PECM2_r", "PECM3_r",
-    "DELT1_l", "DELT2_l", "DELT3_l",
-    "LAT1_r", "LAT2_r", "LAT3_r",
-    "glmax1_l", "glmax2_l", "glmax3_l",
+    "PECM1_r",
+    "PECM2_r",
+    "PECM3_r",
+    "DELT1_l",
+    "DELT2_l",
+    "DELT3_l",
+    "LAT1_r",
+    "LAT2_r",
+    "LAT3_r",
+    "glmax1_l",
+    "glmax2_l",
+    "glmax3_l",
     # limb muscles (match limb dict maps)
-    "psoas_r", "iliacus_r", "recfem_r",
-    "vaslat_l", "vasmed_l", "vasint_l",
-    "soleus_r", "gasmed_r", "tibant_r",
-    "TRIlong_l", "TRIlat_l", "BIClong_l",
+    "psoas_r",
+    "iliacus_r",
+    "recfem_r",
+    "vaslat_l",
+    "vasmed_l",
+    "vasint_l",
+    "soleus_r",
+    "gasmed_r",
+    "tibant_r",
+    "TRIlong_l",
+    "TRIlat_l",
+    "BIClong_l",
 ]
 
 # A muscle set that only works for the "anatomical" strategy (needs the
 # singleton fallback because these bases are not in any limb map).
 ANATOMICAL_ONLY_MUSCLE_NAMES: list[str] = [
-    "PECM1_r", "PECM2_r",
-    "somecustom_r", "somecustom_l",   # unknown -> singleton fallback
-    "another",                        # center, unknown -> singleton fallback
+    "PECM1_r",
+    "PECM2_r",
+    "somecustom_r",
+    "somecustom_l",  # unknown -> singleton fallback
+    "another",  # center, unknown -> singleton fallback
 ]
 
 PROPRIOCEPTIVE_INPUTS: list[str] = [

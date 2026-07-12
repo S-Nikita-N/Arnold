@@ -13,6 +13,7 @@ from arnold.memory import OBCMemory
 #              OBCMemory               #
 ########################################
 
+
 def _fill_memory():
     m = OBCMemory()
     n = 5

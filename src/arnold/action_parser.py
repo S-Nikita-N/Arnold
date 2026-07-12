@@ -743,7 +743,7 @@ class ActionParser:
             )
         raise ValueError(
             f"Unknown strategy: {strategy!r}. "
-            f"Supported: 'anatomical', 'functional', 'hybrid'."
+            f"Supported: 'anatomical', 'functional', 'hybrid'.",
         )
 
     def assign_group(
@@ -773,7 +773,7 @@ class ActionParser:
         raise ValueError(
             f"Muscle '{muscle_name}' (base='{base}') not matched by any "
             f"torso regex or limb map entry. Add it to the appropriate map "
-            f"or use singleton_fallback=True for anatomical strategy."
+            f"or use singleton_fallback=True for anatomical strategy.",
         )
 
     def granulate(
@@ -810,12 +810,12 @@ class ActionParser:
                 logger.warning(
                     f"[{strategy_name}] group '{group_id}' "
                     f"(granule='{g_base}') has no canonical definition. "
-                    f"Muscles: {groups[group_id]}"
+                    f"Muscles: {groups[group_id]}",
                 )
 
         logger.info(
             f"{strategy_name}: {len(self.muscle_names)} muscles -> "
-            f"{len(group_order)} groups"
+            f"{len(group_order)} groups",
         )
         return MuscleGrouping(
             groups=groups,

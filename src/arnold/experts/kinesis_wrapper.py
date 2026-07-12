@@ -217,7 +217,8 @@ class KinesisWrapper:
             if obs_t.dim() == 1:
                 obs_t = obs_t.unsqueeze(0)
             action = self.agent.policy_net.select_action(
-                obs_t, mean_action=True
+                obs_t,
+                mean_action=True,
             )[0]
             return action.cpu().numpy().squeeze()
 
@@ -231,7 +232,9 @@ class KinesisWrapper:
         невалидные значения.
         """
         action = np.clip(
-            action.astype(np.float32), self.actions_low, self.actions_high
+            action.astype(np.float32),
+            self.actions_low,
+            self.actions_high,
         )
         # rescale_actions(low, high, x): x * (high-low)/2 +
         # (high+low)/2 — для [-1,1] это id
@@ -244,7 +247,7 @@ class KinesisWrapper:
         Действия предварительно clip+rescale как у эксперта."""
         action = self.preprocess_actions(action)
         next_obs, reward, terminated, truncated, info = self.agent.env.step(
-            action
+            action,
         )
         info["r_body_pos"] = info["r_body_pos"][0]
         info["r_vel"] = info["r_vel"][0]

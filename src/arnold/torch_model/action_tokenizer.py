@@ -96,11 +96,13 @@ class ActionTokenizer(nn.Module):
         # Per-expert metadata: (granule_base, side) tuples instead of
         # string group_ids
         self.expert_groups: dict[
-            str, list[tuple[str, str]]
+            str,
+            list[tuple[str, str]],
         ] = {}  # [(base, side), ...]
         self.expert_group_sizes: dict[str, list[int]] = {}
         self.expert_muscle_sigs_grouped: dict[
-            str, list[tuple[str, ...]]
+            str,
+            list[tuple[str, ...]],
         ] = {}  # per-muscle sigs in grouped order
 
         self.build_grouping(groupings, action_signatures)
@@ -137,7 +139,7 @@ class ActionTokenizer(nn.Module):
                     else:
                         base = muscle_name
                     muscle_sigs_grouped.append(
-                        (base, side, "muscle", "activation")
+                        (base, side, "muscle", "activation"),
                     )
 
                 # Canonical head size
@@ -146,7 +148,7 @@ class ActionTokenizer(nn.Module):
                         f"granule_base '{granule_base}' contains "
                         f"'.' or '-' which are not allowed as "
                         f"nn.ModuleDict keys. Fix canonical granule "
-                        f"naming."
+                        f"naming.",
                     )
 
                 if granule_base not in head_output_dims:
@@ -178,7 +180,9 @@ class ActionTokenizer(nn.Module):
         self.build_group_muscle_maps()
 
     def build_select_idx(
-        self, granule_base: str, muscles: list[str]
+        self,
+        granule_base: str,
+        muscles: list[str],
     ) -> list[int]:
         """Строит select_idx: маппинг canonical positions → expert muscles."""
         if granule_base not in self.canonical_granules:
@@ -249,7 +253,7 @@ class ActionTokenizer(nn.Module):
 
             # valid_mask для vectorized scatter: [G, max_gs]
             valid_mask = torch.arange(max_group_size).unsqueeze(
-                0
+                0,
             ) < group_sizes_t.unsqueeze(1)
             scatter_tgt_idx = gather_idx[valid_mask]  # [A_total]
 
@@ -282,7 +286,7 @@ class ActionTokenizer(nn.Module):
 
                 # Pre-compute float attention mask: [n_b, 1, seq_len, seq_len]
                 kv_mask = b_pad.unsqueeze(1).unsqueeze(
-                    2
+                    2,
                 )  # [n_b, 1, 1, seq_len]
                 q_mask = b_pad.unsqueeze(1).unsqueeze(3)  # [n_b, 1, seq_len, 1]
                 b_attn_mask = torch.where(
@@ -292,30 +296,37 @@ class ActionTokenizer(nn.Module):
                 )
 
                 self.register_buffer(
-                    f"gm_bkt_{expert_name}_{bucket_idx}_gidx", g_indices
+                    f"gm_bkt_{expert_name}_{bucket_idx}_gidx",
+                    g_indices,
                 )
                 self.register_buffer(
-                    f"gm_bkt_{expert_name}_{bucket_idx}_gather", b_gather
+                    f"gm_bkt_{expert_name}_{bucket_idx}_gather",
+                    b_gather,
                 )
                 self.register_buffer(
-                    f"gm_bkt_{expert_name}_{bucket_idx}_pad", b_pad
+                    f"gm_bkt_{expert_name}_{bucket_idx}_pad",
+                    b_pad,
                 )
                 self.register_buffer(
-                    f"gm_bkt_{expert_name}_{bucket_idx}_attn", b_attn_mask
+                    f"gm_bkt_{expert_name}_{bucket_idx}_attn",
+                    b_attn_mask,
                 )
                 bucket_idx += 1
 
             self.register_buffer(f"gm_sizes_{expert_name}", group_sizes_t)
             self.register_buffer(f"gm_valid_mask_{expert_name}", valid_mask)
             self.register_buffer(
-                f"gm_scatter_tgt_{expert_name}", scatter_tgt_idx
+                f"gm_scatter_tgt_{expert_name}",
+                scatter_tgt_idx,
             )
 
             # Store bucket count and max sizes for reconstruction
             self._gm_bucket_counts = getattr(self, "_gm_bucket_counts", {})
             self._gm_bucket_counts[expert_name] = bucket_idx
             self._gm_bucket_max_sizes = getattr(
-                self, "_gm_bucket_max_sizes", {}
+                self,
+                "_gm_bucket_max_sizes",
+                {},
             )
             self._gm_bucket_max_sizes[expert_name] = [
                 max(sizes[g] for g in bucket_groups[thr])
@@ -326,7 +337,7 @@ class ActionTokenizer(nn.Module):
             logger.info(
                 f"  GroupMuscleMap [{expert_name}]: {n_groups} groups, "
                 f"{bucket_idx} buckets "
-                f"(sizes: {[len(bucket_groups[t]) for t in bucket_thresholds if t in bucket_groups]})"  # noqa: E501
+                f"(sizes: {[len(bucket_groups[t]) for t in bucket_thresholds if t in bucket_groups]})",  # noqa: E501
             )
 
     def get_group_muscle_map(self, expert_name: str) -> GroupMuscleMap:
@@ -340,15 +351,17 @@ class ActionTokenizer(nn.Module):
             buckets.append(
                 SizeBucket(
                     group_indices=getattr(
-                        self, f"gm_bkt_{expert_name}_{i}_gidx"
+                        self,
+                        f"gm_bkt_{expert_name}_{i}_gidx",
                     ),
                     max_size=max_sizes[i],
                     gather_idx=getattr(
-                        self, f"gm_bkt_{expert_name}_{i}_gather"
+                        self,
+                        f"gm_bkt_{expert_name}_{i}_gather",
                     ),
                     pad_mask=getattr(self, f"gm_bkt_{expert_name}_{i}_pad"),
                     attn_mask=getattr(self, f"gm_bkt_{expert_name}_{i}_attn"),
-                )
+                ),
             )
 
         return GroupMuscleMap(
@@ -369,20 +382,20 @@ class ActionTokenizer(nn.Module):
                 f"ActionTokenizer [{expert_name}]: "
                 f"{grouping.n_muscles} muscles -> {grouping.n_groups} groups "
                 f"(sizes: min={min(sizes)}, max={max(sizes)}, "
-                f"mean={sum(sizes) / len(sizes):.1f})"
+                f"mean={sum(sizes) / len(sizes):.1f})",
             )
             canonical_sizes = [
                 len(self.canonical_granules[base])
                 if base in self.canonical_granules
                 else sizes[i]
                 for i, (base, _side) in enumerate(
-                    self.expert_groups[expert_name]
+                    self.expert_groups[expert_name],
                 )
             ]
             logger.info(
                 f"  Canonical head sizes: min={min(canonical_sizes)}, "
                 f"max={max(canonical_sizes)}, "
-                f"total_params={sum(canonical_sizes) * self.embed_dim}"
+                f"total_params={sum(canonical_sizes) * self.embed_dim}",
             )
 
     def get_group_signatures(self, expert_name: str) -> list[tuple[str, ...]]:
@@ -422,7 +435,7 @@ class ActionTokenizer(nn.Module):
         hidden_parts: list[torch.Tensor] = []
 
         for g_idx, ((granule_base, _side), _n_expert_muscles) in enumerate(
-            zip(group_signatures, group_sizes, strict=False)
+            zip(group_signatures, group_sizes, strict=False),
         ):
             # Project in actions
             head = self.expand_heads[granule_base]
@@ -432,14 +445,15 @@ class ActionTokenizer(nn.Module):
             # Select expert's muscles from canonical positions
             select_idx = getattr(self, f"select_{expert_name}_{g_idx}")
             muscle_means = canonical_means[
-                :, select_idx
+                :,
+                select_idx,
             ]  # [B, n_expert_muscles]
             mean_parts.append(muscle_means)
 
             # Hidden: per-muscle hidden states для covariance
             W_norm = F.normalize(head.weight, dim=-1)  # [n_canonical, D]
             canonical_h = g_emb.unsqueeze(1) * W_norm.unsqueeze(
-                0
+                0,
             )  # [B, n_canonical, D]
             muscle_h = canonical_h[:, select_idx]  # [B, n_expert_muscles, D]
             hidden_parts.append(muscle_h * (D**0.5))

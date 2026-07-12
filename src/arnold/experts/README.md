@@ -68,7 +68,7 @@ python src/utils/download_model.py --repo_id amathislab/kinesis-target-goal-reac
 ```bash
 sed -i '' "s/torch.load(checkpoint_path, map_location=self.device)/torch.load(checkpoint_path, map_location=self.device, weights_only=False)/" src/agents/agent_humanoid.py
 
-sed -i '' \  
+sed -i '' \
    -e 's/mjv_makeConnector/mjv_connector/' \
    -e 's/point1\[0], point1\[1], point1\[2]/point1/' \
    -e 's/point2\[0], point2\[1], point2\[2]/point2/' \

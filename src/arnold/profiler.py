@@ -220,7 +220,8 @@ class Profiler:
                 entry["sum_mem_delta"] += rec["mem_delta"]
                 entry["sum_mem_after"] += rec["mem_after"]
                 entry["sum_mem_peak"] = max(
-                    entry["sum_mem_peak"], rec["mem_peak"]
+                    entry["sum_mem_peak"],
+                    rec["mem_peak"],
                 )
                 entry["count_mem"] += 1
 
@@ -243,7 +244,7 @@ class Profiler:
                     if e["count_mem"]
                     else None,
                     "peak_mem": e["sum_mem_peak"] if e["count_mem"] else None,
-                }
+                },
             )
         return result
 
@@ -402,7 +403,7 @@ class Profiler:
                 f"  {leader}"
                 f" {delta_str:>{col_widths[0]}}"
                 f" {cur_str:>{col_widths[1]}}"
-                f" {peak_str:>{col_widths[2]}}"
+                f" {peak_str:>{col_widths[2]}}",
             )
 
         lines.append(sep)

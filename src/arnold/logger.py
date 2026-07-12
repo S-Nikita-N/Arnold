@@ -87,10 +87,12 @@ class OBCLogger:
         self.num_episodes += 1
 
         self.min_episode_reward = min(
-            self.min_episode_reward, self.episode_reward
+            self.min_episode_reward,
+            self.episode_reward,
         )
         self.max_episode_reward = max(
-            self.max_episode_reward, self.episode_reward
+            self.max_episode_reward,
+            self.episode_reward,
         )
 
         self.episode_reward = 0.0
@@ -187,10 +189,12 @@ class OBCLogger:
             merged.min_reward = min(merged.min_reward, lg.min_reward)
             merged.max_reward = max(merged.max_reward, lg.max_reward)
             merged.min_episode_reward = min(
-                merged.min_episode_reward, lg.min_episode_reward
+                merged.min_episode_reward,
+                lg.min_episode_reward,
             )
             merged.max_episode_reward = max(
-                merged.max_episode_reward, lg.max_episode_reward
+                merged.max_episode_reward,
+                lg.max_episode_reward,
             )
 
             merged.episode_rewards.extend(lg.episode_rewards)
@@ -213,7 +217,7 @@ class OBCLogger:
                 f"{np.mean(v):.3f}"
                 for k, v in self.info_dict.items()
                 if len(v) > 0
-            ]
+            ],
         )
 
         return (

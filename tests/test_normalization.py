@@ -15,6 +15,7 @@ SIGS = [("a", "b"), ("c", "d"), ("e", "f")]
 #            Normalization             #
 ########################################
 
+
 def _build_and_fill():
     norm = SignatureNormalizerModule()
     torch.manual_seed(104)
@@ -44,7 +45,8 @@ def test_welford_stats_golden(goldens):
 def test_normalize_golden(goldens_npz):
     norm = _build_and_fill()
     test_vals = torch.arange(
-        3 * helpers.HISTORY_LEN, dtype=torch.float32
+        3 * helpers.HISTORY_LEN,
+        dtype=torch.float32,
     ).reshape(1, 3, helpers.HISTORY_LEN)
     out = norm.normalize(SIGS, test_vals)
     assert out.shape == test_vals.shape
@@ -68,7 +70,8 @@ def test_normalize_unknown_signatures_passthrough():
 def test_normalize_matches_manual_formula():
     norm = _build_and_fill()
     vals = torch.arange(
-        3 * helpers.HISTORY_LEN, dtype=torch.float32
+        3 * helpers.HISTORY_LEN,
+        dtype=torch.float32,
     ).reshape(1, 3, helpers.HISTORY_LEN)
     out = norm.normalize(SIGS, vals)
     keys = [SignatureNormalizerModule._sig_key(s) for s in SIGS]
@@ -117,8 +120,10 @@ def test_extra_state_roundtrip():
         assert torch.allclose(torch.as_tensor(v1), torch.as_tensor(v2))
     # normalized output identical after roundtrip
     vals = torch.arange(
-        3 * helpers.HISTORY_LEN, dtype=torch.float32
+        3 * helpers.HISTORY_LEN,
+        dtype=torch.float32,
     ).reshape(1, 3, helpers.HISTORY_LEN)
     assert torch.allclose(
-        norm.normalize(SIGS, vals), norm2.normalize(SIGS, vals),
+        norm.normalize(SIGS, vals),
+        norm2.normalize(SIGS, vals),
     )

@@ -13,6 +13,7 @@ from arnold.observation_parser import BodyGroup, ObservationParser
 #          ObservationParser           #
 ########################################
 
+
 def test_parse_side():
     op = helpers.make_observation_parser()
     assert op._parse_side("femur_r") == ("femur", "r")
@@ -50,11 +51,14 @@ def test_specific_signatures():
     assert sigs[4] == ("root", "c", "tilt", "qy")
 
 
-@pytest.mark.parametrize(("granularity", "key"), [
-    ("scalar", "obs_groups_scalar"),
-    ("per_spec", "obs_groups_per_spec"),
-    ("per_body", "obs_groups_per_body"),
-])
+@pytest.mark.parametrize(
+    ("granularity", "key"),
+    [
+        ("scalar", "obs_groups_scalar"),
+        ("per_spec", "obs_groups_per_spec"),
+        ("per_body", "obs_groups_per_body"),
+    ],
+)
 def test_body_groups_counts(granularity, key, goldens):
     op = helpers.make_observation_parser()
     groups = op.get_body_groups(granularity)

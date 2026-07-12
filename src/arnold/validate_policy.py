@@ -95,7 +95,7 @@ def validate_vectorized(cfg: DictConfig) -> dict:
             if wrapper is None:
                 raise ValueError(
                     f"No valid wrapper for expert '{expert_name}'. "
-                    f"Is run.eval_frequency > 0?"
+                    f"Is run.eval_frequency > 0?",
                 )
             metrics = trainer._evaluate_expert_vectorized(
                 expert_name,
@@ -123,7 +123,7 @@ def _print_summary(all_metrics: dict) -> None:
             print(
                 f"    {k:30s} = {v:.4f}"
                 if isinstance(v, float)
-                else f"    {k:30s} = {v}"
+                else f"    {k:30s} = {v}",
             )
     print("=" * 60)
 
@@ -148,11 +148,13 @@ def _create_policy(cfg, expert, parser):
         from arnold.torch_model.transformer_policy import TransformerPolicy
 
         transformer_cfg = OmegaConf.to_container(
-            cfg.learning.transformer, resolve=True
+            cfg.learning.transformer,
+            resolve=True,
         )
         action_granulation = transformer_cfg.pop("action_granulation", "none")
         action_decoder_layers = transformer_cfg.pop(
-            "action_decoder_layers", None
+            "action_decoder_layers",
+            None,
         )
 
         expert_config = list(cfg.run.experts.values())[0]
@@ -165,7 +167,9 @@ def _create_policy(cfg, expert, parser):
         if action_granulation != "none":
             ap = ActionParser.from_env(expert.env)
             action_groupings = {
-                expert_name: ap.get_muscle_grouping(strategy=action_granulation)
+                expert_name: ap.get_muscle_grouping(
+                    strategy=action_granulation,
+                ),
             }
             action_sigs_by_expert = {expert_name: ap.action_signatures}
 
@@ -215,21 +219,23 @@ def _create_policy(cfg, expert, parser):
 
     raise ValueError(
         f"Unknown policy: {policy_type}. "
-        f"Supported: transformer, lattice, moe, gate_moe"
+        f"Supported: transformer, lattice, moe, gate_moe",
     )
 
 
 def _load_policy(cfg, checkpoint_path, device, expert, parser):
     logger.info(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(
-        checkpoint_path, map_location=device, weights_only=False
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
     )
 
     policy = _create_policy(cfg, expert, parser)
 
     policy_state = checkpoint["policy"]
     if policy_state and next(iter(policy_state.keys()), "").startswith(
-        "module."
+        "module.",
     ):
         policy_state = {
             k.replace("module.", "", 1): v for k, v in policy_state.items()
@@ -239,7 +245,7 @@ def _load_policy(cfg, checkpoint_path, device, expert, parser):
         policy.load_state_dict(policy_state)
     except RuntimeError as e:
         logger.warning(
-            f"Strict load failed: {e}; retrying without size-mismatched keys"
+            f"Strict load failed: {e}; retrying without size-mismatched keys",
         )
         model_state = policy.state_dict()
         filtered = {}
@@ -260,7 +266,7 @@ def _load_policy(cfg, checkpoint_path, device, expert, parser):
     epoch = checkpoint.get("epoch", "?")
     logger.info(
         f"Policy loaded ({cfg.learning.policy}). "
-        f"Epoch: {epoch}, parameters: {n_params:,}"
+        f"Epoch: {epoch}, parameters: {n_params:,}",
     )
     return policy
 
@@ -283,7 +289,7 @@ def validate_sequential(cfg: DictConfig) -> dict:
 
     env_mode = run.get("mode", "valid")
     logger.info(
-        f"Loading expert environment (mode={env_mode}, headless=False)..."
+        f"Loading expert environment (mode={env_mode}, headless=False)...",
     )
     expert = create_expert_wrapper(
         expert_config,
@@ -292,7 +298,7 @@ def validate_sequential(cfg: DictConfig) -> dict:
     )
     logger.info(
         f"Expert loaded. Obs dim: {expert.obs_dim}, "
-        f"Action dim: {expert.action_dim}"
+        f"Action dim: {expert.action_dim}",
     )
 
     parser = ObservationParser.from_env(expert.env, history_len=history_len)
@@ -352,12 +358,12 @@ def validate_sequential(cfg: DictConfig) -> dict:
                 if expert.has_expert:
                     expert_action = expert.get_expert_action(obs)
                     step_im_losses.append(
-                        float(((action_np - expert_action) ** 2).mean())
+                        float(((action_np - expert_action) ** 2).mean()),
                     )
 
                 with profiler.section("env_step"):
                     next_obs, reward, terminated, truncated, info = expert.step(
-                        action_np
+                        action_np,
                     )
                 done = terminated or truncated
 
@@ -375,7 +381,7 @@ def validate_sequential(cfg: DictConfig) -> dict:
                         episode_mpjpes.append(float(info["mpjpe"]))
                     if "frame_coverage" in info:
                         episode_frame_coverages.append(
-                            float(info["frame_coverage"])
+                            float(info["frame_coverage"]),
                         )
                     if "success" in info:
                         episode_successes.append(float(info["success"]))
@@ -409,21 +415,21 @@ def validate_sequential(cfg: DictConfig) -> dict:
             "eval/mean_length": float(np.mean(episode_lengths))
             if episode_lengths
             else 0.0,
-        }
+        },
     }
     if episode_imitation_losses:
         metrics[expert_name]["eval/imitation_loss"] = float(
-            np.mean(episode_imitation_losses)
+            np.mean(episode_imitation_losses),
         )
     if episode_mpjpes:
         metrics[expert_name]["eval/mpjpe"] = float(np.mean(episode_mpjpes))
     if episode_frame_coverages:
         metrics[expert_name]["eval/frame_coverage"] = float(
-            np.mean(episode_frame_coverages)
+            np.mean(episode_frame_coverages),
         )
     if episode_successes:
         metrics[expert_name]["eval/success_rate"] = float(
-            np.mean(episode_successes)
+            np.mean(episode_successes),
         )
 
     _print_summary(metrics)
@@ -442,7 +448,7 @@ def validate(cfg: DictConfig) -> dict:
         raise ValueError(
             "run.checkpoint is required: "
             "python -m arnold.validate_policy run=validate "
-            "run.checkpoint=path/to/model.pth"
+            "run.checkpoint=path/to/model.pth",
         )
 
     headless = bool(run.headless)

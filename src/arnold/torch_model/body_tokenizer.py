@@ -67,7 +67,8 @@ class BodyTokenizer(nn.Module):
         for expert_name in self.expert_names:
             expert_groups = groups_by_expert[expert_name]
             sorted_groups = sorted(
-                expert_groups, key=lambda g: (g.type, g.name, g.side)
+                expert_groups,
+                key=lambda g: (g.type, g.name, g.side),
             )
             self._expert_group_signatures[expert_name] = [
                 g.signature for g in sorted_groups
@@ -92,7 +93,7 @@ class BodyTokenizer(nn.Module):
                             f"got {n_features} "
                             f"(expert '{expert_name}'). "
                             f"Experts must share the same observation "
-                            f"structure per type."
+                            f"structure per type.",
                         )
                 else:
                     type_features[gtype] = n_features
@@ -134,6 +135,7 @@ class BodyTokenizer(nn.Module):
         return torch.cat(parts, dim=1)  # [B, n_groups, embed_dim]
 
     def get_group_signatures(
-        self, expert_name: str | None = None
+        self,
+        expert_name: str | None = None,
     ) -> list[tuple[str, ...]]:
         return self._expert_group_signatures[expert_name]

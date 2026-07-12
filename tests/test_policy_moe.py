@@ -21,13 +21,19 @@ LATENT_DIM = 4
 #              MoE policy              #
 ########################################
 
+
 def _make_sparse(seed=5, cov_from_experts=False):
     torch.manual_seed(seed)
     return MoELatticePolicy(
-        state_dim=8, action_dim=ACTION_DIM,
-        shared_units=(), shared_expert_units=(LATENT_DIM,),
-        num_experts=4, top_k=2, expert_units=(LATENT_DIM,),
-        gate_units=(8,), value_units=(8,),
+        state_dim=8,
+        action_dim=ACTION_DIM,
+        shared_units=(),
+        shared_expert_units=(LATENT_DIM,),
+        num_experts=4,
+        top_k=2,
+        expert_units=(LATENT_DIM,),
+        gate_units=(8,),
+        value_units=(8,),
         cov_from_experts=cov_from_experts,
     )
 
@@ -35,10 +41,15 @@ def _make_sparse(seed=5, cov_from_experts=False):
 def _make_soft(seed=6):
     torch.manual_seed(seed)
     return MoELatticePolicy(
-        state_dim=8, action_dim=ACTION_DIM,
-        shared_units=(), shared_expert_units=(LATENT_DIM,),
-        num_experts=4, top_k=4, expert_units=(LATENT_DIM,),
-        gate_units=(8,), value_units=(8,),
+        state_dim=8,
+        action_dim=ACTION_DIM,
+        shared_units=(),
+        shared_expert_units=(LATENT_DIM,),
+        num_experts=4,
+        top_k=4,
+        expert_units=(LATENT_DIM,),
+        gate_units=(8,),
+        value_units=(8,),
     )
 
 
@@ -51,19 +62,24 @@ def _fixed_inputs():
 
 def test_config_flags():
     sparse = _make_sparse()
-    assert sparse.soft_routing is False   # top_k != num_experts
+    assert sparse.soft_routing is False  # top_k != num_experts
     assert sparse.latent_dim == LATENT_DIM
     soft = _make_soft()
-    assert soft.soft_routing is True      # top_k == num_experts
+    assert soft.soft_routing is True  # top_k == num_experts
 
 
 def test_shared_expert_units_mismatch_raises():
     with pytest.raises(ValueError, match="latent_dim"):
         MoELatticePolicy(
-            state_dim=8, action_dim=ACTION_DIM,
-            shared_units=(), shared_expert_units=(4,),
-            num_experts=2, top_k=1, expert_units=(8,),   # 8 != 4
-            gate_units=(8,), value_units=(8,),
+            state_dim=8,
+            action_dim=ACTION_DIM,
+            shared_units=(),
+            shared_expert_units=(4,),
+            num_experts=2,
+            top_k=1,
+            expert_units=(8,),  # 8 != 4
+            gate_units=(8,),
+            value_units=(8,),
         )
 
 
@@ -73,10 +89,12 @@ def test_compute_sparse_balance_loss_golden(goldens):
     loss, stats = sparse.compute_sparse_balance_loss(top_k_indices, gate_probs)
     assert loss.shape == (1,)
     assert float(loss.item()) == pytest.approx(
-        goldens["moe_sparse_lb"], rel=1e-5,
+        goldens["moe_sparse_lb"],
+        rel=1e-5,
     )
     assert stats["lb_total"] == pytest.approx(
-        goldens["moe_sparse_lb"], rel=1e-5,
+        goldens["moe_sparse_lb"],
+        rel=1e-5,
     )
 
 
@@ -95,7 +113,8 @@ def test_compute_cov_factor_shared_only_golden(goldens, goldens_npz):
     top_k_indices, _ = _fixed_inputs()
     top_k_weights = torch.tensor([[0.6, 0.4], [0.7, 0.3], [0.5, 0.5]])
     cov_f, diag_std, latent_std = sparse._compute_cov_factor(
-        top_k_indices, top_k_weights,
+        top_k_indices,
+        top_k_weights,
     )
     # shared-only path: cov_factor is [A, L] (no batch dim)
     assert list(cov_f.shape) == goldens["moe_cov_shared_shape"]

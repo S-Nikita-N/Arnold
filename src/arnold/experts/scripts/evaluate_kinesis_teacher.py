@@ -181,7 +181,7 @@ class _Experts(nn.Module):
                     _RunningNorm(OBS_DIM),
                     _MLP(OBS_DIM, EXPERT_UNITS, ACTIVATION),
                     nn.Linear(EXPERT_UNITS[-1], ACTION_DIM),
-                )
+                ),
             )
 
 
@@ -191,7 +191,12 @@ class _Experts(nn.Module):
 
 
 def _compute_imitation_obs(
-    root_pos, root_rot, body_pos, body_vel, ref_body_pos, ref_body_vel
+    root_pos,
+    root_rot,
+    body_pos,
+    body_vel,
+    ref_body_pos,
+    ref_body_vel,
 ):
     """Kinesis-compatible imitation observations (no muscle features).
 
@@ -244,7 +249,8 @@ class KinesisObservationAdapter:
         )
 
         self.tracked_mh_ids = np.array(
-            [mh.index(name) for name in KINESIS_TRACKED_BODIES], dtype=np.intp
+            [mh.index(name) for name in KINESIS_TRACKED_BODIES],
+            dtype=np.intp,
         )
 
     def build_obs(self, env) -> np.ndarray:
@@ -261,7 +267,10 @@ class KinesisObservationAdapter:
         body_ang = ang_all[idx][None]
 
         obs_dict = compute_self_observations(
-            body_pos, body_rot, body_vel, body_ang
+            body_pos,
+            body_rot,
+            body_vel,
+            body_ang,
         )
 
         q = env.mj_data.qpos
@@ -337,7 +346,9 @@ class KinesisTeacher(nn.Module):
         self.experts = _Experts()
 
         ckpt = torch.load(
-            checkpoint_path, map_location=device, weights_only=True
+            checkpoint_path,
+            map_location=device,
+            weights_only=True,
         )
         self.load_state_dict(ckpt["policy"], strict=True)
         logger.info(
@@ -359,7 +370,7 @@ class KinesisTeacher(nn.Module):
                 [
                     torch.arange(210, 290, dtype=torch.long),
                     torch.arange(0, 210, dtype=torch.long),
-                ]
+                ],
             ),
         )
 
@@ -369,7 +380,8 @@ class KinesisTeacher(nn.Module):
 
     @torch.no_grad()
     def forward_batch(
-        self, obs: torch.Tensor
+        self,
+        obs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Batched MoE inference.
 
@@ -464,7 +476,7 @@ def eval_worker(
     def _compute_frame_metrics():
         """Per-tracked-body position errors for current frame."""
         ref_state = env.get_state_from_motionlib_cache(
-            env.cur_t * env.dt + env._motion_start_time
+            env.cur_t * env.dt + env._motion_start_time,
         )
         ref_pos = ref_state["xpos"][0, tracked_ids]
         sim_pos = env.get_body_xpos()[tracked_ids]
@@ -491,7 +503,7 @@ def eval_worker(
             ep_actions.append(action_np.copy())
 
             next_obs, reward, terminated, truncated, info = wrapper.step(
-                action_np
+                action_np,
             )
 
             frame_met = _compute_frame_metrics()
@@ -507,17 +519,18 @@ def eval_worker(
                             "mpjpe": float(info.get("mpjpe", 0.0)),
                             "max_mpjpe": float(info.get("max_mpjpe", 0.0)),
                             "frame_coverage": float(
-                                info.get("frame_coverage", 0.0)
+                                info.get("frame_coverage", 0.0),
                             ),
                             "frame_metrics": ep_frame_metrics.copy(),
                             "trajectory": {
                                 "obs": np.array(ep_env_obs, dtype=np.float32),
                                 "actions": np.array(
-                                    ep_actions, dtype=np.float32
+                                    ep_actions,
+                                    dtype=np.float32,
                                 ),
                             },
                         },
-                    )
+                    ),
                 )
                 if not _load_next():
                     return
@@ -603,7 +616,8 @@ def run_eval(args):
         wh = _WH()
         wh.obs_buf = torch.zeros(OBS_DIM, dtype=torch.float32).share_memory_()
         wh.action_buf = torch.zeros(
-            MYOHUMAN_ACTION_DIM, dtype=torch.float32
+            MYOHUMAN_ACTION_DIM,
+            dtype=torch.float32,
         ).share_memory_()
         wh.obs_ready = fork_ctx.Event()
         wh.action_ready = fork_ctx.Event()
@@ -662,7 +676,7 @@ def run_eval(args):
                 continue
 
             batch_obs = torch.stack([wh.obs_buf.clone() for wh in active]).to(
-                device
+                device,
             )
             actions_mh, _ = teacher.forward_batch(batch_obs)
             actions_cpu = actions_mh.cpu()
@@ -724,7 +738,7 @@ def run_eval(args):
                 "max_mpjpe": r["max_mpjpe"],
                 "frame_coverage": r["frame_coverage"],
                 "frame_metrics": r["frame_metrics"],
-            }
+            },
         )
 
     json_path = out_dir / f"{args.split}.json"
@@ -784,7 +798,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument(
-        "--split", type=str, default="test", choices=["train", "test"]
+        "--split",
+        type=str,
+        default="test",
+        choices=["train", "test"],
     )
     parser.add_argument(
         "--output-dir",

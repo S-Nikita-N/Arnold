@@ -480,7 +480,7 @@ class SensorimotorVocabulary(nn.Module):
                         f"Duplicate tokens found! This will cause "
                         f"embedding collisions:\n"
                         f"Duplicated token: {token}\n"
-                        f"Please ensure all token names are unique."
+                        f"Please ensure all token names are unique.",
                     )
                 else:
                     seen.add(token)
@@ -490,7 +490,8 @@ class SensorimotorVocabulary(nn.Module):
         return all_tokens, token_to_idx
 
     def get_embedding(
-        self, tokens: tuple[str, ...]
+        self,
+        tokens: tuple[str, ...],
     ) -> torch.Tensor:  # [emb_dim]
         """
         Получает композитный эмбеддинг как сумму эмбеддингов токенов.
@@ -518,7 +519,8 @@ class SensorimotorVocabulary(nn.Module):
         return token_embeddings.sum(dim=0)
 
     def get_embedding_batch(
-        self, tokens_batch: list[tuple[str, ...]]
+        self,
+        tokens_batch: list[tuple[str, ...]],
     ) -> torch.Tensor:  # [batch_size, emb_dim]
         """
         Получает батч композитных эмбеддингов.
@@ -560,16 +562,20 @@ class SensorimotorVocabulary(nn.Module):
                 for token in tokens:
                     if token not in self.token_to_idx:
                         raise KeyError(
-                            f"Token '{token}' not found in vocabulary."
+                            f"Token '{token}' not found in vocabulary.",
                         )
                     all_indices.append(self.token_to_idx[token])
                     segment_ids.append(seg_id)
 
             idx_tensor = torch.tensor(
-                all_indices, device=device, dtype=torch.long
+                all_indices,
+                device=device,
+                dtype=torch.long,
             )
             seg_tensor = torch.tensor(
-                segment_ids, device=device, dtype=torch.long
+                segment_ids,
+                device=device,
+                dtype=torch.long,
             )
             n_segments = len(tokens_batch)
 
@@ -583,10 +589,15 @@ class SensorimotorVocabulary(nn.Module):
 
         # Segment sum: суммируем эмбеддинги по segment_ids
         result = torch.zeros(
-            n_segments, self.embed_dim, device=device, dtype=all_embs.dtype
+            n_segments,
+            self.embed_dim,
+            device=device,
+            dtype=all_embs.dtype,
         )
         result.scatter_add_(
-            0, seg_tensor.unsqueeze(1).expand(-1, self.embed_dim), all_embs
+            0,
+            seg_tensor.unsqueeze(1).expand(-1, self.embed_dim),
+            all_embs,
         )
 
         return result

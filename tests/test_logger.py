@@ -14,6 +14,7 @@ from arnold.logger import OBCLogger
 #              OBCLogger               #
 ########################################
 
+
 def _make_logged():
     lg = OBCLogger()
     lg.step(1.0, info={"comp_a": 0.5, "done": True})
@@ -46,9 +47,9 @@ def test_info_dict_bool_and_numeric():
 
 def test_properties():
     lg = _make_logged()
-    assert lg.avg_episode_reward == 3.0          # 6/2
-    assert lg.avg_episode_len == 1.5             # 3/2
-    assert lg.avg_reward == 2.0                  # 6/3
+    assert lg.avg_episode_reward == 3.0  # 6/2
+    assert lg.avg_episode_len == 1.5  # 3/2
+    assert lg.avg_reward == 2.0  # 6/3
 
 
 def test_properties_empty():
@@ -62,8 +63,12 @@ def test_total_loss_sum():
     lg = OBCLogger()
     lg.reset_losses()
     lg.set_update_losses(
-        ppo_loss=1.0, imitation_loss=2.0, value_loss=3.0,
-        entropy_loss=4.0, load_balance_loss=5.0, mean_penalty_loss=6.0,
+        ppo_loss=1.0,
+        imitation_loss=2.0,
+        value_loss=3.0,
+        entropy_loss=4.0,
+        load_balance_loss=5.0,
+        mean_penalty_loss=6.0,
     )
     # total_loss sums all six loss components (ppo+im+val+ent+bal+mp)
     assert lg.total_loss == 21.0

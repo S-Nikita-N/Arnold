@@ -198,7 +198,11 @@ class WithinGroupLayer(nn.Module):
 
             # --- Self-attention with pre-computed mask ---
             qkv = self.qkv_proj(self.sa_norm(x)).reshape(
-                B * n_b, seq_len, 3, self.num_heads, head_dim
+                B * n_b,
+                seq_len,
+                3,
+                self.num_heads,
+                head_dim,
             )
             q, k, v = qkv.unbind(dim=2)
             q = q.transpose(1, 2)  # [B*n_b, H, seq_len, head_dim]
@@ -214,7 +218,11 @@ class WithinGroupLayer(nn.Module):
             )
 
             attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
             )
             attn_out = attn_out.transpose(1, 2).reshape(B * n_b, seq_len, D)
             x = x + self.out_proj(attn_out)
@@ -277,7 +285,7 @@ class HierarchicalActionDecoder(nn.Module):
                         ff_dim=ff_dim,
                         dropout=dropout,
                         cross_attention=cross_attn,
-                    )
+                    ),
                 )
             elif layer_type == "wg":
                 layers.append(
@@ -287,11 +295,11 @@ class HierarchicalActionDecoder(nn.Module):
                         ff_dim=ff_dim,
                         dropout=dropout,
                         cross_attention=cross_attn,
-                    )
+                    ),
                 )
             else:
                 raise ValueError(
-                    f"Unknown layer type: {layer_type!r} (use 'g2g' or 'wg')"
+                    f"Unknown layer type: {layer_type!r} (use 'g2g' or 'wg')",
                 )
 
         self.layers = nn.ModuleList(layers)
@@ -308,7 +316,7 @@ class HierarchicalActionDecoder(nn.Module):
         )
         logger.info(
             f"HierarchicalActionDecoder: {len(self.layers)} layers "
-            f"[{types_str}]"
+            f"[{types_str}]",
         )
 
     def forward(
@@ -439,7 +447,7 @@ class TransformerPolicy(nn.Module):
             )
             logger.info(
                 f"Action granulation enabled: strategy={action_granulation}, "
-                f"decoder queries reduced to group-level"
+                f"decoder queries reduced to group-level",
             )
         else:
             self.action_tokenizer = None
@@ -455,7 +463,9 @@ class TransformerPolicy(nn.Module):
         )
         encoder_norm = nn.LayerNorm(embed_dim)
         self.encoder = nn.TransformerEncoder(
-            encoder_layer, num_enc_layers, norm=encoder_norm
+            encoder_layer,
+            num_enc_layers,
+            norm=encoder_norm,
         )
 
         # Action decoder: hierarchical (if configured) or legacy uniform
@@ -497,7 +507,9 @@ class TransformerPolicy(nn.Module):
         )
         value_decoder_norm = nn.LayerNorm(embed_dim)
         self.value_decoder = nn.TransformerDecoder(
-            value_decoder_layer, num_val_dec_layers, norm=value_decoder_norm
+            value_decoder_layer,
+            num_val_dec_layers,
+            norm=value_decoder_norm,
         )
 
         self.action_mean_head = nn.Linear(embed_dim, 1)
@@ -583,7 +595,8 @@ class TransformerPolicy(nn.Module):
         # ── Body tokenizer ───────────────────────────────────────────
         with p.section("body_tokenizer"):
             sensory_emb = self.body_tokenizer.encode(
-                obs_timeseries, expert_name=expert_name
+                obs_timeseries,
+                expert_name=expert_name,
             )
 
         # ── Vocab embed obs ──────────────────────────────────────────
@@ -601,11 +614,13 @@ class TransformerPolicy(nn.Module):
         if self.action_tokenizer is not None:
             with p.section("vocab_embed_act_groups"):
                 act_group_sigs = self.action_tokenizer.get_group_signatures(
-                    expert_name
+                    expert_name,
                 )
                 group_query = self.vocab.get_embedding_batch(act_group_sigs)
                 group_query = group_query.unsqueeze(0).expand(
-                    batch_size, -1, -1
+                    batch_size,
+                    -1,
+                    -1,
                 )
 
             if self.hierarchical_decoder is not None:
@@ -614,19 +629,21 @@ class TransformerPolicy(nn.Module):
                     with p.section("vocab_embed_muscles"):
                         muscle_sigs = (
                             self.action_tokenizer.get_muscle_signatures(
-                                expert_name
+                                expert_name,
                             )
                         )
                         muscle_query = self.vocab.get_embedding_batch(
-                            muscle_sigs
+                            muscle_sigs,
                         )
                         muscle_query = muscle_query.unsqueeze(0).expand(
-                            batch_size, -1, -1
+                            batch_size,
+                            -1,
+                            -1,
                         )
 
                 with p.section("action_decoder"):
                     gm_map = self.action_tokenizer.get_group_muscle_map(
-                        expert_name
+                        expert_name,
                     )
                     group_out, muscle_out = self.hierarchical_decoder(
                         group_query,
@@ -638,7 +655,8 @@ class TransformerPolicy(nn.Module):
                 if muscle_out is not None:
                     with p.section("action_tokenizer"):
                         reorder_idx = getattr(
-                            self.action_tokenizer, f"reorder_idx_{expert_name}"
+                            self.action_tokenizer,
+                            f"reorder_idx_{expert_name}",
                         )
                         D = muscle_out.shape[-1]
                         action_out = torch.gather(
@@ -652,20 +670,24 @@ class TransformerPolicy(nn.Module):
                 else:
                     with p.section("action_tokenizer"):
                         mean, action_out = self.action_tokenizer.decode(
-                            group_out, expert_name
+                            group_out,
+                            expert_name,
                         )
             else:
                 with p.section("action_decoder"):
                     group_out = self.action_decoder(group_query, encoder_out)
                 with p.section("action_tokenizer"):
                     mean, action_out = self.action_tokenizer.decode(
-                        group_out, expert_name
+                        group_out,
+                        expert_name,
                     )
         else:
             with p.section("vocab_embed_act"):
                 action_query = self.vocab.get_embedding_batch(action_signatures)
                 action_query = action_query.unsqueeze(0).expand(
-                    batch_size, -1, -1
+                    batch_size,
+                    -1,
+                    -1,
                 )
             with p.section("action_decoder"):
                 action_out = self.action_decoder(action_query, encoder_out)
@@ -701,7 +723,7 @@ class TransformerPolicy(nn.Module):
 
                     if self.cov_mode == "action_out":
                         cov_factor = action_out * latent_std.unsqueeze(
-                            0
+                            0,
                         ).unsqueeze(0)
                         cov_factor = cov_factor / (self.latent_dim**0.5)
                     else:
@@ -758,7 +780,7 @@ class TransformerPolicy(nn.Module):
         else:
             if cov_factor is None:
                 raise ValueError(
-                    "return_std=False допустим только при deterministic=True"
+                    "return_std=False допустим только при deterministic=True",
                 )
             with p.section("dist_build"):
                 dist = self.build_action_dist(mean, cov_factor, diag_std)
