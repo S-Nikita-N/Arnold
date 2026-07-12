@@ -1,13 +1,13 @@
-# Arnold
+# MyoTrainer
 
 Обучаемый агент на базе On-Policy Behavior Cloning (OBC) и эксперта Kinesis (MyoLegs).
 
-> **Реализация и адаптация работы**
+> **За основу взята работа Arnold** (реализация и адаптация):
 > Chiappa A. S., An B., Simos M., Li C., Mathis A.
 > *Arnold: A Generalist Muscle Transformer Policy.*
 > 2025. [arXiv:2508.18066](https://arxiv.org/abs/2508.18066).
 >
-> Этот репозиторий — переработанная имплементация под задачу управления
+> MyoTrainer — переработанная имплементация Arnold под задачу управления
 > полнотелой моделью MyoHuman (338 мышечных актуаторов, имитация motion
 > capture траекторий из AMASS) с расширениями: иерархический декодер
 > действий, грануляции наблюдений и мышечных групп, дистилляция
@@ -34,8 +34,8 @@ git lfs install
 ### 2. Клонировать репозиторий с submodules и LFS
 
 ```bash
-git clone --recurse-submodules <URL-репозитория> arnold
-cd arnold
+git clone --recurse-submodules <URL-репозитория> MyoTrainer
+cd MyoTrainer
 git lfs pull
 ```
 
@@ -81,7 +81,7 @@ git lfs pull
 | Шаг | Команда |
 |-----|---------|
 | 1 | `git lfs install` (один раз) |
-| 2 | `git clone --recurse-submodules <url> arnold && cd arnold` |
+| 2 | `git clone --recurse-submodules <url> MyoTrainer && cd MyoTrainer` |
 | 3 | `git lfs pull` |
 | 4 | `./scripts/install.sh` |
 | 5 | `./scripts/setup_experts.sh` |
@@ -91,7 +91,7 @@ git lfs pull
 ## Структура
 
 - `cfg/` — конфиги Hydra (env, learning, run).
-- `src/arnold/` — код Arnold (policy, trainer, experts).
+- `src/arnold/` — код MyoTrainer (policy, trainer, experts).
 - `downloads/Kinesis_assets/` — ассеты для Kinesis (Git LFS).
 - `scripts/install.sh` — установка uv и зависимостей.
 - `scripts/setup_experts.sh` — патчи и подготовка данных экспертов.
