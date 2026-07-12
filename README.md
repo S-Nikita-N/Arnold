@@ -1,84 +1,45 @@
-# MyoTrainer — training muscle policies for whole-body motion imitation
+# MyoTrainer — a PPO harness for musculoskeletal muscle control
 
 [![CI](https://github.com/nikswir/MyoTrainer/actions/workflows/ci.yml/badge.svg)](https://github.com/nikswir/MyoTrainer/actions/workflows/ci.yml)
 
-MyoTrainer trains neural-network **muscle-control policies** that imitate human
-motion in the **[MyoHuman](https://github.com/nikswir/Myohuman)** environment —
-a whole-body musculoskeletal model with **338 Hill-type muscles** and
-**86 degrees of freedom**. It combines **PPO** reinforcement learning,
-**On-Policy Behavior Cloning (OBC)** distillation, a scalable **muscle
-transformer** architecture, and a curriculum that bootstraps whole-body control
-from an existing locomotion policy.
+MyoTrainer is a reinforcement-learning **training harness** for muscle-actuated
+musculoskeletal control. It provides a **PPO** training loop, **On-Policy
+Behavior Cloning (OBC)** distillation, and a set of **policy architectures**,
+wired to run out of the box against two environments: **Kinesis** (MyoLegs,
+lower body) and **[MyoHuman](https://github.com/nikswir/Myohuman)** (full body,
+338 muscles).
 
-> **MyoTrainer is the *trainer*.** The body model, imitation task and motion
-> data are provided by **[MyoHuman](https://github.com/nikswir/Myohuman)**,
-> which MyoTrainer consumes as a submodule. This repo is the algorithms and
-> network architectures that learn to act in it.
+> **MyoTrainer is the *trainer*.** The body model, task and motion data come
+> from **[MyoHuman](https://github.com/nikswir/Myohuman)** — this repo is the
+> algorithms and network architectures that learn to act in it.
 
-> **Built on Arnold.** The transformer policy is a reimplementation and
-> adaptation of
-> Chiappa, An, Simos, Li, Mathis — *Arnold: A Generalist Muscle Transformer
-> Policy*, 2025 ([arXiv:2508.18066](https://arxiv.org/abs/2508.18066)) — scaled
-> from MyoSuite's small models to the 338-muscle full-body MyoHuman, with a
-> hierarchical action decoder, observation/action granulation, a transformer
-> adaptation of LATTICE exploration, and a multi-stage training pipeline.
+> The muscle transformer is adapted from **Arnold** (Chiappa et al.,
+> [arXiv:2508.18066](https://arxiv.org/abs/2508.18066)).
 
-<!-- TODO: demo GIF of a trained expert imitating a reference clip -->
+<!-- TODO: demo GIF of a trained policy imitating a reference clip -->
 <p align="center">
   <em>Demo GIF — coming soon.</em>
 </p>
 
-## The idea
+## What it provides
 
-Learning to control 338 muscles **from scratch** is impractical: standard PPO —
-with either an MLP or a transformer policy — stalls in a *standing* local
-optimum (it tracks the arms but never commits to a step), and the transformer
-is also ~10× more expensive per epoch. MyoTrainer instead **transfers** an
-existing locomotion skill and grows it into whole-body control, then
-**distills** the result into a scalable generalist transformer.
+A config-driven ([Hydra](https://hydra.cc)) harness around a PPO training loop:
 
-### 1. Three-stage expert (curriculum)
-
-A single MLP actor is carried through three stages that progressively relax
-toward the full MyoHuman task, reusing the pretrained
-**[Kinesis](https://arxiv.org/abs/2503.14637)** (Simos et al., 2025) locomotion policy (290 leg+torso
-muscles):
-
-| Stage | Method | Arms | Result (SR / FC / MPJPE) |
-| ----- | ------ | ---- | ------------------------ |
-| 1 | **OBC** distill Kinesis into MyoHuman | frozen at zero, termination off | 0.08 / 0.35 / 0.104 m |
-| 2 | **PPO**, relaxed arm requirements | learned, soft termination & reward | 0.36 / 0.60 / 0.090 m |
-| 3 | **PPO**, full target task | full weight, 0.15 m termination | **0.45 / 0.68 / 0.061 m** |
-
-*SR = success rate, FC = frame coverage, MPJPE = mean per-joint position error.*
-
-### 2. Distill into a muscle transformer
-
-The Stage-3 MLP expert is distilled (again via OBC) into an **encoder–decoder
-transformer** whose tokens carry a **sensorimotor vocabulary** — each
-observation and muscle is described by role tokens (side, anatomical structure,
-signal type). To scale attention from 800+ sensory and 338 motor tokens, MyoTrainer
-**granulates** tokens:
-
-- **observation granulation** — `none` / by-specification / **by-body**;
-- **action granulation** — `none` / anatomical / functional / **hybrid**
-  (muscles grouped into ~30 granules by joint function and anatomy);
-- **hierarchical decoder** — group-to-group (G2G) attention blocks plus
-  within-group (WG) blocks and/or MLP **expansion heads** that unfold each
-  group token back into individual muscle activations;
-- **LATTICE** — latent time-correlated exploration adapted to the tokenized
-  decoder (direct or projected covariance factor).
-
-The strongest distillation configs use **by-body observations + functional/hybrid
-action granulation + a G2G+MLP decoder**; a `G2G×5 + WG×1` decoder is the
-cheapest per epoch. In the OBC setting, LATTICE gave no convergence gain.
-
-### 3. Ensemble (mixture of experts)
-
-Beyond the first expert, **hard-negative mining** yields specialists for the
-clips the current policy imitates worst, and a **gate network** (frozen experts
-+ trainable categorical router) combines them — the path toward a single
-generalist policy covering the whole motion set.
+- **Environments** — pluggable through expert wrappers: **Kinesis** (MyoLegs,
+  lower-body) and **[MyoHuman](https://github.com/nikswir/Myohuman)**
+  (full-body, 338 muscles).
+- **Algorithms** — **PPO** (with GAE) for on-policy RL and **On-Policy Behavior
+  Cloning (OBC)** for policy distillation; the two are mixed per expert through
+  loss weights.
+- **Policy architectures**
+  - **MLP** actor–critic with **LATTICE** latent time-correlated exploration;
+  - a **muscle transformer** — an encoder–decoder that tokenizes observations
+    and muscles through a *sensorimotor vocabulary*, with configurable
+    observation/action **granulation** and a hierarchical group-to-group /
+    within-group decoder;
+  - a **mixture-of-experts gate** that routes between frozen expert policies.
+- **Tooling** — hard-negative mining, policy validation & metrics, Weights &
+  Biases logging, a profiler, and multi-GPU (DataParallel) training.
 
 ## Setup
 
@@ -105,15 +66,15 @@ Already cloned without submodules?
 ## Usage
 
 Training is configured with [Hydra](https://hydra.cc) and driven through one
-entry point; experts are added as config groups.
+entry point; environments are added as expert config groups.
 
 ```bash
-# Stage 1 — OBC distillation from the Kinesis locomotion expert
+# OBC distillation from the Kinesis expert
 uv run python -m myotrainer.train_myotrainer \
     '+run/experts@run.experts.kin=kinesis' \
     exp_name=obc_kinesis
 
-# PPO directly in MyoHuman
+# PPO in MyoHuman
 uv run python -m myotrainer.train_myotrainer \
     '+run/experts@run.experts.myo=myohuman' \
     run.experts.myo.learning.ppo_weight=1.0 \
@@ -137,25 +98,20 @@ uv run python -m myotrainer.mine_negatives    # select worst-imitated clips
 
 ```text
 src/myotrainer/
-├── train_myotrainer.py    training entry point (single- & multi-expert)
-├── trainer.py             MyoTrainer: PPO + OBC loop, logging, checkpoints
-├── torch_model/
-│   ├── transformer_policy.py     encoder–decoder muscle transformer
-│   ├── policy_lattice.py         MLP policy with LATTICE exploration
-│   ├── policy_moe.py / policy_gate_moe.py   mixture-of-experts + gate router
-│   ├── sensorimotor_vocabulary.py, body_tokenizer.py, action_tokenizer.py
-│   └── sensory_encoder.py, normalization.py, mlp.py
-├── experts/               wrappers for Kinesis, MyoHuman, MyoKin + submodules
-├── observation_parser.py / action_parser.py   granulation / token layout
-├── mine_negatives.py, validate_policy.py       hard-negative mining, evaluation
-└── memory.py, profiler.py, logger.py, wandb_logger.py
-cfg/                       Hydra config (config.yaml, learning/, run/, run/experts/)
-downloads/Kinesis_assets/  SMPL, motion dicts, initial poses (Git LFS)
-scripts/                   install.sh, setup_experts.sh
-tests/                     characterization tests (+ stage-2 device gate)
+├── train_myotrainer.py   entry point — launches a PPO / OBC run
+├── trainer.py            training loop: rollouts, PPO update, OBC, checkpoints
+├── torch_model/          policy architectures — transformer, MLP+LATTICE, MoE gate, tokenizers
+├── experts/              environment wrappers — Kinesis (MyoLegs), MyoHuman
+├── observation_parser.py, action_parser.py   observation / action token layout
+├── mine_negatives.py, validate_policy.py      hard-negative mining, evaluation
+└── logger.py, wandb_logger.py, profiler.py, memory.py   logging & utilities
+cfg/                      Hydra config (config.yaml, learning/, run/, run/experts/)
+downloads/Kinesis_assets/ SMPL, motion dicts, initial poses (Git LFS)
+scripts/                  install.sh, setup_experts.sh
+tests/                    characterization tests (+ stage-2 device gate)
 ```
 
-Submodules: **Kinesis** and **MyoHuman** (the environment). More on experts:
+Submodules: **Kinesis** and **MyoHuman**. More on the environment wrappers:
 [src/myotrainer/experts/README.md](src/myotrainer/experts/README.md).
 
 ## How it relates to MyoHuman
@@ -163,8 +119,7 @@ Submodules: **Kinesis** and **MyoHuman** (the environment). More on experts:
 | | [MyoHuman](https://github.com/nikswir/Myohuman) | MyoTrainer (this repo) |
 | --- | --- | --- |
 | Role | the **environment** — body, task, data | the **trainer** — policies & algorithms |
-| Provides | `MyoHumanIm`, MJCF model, retargeted motions | muscle transformer, PPO / OBC pipeline, MoE |
-| Consumed as | Git submodule | — |
+| Provides | `MyoHumanIm`, MJCF model, retargeted motions | PPO / OBC harness, muscle transformer, MoE gate |
 
 ## References
 
@@ -172,8 +127,7 @@ Submodules: **Kinesis** and **MyoHuman** (the environment). More on experts:
   [arXiv:2508.18066](https://arxiv.org/abs/2508.18066).
 - **Kinesis** — Simos et al., *Reinforcement Learning-Based Motion Imitation
   for Physiologically Plausible Musculoskeletal Motor Control*, 2025,
-  [arXiv:2503.14637](https://arxiv.org/abs/2503.14637) — locomotion imitation +
-  hard-negative mining / MoE for a legs+torso musculoskeletal model.
+  [arXiv:2503.14637](https://arxiv.org/abs/2503.14637).
 - **LATTICE** — Chiappa et al., 2023 — latent time-correlated exploration.
 - **PPO** — Schulman et al., 2017. **DeepMimic** — Peng et al., 2018.
 - **MyoSuite** — Caggiano et al., 2022.
