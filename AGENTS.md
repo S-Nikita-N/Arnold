@@ -70,14 +70,19 @@ trusting the gate. Run all: `pre-commit run --all-files`. Run one:
 - **mypy** — runs over the typed `tools/`. Annotating the legacy `src/`
   (hundreds of implicit-Optional / attr-defined findings) is a follow-up.
 
-## Tests
+## Tests — two stages
 
-CPU-only, deterministic golden characterization tests over the parsers,
-tokenizers, models and trainer helpers — no wandb / network / GPU / submodule
-assets. Run on every commit and in CI. Regenerate goldens only on an intentional
-behavior change (`uv run python tests/golden/generate_goldens.py`).
+- **Stage 1 (default)** — CPU-only, deterministic golden characterization
+  tests over the parsers, tokenizers, policies and trainer helpers; no wandb /
+  network / GPU / submodule assets. Runs on every commit and in CI.
+- **Stage 2** — heavy/accelerator tests marked `@pytest.mark.stage2` (e.g.
+  device-agnosticism: policy forward on GPU vs CPU). They run **only** when a
+  CUDA/MPS accelerator is present, or when forced with `RUN_STAGE2=1`;
+  otherwise skipped. On a box with no accelerator they skip gracefully.
 
-Run: `pytest`.
+Run stage 1: `pytest`. Run stage 2 (needs a GPU): `RUN_STAGE2=1 pytest`.
+Regenerate goldens only on an intentional behavior change
+(`uv run python tests/golden/generate_goldens.py`).
 
 ## CI
 

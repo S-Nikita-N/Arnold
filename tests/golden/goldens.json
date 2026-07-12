@@ -425,6 +425,36 @@
     "task",
     "task_muscle"
   ],
+  "gm_cov": null,
+  "gm_diag_std": null,
+  "gm_latent_std": null,
+  "gm_mean_shape": [
+    2,
+    2
+  ],
+  "gm_value_shape": [
+    2,
+    1
+  ],
+  "lat_cov_shape": [
+    24,
+    8
+  ],
+  "lat_diag_std_shape": [
+    1,
+    24
+  ],
+  "lat_latent_std_shape": [
+    8
+  ],
+  "lat_mean_shape": [
+    2,
+    24
+  ],
+  "lat_value_shape": [
+    2,
+    1
+  ],
   "moe_cov_persample_shape": [
     3,
     6,
@@ -433,6 +463,28 @@
   "moe_cov_shared_shape": [
     6,
     4
+  ],
+  "moe_fwd_cov_shape": [
+    24,
+    8
+  ],
+  "moe_fwd_diag_std_shape": [
+    1,
+    24
+  ],
+  "moe_fwd_latent_std_shape": [
+    8
+  ],
+  "moe_fwd_lb_shape": [
+    1
+  ],
+  "moe_fwd_mean_shape": [
+    2,
+    24
+  ],
+  "moe_fwd_value_shape": [
+    2,
+    1
   ],
   "moe_soft_lb": 0.05595046654343605,
   "moe_soft_stats": {
@@ -527,6 +579,46 @@
       "diff_muscle_vel",
       24
     ]
+  ],
+  "tp_cov_shape": [
+    2,
+    24,
+    4
+  ],
+  "tp_diag_std_shape": [
+    2,
+    24
+  ],
+  "tp_latent_std_shape": [
+    4
+  ],
+  "tp_mean_shape": [
+    2,
+    24
+  ],
+  "tp_value_shape": [
+    2,
+    1
+  ],
+  "tpg_cov_shape": [
+    2,
+    24,
+    4
+  ],
+  "tpg_diag_std_shape": [
+    2,
+    24
+  ],
+  "tpg_latent_std_shape": [
+    4
+  ],
+  "tpg_mean_shape": [
+    2,
+    24
+  ],
+  "tpg_value_shape": [
+    2,
+    1
   ],
   "vocab_size": 362
 }

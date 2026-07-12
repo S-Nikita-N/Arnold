@@ -276,6 +276,40 @@ def main():
     goldens["moe_cov_persample_shape"] = list(cov_pf.shape)
     npz["moe_cov_persample"] = cov_pf.detach().numpy()
 
+    # -- Policy forward passes (lattice / moe / transformer / gate_moe) --
+    import tempfile
+
+    op2, ap2, obs = helpers.make_policy_io()
+    state_dim = op2.n_obs_elements
+    action_dim = len(ap2.action_signatures)
+    obs_sigs = op2.obs_signatures
+    act_sigs = ap2.action_signatures
+
+    def _dump(prefix, out):
+        names = ["mean", "cov", "diag_std", "value", "latent_std", "lb"]
+        for name, tensor in zip(names, out, strict=False):
+            if tensor is None:
+                goldens[f"{prefix}_{name}"] = None
+            else:
+                npz[f"{prefix}_{name}"] = tensor.detach().numpy()
+                goldens[f"{prefix}_{name}_shape"] = list(tensor.shape)
+
+    lat = helpers.build_lattice(state_dim, action_dim)
+    _dump("lat", lat(obs, obs_sigs, act_sigs, "legs"))
+
+    moe = helpers.build_moe(state_dim, action_dim)
+    _dump("moe_fwd", moe(obs, obs_sigs, act_sigs, "legs"))
+
+    tp = helpers.build_transformer(op2)
+    _dump("tp", tp(obs, obs_sigs, act_sigs, "legs"))
+
+    tpg = helpers.build_transformer_granulated(op2, ap2)
+    _dump("tpg", tpg(obs, obs_sigs, act_sigs, "legs"))
+
+    tmp = tempfile.mkdtemp()
+    gm = helpers.build_gate_moe(state_dim, action_dim, tmp)
+    _dump("gm", gm(obs, obs_sigs, act_sigs, "legs"))
+
     # -- OBCMemory GAE --
     from arnold.memory import OBCMemory
 

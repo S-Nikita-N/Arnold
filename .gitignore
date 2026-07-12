@@ -24,3 +24,9 @@ multirun/
 *.pt
 *.pth
 wandb/
+
+# TMP files
+tmp/
+
+# IDE
+.vscode/

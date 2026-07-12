@@ -66,6 +66,9 @@ allow-direct-references = true
 testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["tools/pre_commit"]
+markers = [
+    "stage2: heavy/accelerator test; runs only when a GPU/MPS device is present or RUN_STAGE2=1",
+]
 
 # Expert submodules are third-party (git submodules) — excluded everywhere.
 [tool.ruff]

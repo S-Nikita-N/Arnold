@@ -121,3 +121,151 @@ def make_action_parser(muscle_names: list[str] = None):
     if muscle_names is None:
         muscle_names = MUSCLE_NAMES
     return ActionParser(muscle_names)
+
+
+########################################
+#           Policy builders            #
+########################################
+
+# Shared by the golden generator and the policy tests so both construct the
+# exact same seeded networks and drive them with the same synthetic obs.
+# All CPU-only, tiny, deterministic. `expert_name` is always "legs".
+
+POLICY_OBS_SEED = 100
+POLICY_BATCH = 2
+
+
+def make_policy_io():
+    """Returns (obs_parser, action_parser, obs_timeseries) deterministically."""
+    import torch
+
+    op = make_observation_parser()
+    ap = make_action_parser()
+    torch.manual_seed(POLICY_OBS_SEED)
+    obs = torch.randn(POLICY_BATCH, op.n_obs_elements, HISTORY_LEN)
+    return op, ap, obs
+
+
+def build_lattice(state_dim: int, action_dim: int):
+    import torch
+
+    from arnold.torch_model.policy_lattice import LatticePolicy
+
+    torch.manual_seed(10)
+    net = LatticePolicy(state_dim, action_dim, mlp_units=(16, 8))
+    net.eval()
+    return net
+
+
+def build_moe(state_dim: int, action_dim: int):
+    import torch
+
+    from arnold.torch_model.policy_moe import MoELatticePolicy
+
+    torch.manual_seed(11)
+    net = MoELatticePolicy(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        shared_units=(8,),
+        shared_expert_units=(8,),
+        num_experts=3,
+        top_k=2,
+        expert_units=(8,),
+        gate_units=(8,),
+        value_units=(8,),
+    )
+    net.eval()
+    return net
+
+
+def build_transformer(op):
+    import torch
+
+    from arnold.torch_model.transformer_policy import TransformerPolicy
+    from arnold.torch_model.sensorimotor_vocabulary import (
+        SensorimotorVocabulary,
+    )
+
+    torch.manual_seed(12)
+    vocab = SensorimotorVocabulary(embed_dim=EMBED_DIM)
+    net = TransformerPolicy(
+        vocab,
+        {"legs": op.get_body_groups("per_body")},
+        history_len=HISTORY_LEN,
+        embed_dim=EMBED_DIM,
+        ff_dim=32,
+        num_heads=2,
+        num_enc_layers=1,
+        num_act_dec_layers=1,
+        num_val_dec_layers=1,
+        max_action_dim=32,
+        action_cov_rank=4,
+    )
+    net.eval()
+    return net
+
+
+def build_transformer_granulated(op, ap):
+    import torch
+
+    from arnold.torch_model.transformer_policy import TransformerPolicy
+    from arnold.torch_model.sensorimotor_vocabulary import (
+        SensorimotorVocabulary,
+    )
+
+    grouping = ap.get_muscle_grouping("hybrid")
+    torch.manual_seed(14)
+    vocab = SensorimotorVocabulary(embed_dim=EMBED_DIM)
+    net = TransformerPolicy(
+        vocab,
+        {"legs": op.get_body_groups("per_body")},
+        history_len=HISTORY_LEN,
+        embed_dim=EMBED_DIM,
+        ff_dim=32,
+        num_heads=2,
+        num_enc_layers=1,
+        num_act_dec_layers=1,
+        num_val_dec_layers=1,
+        max_action_dim=32,
+        action_cov_rank=4,
+        action_granulation="hybrid",
+        action_groupings={"legs": grouping},
+        action_signatures_by_expert={"legs": ap.action_signatures},
+    )
+    net.eval()
+    return net
+
+
+def write_expert_checkpoints(ckpt_dir, state_dim: int, action_dim: int):
+    """Writes two tiny seeded LatticePolicy checkpoints; returns their paths."""
+    import os
+
+    import torch
+
+    from arnold.torch_model.policy_lattice import LatticePolicy
+
+    paths = []
+    for i in range(2):
+        torch.manual_seed(20 + i)
+        expert = LatticePolicy(state_dim, action_dim, mlp_units=(8,))
+        path = os.path.join(str(ckpt_dir), f"expert_{i}.pth")
+        torch.save({"policy": expert.state_dict()}, path)
+        paths.append(path)
+    return paths
+
+
+def build_gate_moe(state_dim: int, action_dim: int, ckpt_dir):
+    import torch
+
+    from arnold.torch_model.policy_gate_moe import GateMoEPolicy
+
+    paths = write_expert_checkpoints(ckpt_dir, state_dim, action_dim)
+    torch.manual_seed(13)
+    net = GateMoEPolicy(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        expert_checkpoints=paths,
+        gate_units=(8,),
+    )
+    net.eval()
+    return net
