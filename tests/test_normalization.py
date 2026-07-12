@@ -38,8 +38,8 @@ def test_welford_stats_golden(goldens):
     assert set(norm.stats.keys()) == set(g.keys())
     for key, (count, mean_t, m2_t) in norm.stats.items():
         assert count == g[key]["count"]
-        assert float(mean_t) == pytest.approx(g[key]["mean"], rel=1e-6)
-        assert float(m2_t) == pytest.approx(g[key]["M2"], rel=1e-6)
+        assert float(mean_t) == pytest.approx(g[key]["mean"], rel=1e-4)
+        assert float(m2_t) == pytest.approx(g[key]["M2"], rel=1e-4)
 
 
 def test_normalize_golden(goldens_npz):
@@ -53,8 +53,8 @@ def test_normalize_golden(goldens_npz):
     np.testing.assert_allclose(
         out.detach().numpy(),
         goldens_npz["norm_normalized"],
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
 
 

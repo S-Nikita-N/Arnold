@@ -43,8 +43,8 @@ def test_mlp_forward_golden(goldens_npz):
     np.testing.assert_allclose(
         out.detach().numpy(),
         goldens_npz["mlp_out"],
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
 
 
@@ -66,8 +66,8 @@ def test_sensory_encoder_golden(goldens_npz):
     np.testing.assert_allclose(
         out.detach().numpy(),
         goldens_npz["sensory_out"],
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
 
 

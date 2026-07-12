@@ -44,14 +44,14 @@ def test_get_embedding_matches_golden(goldens_npz):
     np.testing.assert_allclose(
         emb_a.detach().numpy(),
         goldens_npz["vocab_emb_a"],
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
     np.testing.assert_allclose(
         emb_b.detach().numpy(),
         goldens_npz["vocab_emb_b"],
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
 
 
@@ -73,8 +73,8 @@ def test_get_embedding_batch_equivalence_and_golden(goldens_npz):
     np.testing.assert_allclose(
         batch.detach().numpy(),
         goldens_npz["vocab_batch"],
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
 
 

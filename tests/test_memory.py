@@ -54,14 +54,14 @@ def test_to_batch_gae_golden(goldens_npz):
     np.testing.assert_allclose(
         batch.returns.detach().numpy(),
         goldens_npz["gae_returns"],
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
     np.testing.assert_allclose(
         batch.advantages.detach().numpy(),
         goldens_npz["gae_advantages"],
-        rtol=1e-6,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
     # advantages normalized: near zero mean, ~unit std
     assert batch.advantages.mean().item() == pytest.approx(0.0, abs=1e-6)

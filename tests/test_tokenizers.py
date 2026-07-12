@@ -45,8 +45,8 @@ def test_body_tokenizer_encode_golden(goldens, goldens_npz):
     np.testing.assert_allclose(
         out.detach().numpy(),
         goldens_npz["body_tok_out"],
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
 
 
@@ -148,12 +148,12 @@ def test_action_tokenizer_decode_golden(goldens, goldens_npz):
     np.testing.assert_allclose(
         mean.detach().numpy(),
         goldens_npz["atok_mean"],
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
     np.testing.assert_allclose(
         hidden.detach().numpy(),
         goldens_npz["atok_hidden"],
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )

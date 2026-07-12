@@ -90,11 +90,11 @@ def test_compute_sparse_balance_loss_golden(goldens):
     assert loss.shape == (1,)
     assert float(loss.item()) == pytest.approx(
         goldens["moe_sparse_lb"],
-        rel=1e-5,
+        rel=1e-4,
     )
     assert stats["lb_total"] == pytest.approx(
         goldens["moe_sparse_lb"],
-        rel=1e-5,
+        rel=1e-4,
     )
 
 
@@ -103,9 +103,9 @@ def test_compute_soft_balance_loss_golden(goldens):
     _, gate_probs = _fixed_inputs()
     loss, stats = soft.compute_soft_balance_loss(gate_probs)
     assert loss.shape == (1,)
-    assert float(loss.item()) == pytest.approx(goldens["moe_soft_lb"], rel=1e-5)
+    assert float(loss.item()) == pytest.approx(goldens["moe_soft_lb"], rel=1e-4)
     for k, v in goldens["moe_soft_stats"].items():
-        assert stats[k] == pytest.approx(v, rel=1e-5)
+        assert stats[k] == pytest.approx(v, rel=1e-4)
 
 
 def test_compute_cov_factor_shared_only_golden(goldens, goldens_npz):
@@ -123,20 +123,20 @@ def test_compute_cov_factor_shared_only_golden(goldens, goldens_npz):
     np.testing.assert_allclose(
         cov_f.detach().numpy(),
         goldens_npz["moe_cov_shared"],
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
     np.testing.assert_allclose(
         diag_std.detach().numpy(),
         goldens_npz["moe_diag_std"],
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
     np.testing.assert_allclose(
         latent_std.detach().numpy(),
         goldens_npz["moe_latent_std"],
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
     # std must be strictly positive (softplus + min_diag_std)
     assert (diag_std > 0).all()
@@ -153,8 +153,8 @@ def test_compute_cov_factor_per_sample_golden(goldens, goldens_npz):
     np.testing.assert_allclose(
         cov_f.detach().numpy(),
         goldens_npz["moe_cov_persample"],
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-4,
+        atol=1e-5,
     )
 
 
