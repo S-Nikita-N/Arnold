@@ -9,11 +9,6 @@
 - Назначение: Эксперт для задачи Walk to point на MyoLegs (80 мышц)
 - Статус: Подтвержден, работает
 
-### myochallenge-lattice (MyoArm - Object relocate)
-- URL: https://github.com/amathislab/myochallenge-lattice
-- Назначение: Эксперт для задачи Object relocate на MyoArm (48 мышц без кисти)
-- Статус: Требует проверки
-
 ---
 
 ## Установка
@@ -96,14 +91,6 @@ sed -i '' \
 
 ---
 
-### Установка myochallenge-lattice (MyoArm эксперт)
-
-**Статус**: Требует проверки и уточнения плана установки.
-
-После проверки репозитория здесь будет добавлен полный план установки.
-
----
-
 ## Структура
 
 После клонирования и установки структура будет следующей:
@@ -114,8 +101,7 @@ experts/
 ├── __init__.py
 ├── expert_wrapper.py
 ├── kinesis_expert.py          # (будет создан)
-├── myochallenge_expert.py     # (будет создан)
-├── Kinesis/
+└── Kinesis/
 │   ├── data/
 │   │   ├── smpl/
 │   │   │   └── SMPL_NEUTRAL.pkl
@@ -125,8 +111,6 @@ experts/
 │   │       └── kinesis-target-goal-reach/
 │   │           └── model.pth
 │   └── ...
-└── myochallenge-lattice/
-    └── ...
 ```
 
 ---
@@ -137,4 +121,3 @@ experts/
 
 - `expert_wrapper.py` - базовый класс для всех экспертов
 - `kinesis_wrapper.py` - wrapper для Kinesis (MyoLegs)
-- `myochallenge_wrapper.py` - wrapper для myochallenge-lattice (MyoArm)
