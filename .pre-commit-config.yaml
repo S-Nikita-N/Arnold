@@ -6,7 +6,6 @@
 exclude: |
   (?x)^(
     src/myotrainer/experts/Kinesis/
-    | src/myotrainer/experts/myochallenge-lattice/
     | src/myotrainer/experts/Myohuman/
     | downloads/
     | docs/

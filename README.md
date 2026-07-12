@@ -87,7 +87,7 @@ Requires **Git**, **[Git LFS](https://git-lfs.com/)** and
 
 ```bash
 git lfs install                                             # once per machine
-git clone --recurse-submodules <repo-url> MyoTrainer        # + Kinesis, lattice, MyoHuman
+git clone --recurse-submodules <repo-url> MyoTrainer        # + Kinesis, MyoHuman
 cd MyoTrainer
 git lfs pull                                                # heavy assets under downloads/
 ./scripts/install.sh                                        # uv sync into .venv

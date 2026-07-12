@@ -18,7 +18,7 @@ Repo-specific commands (how to run things) live in the README.
 
 ## Expert submodules are third-party
 
-`src/myotrainer/experts/{Kinesis, myochallenge-lattice, Myohuman}` are git
+`src/myotrainer/experts/{Kinesis, Myohuman}` are git
 submodules. **They are excluded from every hook, lint, format and type check**
 (a global `exclude` in `.pre-commit-config.yaml` plus `extend-exclude` in
 pyproject). Never reformat them here; the Myohuman submodule is edited only in

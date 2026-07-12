@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Настраивает submodule-экспертов (Kinesis, myochallenge-lattice, Myohuman):
+# Настраивает submodule-экспертов (Kinesis, Myohuman):
 # инициализирует submodule и применяет локальные патчи.
 # Универсальный инсталлятор: macOS (BSD sed) и Linux (GNU sed).
 #
 # Использование: ./scripts/setup_experts.sh [expert ...]
 #   Без аргументов или "all" — настроить всех экспертов.
-#   Иначе — только перечисленных: kinesis, myochallenge-lattice, myohuman.
+#   Иначе — только перечисленных: kinesis, myohuman.
 #   Пример: ./scripts/setup_experts.sh kinesis myohuman
 
 set -e
@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_PATH")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-AVAILABLE_EXPERTS="kinesis myochallenge-lattice myohuman"
+AVAILABLE_EXPERTS="kinesis myohuman"
 
 # Разбор аргументов: по умолчанию все
 if [ $# -eq 0 ] || [ "$*" = "all" ]; then
@@ -82,7 +82,6 @@ echo "Initializing submodules..."
 for ex in $EXPERTS; do
     case "$ex" in
         kinesis)            path="src/myotrainer/experts/Kinesis" ;;
-        myochallenge-lattice) path="src/myotrainer/experts/myochallenge-lattice" ;;
         myohuman)           path="src/myotrainer/experts/Myohuman" ;;
         *)                  path="" ;;
     esac
@@ -92,7 +91,6 @@ echo "Pulling LFS files in selected submodules..."
 for ex in $EXPERTS; do
     case "$ex" in
         kinesis)            path="src/myotrainer/experts/Kinesis" ;;
-        myochallenge-lattice) path="src/myotrainer/experts/myochallenge-lattice" ;;
         myohuman)           path="src/myotrainer/experts/Myohuman" ;;
         *)                  path="" ;;
     esac

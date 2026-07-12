@@ -74,13 +74,13 @@ markers = [
 [tool.ruff]
 line-length = 80
 target-version = "py312"
-extend-exclude = ["src/myotrainer/experts/Kinesis", "src/myotrainer/experts/myochallenge-lattice", "src/myotrainer/experts/Myohuman"]
+extend-exclude = ["src/myotrainer/experts/Kinesis", "src/myotrainer/experts/Myohuman"]
 
 [tool.ruff.lint]
 select = ["E", "F", "UP", "B", "SIM", "C4", "PT"]
 
 [tool.typos.files]
-extend-exclude = ["src/myotrainer/experts/Kinesis", "src/myotrainer/experts/myochallenge-lattice", "src/myotrainer/experts/Myohuman", "downloads", "docs"]
+extend-exclude = ["src/myotrainer/experts/Kinesis", "src/myotrainer/experts/Myohuman", "downloads", "docs"]
 
 # Domain terms / muscle abbreviations that are not typos: DELT (deltoid),
 # abd (abduction), sart (sartorius), GAE (advantage estimation), ANC, strat, thr.
